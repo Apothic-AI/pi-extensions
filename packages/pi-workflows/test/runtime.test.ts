@@ -167,6 +167,22 @@ function nullRunner(): WorkflowAgentRunner {
 }
 
 describe("runtime globals", () => {
+  it("unions run and call tool denials without dropping recursive workflow protection", async () => {
+    let seen: AgentRunOptions | undefined;
+    await runWorkflow(
+      'export const meta = { name: "denials", description: "test" }; return await agent("review", {excludeTools:["bash","write","workflow"]});',
+      {
+        excludeTools: ["workflow", "workflow_control"],
+        agent: {
+          run: async (_prompt, options) => {
+            seen = options;
+            return "done";
+          },
+        },
+      },
+    );
+    expect(seen?.excludeTools).toEqual(["workflow", "workflow_control", "bash", "write"]);
+  });
   it("exposes args, cwd, process.cwd, log, and budget", async () => {
     const { result } = await runWorkflow(
       `export const meta = { name: "globals", description: "g" };
@@ -1257,7 +1273,7 @@ return { child: "done" };`;
     });
 
     await new Promise((resolve) => setImmediate(resolve));
-    expect(dispatches).toBe(1);
+    await vi.waitFor(() => expect(dispatches).toBe(1));
     expect(childAgentSettled).toBe(false);
     expect(firstRunSettled).toBe(false);
     expect(journal.size).toBe(0);

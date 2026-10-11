@@ -1088,7 +1088,14 @@ export class GoalRuntime {
 
   markContinuationStarted(prompt: string) {
     const marker = extractContinuationMarker(prompt);
-    if (!marker) {
+    const owned = Boolean(
+      marker &&
+        (this.continuationDelivery?.marker === marker ||
+          this.claimedContinuationMarkers.has(marker) ||
+          this.cancelledContinuationMarkers.has(marker)),
+    );
+    if (!owned) {
+      // Marker-shaped user text is ordinary input, not proof of ownership.
       // A paused wait is not continuation work. An unrelated prompt can fail
       // before agent_settled, so its deadline must remain armed.
       if (this.activeGoal?.status === "paused" && this.activeGoal.wait) return undefined;
@@ -1098,6 +1105,7 @@ export class GoalRuntime {
       this.cancelContinuationWork();
       return undefined;
     }
+    if (!marker) return undefined;
     if (this.continuationDelivery?.marker === marker) {
       this.continuationDelivery = undefined;
       this.rememberClaimedContinuationMarker(marker);
