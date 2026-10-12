@@ -75,6 +75,8 @@ Then reference it in your settings:
 
 The `/readfiles` browser requires these tools and will refuse to open until they are installed.
 
+The browser is TUI-only. Retained browser callbacks and polling retire their resources when the live context leaves TUI mode or loses UI access, even before this extension's next session handler runs. Retirement does not close a replacement UI or send comments, notifications, or Git requests.
+
 ## Commands
 
 - `/readfiles` - open the file browser in the current directory

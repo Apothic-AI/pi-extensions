@@ -62,7 +62,7 @@ function settingsRuntime(overrides = {}): CodexCompactSettingsRuntime {
   let state: CodexCompactSettingsState = {
     kind: "loaded",
     path: "/tmp/test-pi-codex-compact.json",
-    settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, ...overrides },
+    settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory: true, ...overrides },
     document: {},
   };
   return {
@@ -1362,7 +1362,7 @@ for (const change of ["prompt", "tools", "context edit"] as const) {
     else if (change === "tools") mock.pi.setActiveTools([nextTool.name]);
     else session.appendContextEdit(keptId, { content: "Changed after request started" });
     release();
-    assert.equal(await inFlight, undefined);
+    assert.deepEqual(await inFlight, change === "context edit" ? { cancel: true } : undefined);
     assert.equal(fetches, 1);
     assert.equal(statuses.get("codex-compact"), undefined);
     assert.equal(
