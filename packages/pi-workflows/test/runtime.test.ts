@@ -940,6 +940,34 @@ return [a, b];`;
 
 // ── concurrency and limits ───────────────────────────────────────────────────
 
+/** Hold the first batch until its full declared width is admitted, not for an OS-timed overlap. */
+function firstWaveRendezvous(width: number) {
+  let admitted = 0;
+  let release!: () => void;
+  let fail!: (error: Error) => void;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const ready = new Promise<void>((resolve, reject) => {
+    release = resolve;
+    fail = reject;
+  });
+  return {
+    async enter() {
+      if (++admitted === 1) {
+        deadline = setTimeout(() => fail(new Error(`First wave admitted ${admitted}, expected ${width}`)), 2000);
+      }
+      if (admitted === width) {
+        clearTimeout(deadline);
+        release();
+      }
+      await ready;
+    },
+    dispose() {
+      clearTimeout(deadline);
+      release();
+    },
+  };
+}
+
 describe("limits", () => {
   it("the concurrency limiter caps peak parallelism without breaching maxAgents", async () => {
     let active = 0;
@@ -980,6 +1008,7 @@ return results.length;`,
   });
 
   it("runs a fan-out wider than the old 16-agent ceiling in one batch", async () => {
+    const wave = firstWaveRendezvous(40);
     let active = 0;
     let peak = 0;
     await runWorkflow(
@@ -992,17 +1021,18 @@ return 0;`,
           run: async () => {
             active++;
             peak = Math.max(peak, active);
-            await new Promise((r) => setTimeout(r, 5));
+            await wave.enter();
             active--;
             return "x";
           },
         },
       },
-    );
+    ).finally(() => wave.dispose());
     expect(peak).toBe(40);
   });
 
   it("takes the host pool size as its width when the peer published one", async () => {
+    const wave = firstWaveRendezvous(24);
     let active = 0;
     let peak = 0;
     await runWorkflow(
@@ -1015,17 +1045,18 @@ return 0;`,
           run: async () => {
             active++;
             peak = Math.max(peak, active);
-            await new Promise((r) => setTimeout(r, 5));
+            await wave.enter();
             active--;
             return "x";
           },
         },
       },
-    );
+    ).finally(() => wave.dispose());
     expect(peak).toBe(24);
   });
 
   it("clamps a requested concurrency to the host pool", async () => {
+    const wave = firstWaveRendezvous(12);
     let active = 0;
     let peak = 0;
     await runWorkflow(
@@ -1041,13 +1072,13 @@ return 0;`,
           run: async () => {
             active++;
             peak = Math.max(peak, active);
-            await new Promise((r) => setTimeout(r, 5));
+            await wave.enter();
             active--;
             return "x";
           },
         },
       },
-    );
+    ).finally(() => wave.dispose());
     expect(peak).toBe(12);
   });
 
