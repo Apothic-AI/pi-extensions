@@ -18,10 +18,24 @@ import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, type Theme } from "./agent-display.js";
-import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, getConversationViewerMode } from "./conversation-viewer.js";
 import { type OwnerGroup, OwnerGroupViewer, workflowGroupId } from "./owner-group.js";
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
 import type { ViewerKeybindings } from "./viewer-keys.js";
+import type { WorkflowUiClient } from "./workflow-ui-client.js";
+
+/** Immutable selection, including the attempt generation on a reusable native thread. */
+export function captureAgentSelection(manager: AgentManager, record: AgentRecord, isCurrent: () => boolean = () => true) {
+  const session = record.session;
+  const owner = record.owner ? { ...record.owner } : undefined;
+  const snapshot = { ...record, owner, lifetimeUsage: { ...record.lifetimeUsage } };
+  const current = (): AgentRecord | undefined => isCurrent() ? manager.listAgentsMutable().find(candidate =>
+    candidate.id === snapshot.id && candidate.session === session && !candidate.detached &&
+    candidate.owner?.extension === owner?.extension && candidate.owner?.runId === owner?.runId &&
+    candidate.owner?.nodeId === owner?.nodeId && candidate.owner?.attemptId === owner?.attemptId) : undefined;
+  return { snapshot, session, owner, current };
+}
+export type AgentSelection = ReturnType<typeof captureAgentSelection>;
 
 /** Widget key for the below-editor fleet list. */
 const FLEET_KEY = "fleet";
@@ -97,11 +111,38 @@ export class FleetList {
   /** Set while a conversation overlay is open; calling it closes the overlay. */
   private viewerClose: (() => void) | undefined;
   private viewingAgentId: string | undefined;
+  private workflowClient: WorkflowUiClient | undefined;
+  private externalOpening = false;
+  private externalViewingId: string | undefined;
+  private externalTimer: ReturnType<typeof setTimeout> | undefined;
+
+  setWorkflowClient(client: WorkflowUiClient | undefined): void {
+    this.workflowClient = client;
+    this.update();
+  }
+
+  /** Shared exact-attempt opener for user selections and the workflow UI endpoint. */
+  canOpenConversation(selection: AgentSelection): boolean {
+    return !!this.ui && !this.viewerClose && !!selection.session && !!selection.current();
+  }
+
+  openConversation(selection: AgentSelection, deferConstruction = false): boolean {
+    if (!this.canOpenConversation(selection)) return false;
+    this.viewingAgentId = selection.snapshot.id;
+    const mode = this.conversationMode();
+    void this.openOverlay((tui, theme, keys, done) => {
+      if (!selection.current()) { done(undefined); return { render: () => [], invalidate: () => {} }; }
+      return this.conversation(selection, tui, theme, keys, done, undefined, mode);
+    }, mode, deferConstruction);
+    return true;
+  }
 
   constructor(
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
   ) {}
+
+  conversationMode(): "fullscreen" | "overlay" { return getConversationViewerMode(this.tui); }
 
   // ---- Lifecycle ----
 
@@ -137,6 +178,11 @@ export class FleetList {
 
   dispose(): void {
     this.overlayGeneration++;
+    if (this.externalTimer) clearTimeout(this.externalTimer);
+    this.externalTimer = undefined;
+    this.externalOpening = false;
+    this.externalViewingId = undefined;
+    this.workflowClient = undefined;
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
@@ -153,6 +199,7 @@ export class FleetList {
   /** Re-register/refresh the below-editor widget; clears it when no agents remain. */
   update(): void {
     if (!this.ui) return;
+    if (this.externalViewingId && !this.externalOpening && this.editorHasFocus()) this.externalViewingId = undefined;
     const hasAgents = this.enabled && this.roster().length > 1;
 
     if (!hasAgents) {
@@ -217,6 +264,14 @@ export class FleetList {
       if (!group) { group = { id, runId: record.owner!.runId, records: [] }; groups.set(id, group); }
       group.records.push(record);
     }
+    const retained = new Set([...groups.values()].map(group => group.runId));
+    if (this.externalViewingId) retained.add(this.externalViewingId);
+    for (const run of this.workflowClient?.runs(retained) ?? []) {
+      const id = JSON.stringify(["pi-workflows", run.runId]);
+      const group = groups.get(id) ?? { id, runId: run.runId, records: [] };
+      group.summary = run;
+      groups.set(id, group);
+    }
     for (const group of groups.values()) group.records.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
     return [...groups.values()];
   }
@@ -252,14 +307,26 @@ export class FleetList {
     // tap would move/fire twice. Repeats still pass through for held-key nav.
     if (isKeyRelease(data)) return undefined;
     // While an overlay is open, let it own all input.
-    if (this.viewerClose) return undefined;
+    if (this.viewerClose || this.externalOpening) return undefined;
     // Input listeners fire BEFORE the focused component, and dialogs
     // (ctx.ui.select/confirm/input, pi's own menus) swap the prompt editor out
     // while getEditorText() still reads the detached — empty — editor. So when
     // anything but the editor owns the keyboard, stay out of its keys (#123).
     if (!this.editorHasFocus()) {
-      if (this.active) this.deactivate();
+      if (this.active && !this.externalViewingId) this.deactivate();
       return undefined;
+    }
+    this.externalViewingId = undefined;
+
+    if (!this.active && this.ui.getEditorText() === "" && matchesKey(data, "ctrl+b")) {
+      const candidates = this.manager.listAgentsMutable().filter(record => !record.detached && !record.parentAgentId &&
+        !record.owner && record.isBackground === false && record.status === "running");
+      const eligible = candidates.filter(record => this.manager.canHandoff(record.id));
+      if (eligible.length > 1) this.ui.notify("Multiple foreground agents; select a conversation and press b to hand off explicitly.", "info");
+      else if (eligible.length === 1) this.handoff(captureAgentSelection(this.manager, eligible[0]));
+      else if (candidates.length) this.ui.notify(this.manager.handoffUnavailableReason(candidates[0].id) ?? "No eligible foreground agent.", "warning");
+      else return undefined;
+      return { consume: true };
     }
 
     if (!this.active) {
@@ -335,49 +402,87 @@ export class FleetList {
       this.ui.notify(`Agent is ${record.status}; no session available.`, "info");
       return;
     }
-    this.viewingAgentId = record.id;
-    void this.openOverlay((tui, theme, keys, done) => this.conversation(record, tui, theme, keys, done));
+    this.openConversation(captureAgentSelection(this.manager, record));
   }
 
-  private conversation(record: AgentRecord, tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void): ConversationViewer {
-    const session = record.session;
-    if (!session) throw new Error("No session available");
-    const owner = record.owner ? { ...record.owner } : undefined;
-    // An id can be reused for another thread attempt. Bind controls to this
-    // session and immutable owner generation, never to id alone.
-    const current = (): AgentRecord | undefined => this.manager.listAgentsMutable().find(candidate =>
-      candidate.id === record.id && candidate.session === session && !candidate.detached &&
-      candidate.owner?.extension === owner?.extension && candidate.owner?.runId === owner?.runId &&
-      candidate.owner?.nodeId === owner?.nodeId && candidate.owner?.attemptId === owner?.attemptId);
+  conversation(selection: AgentSelection, tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void,
+    notify = (message: string) => this.ui?.notify(message, "info"), mode: "fullscreen" | "overlay" = "overlay"): ConversationViewer {
+    const { snapshot: record, session, owner, current } = selection;
+    if (!session || !current()) throw new Error("Conversation selection is no longer active");
+    let last = record;
     return new ConversationViewer(tui, session, record, this.agentActivity.get(record.id), theme, done,
-      () => { if (current() && this.manager.abort(record.id)) this.ui?.notify(`Stopped "${sanitizeDisplayText(record.description)}".`, "info"); },
+      () => { if (current() && this.manager.abort(record.id)) notify(`Stopped "${sanitizeDisplayText(record.description)}".`); },
       keys,
-      message => !!current() && this.manager.steer(record.id, message),
-      () => current() ?? { ...record, status: record.status === "running" || record.status === "queued" ? "stopped" : record.status, detached: true },
+      message => current() ? this.manager.steerAccepted(record.id, message, { session, owner }) : Promise.resolve(false),
+      () => {
+        const fresh = current();
+        if (fresh) { last = { ...fresh, owner, lifetimeUsage: { ...fresh.lifetimeUsage } }; return fresh; }
+        return { ...last, detached: true };
+      },
+      { mode, canHandoff: () => !!current() && this.manager.canHandoff(record.id), onHandoff: () => this.handoff(selection) },
     );
   }
 
-  private openGroup(group: OwnerGroup): void {
+  private handoff(selection: AgentSelection): boolean {
+    if (!selection.current()) return false;
+    const id = selection.snapshot.id;
+    if (!this.manager.handoff(id)) {
+      this.ui?.notify(this.manager.handoffUnavailableReason(id) ?? "Cannot hand off this agent.", "warning");
+      return false;
+    }
+    this.ui?.notify(`Agent ${sanitizeDisplayText(id)} continues in background.`, "info");
+    this.update();
+    return true;
+  }
+
+  private async openGroup(group: OwnerGroup): Promise<void> {
+    const client = this.workflowClient;
+    const ui = this.ui;
+    const generation = this.overlayGeneration;
+    if (group.summary && client) {
+      this.externalOpening = true;
+      try {
+        await client.open(group.summary);
+        if (generation === this.overlayGeneration && ui === this.ui) this.externalViewingId = group.runId;
+        // Admission precedes the peer's dialog factory. Yield through its next
+        // macrotask, then rely on public TUI focus for the entire interaction.
+        if (generation === this.overlayGeneration && ui === this.ui) {
+          this.externalTimer = setTimeout(() => { this.externalTimer = undefined; this.externalOpening = false; this.update(); }, 0);
+        }
+        return;
+      } catch {
+        if (generation !== this.overlayGeneration || ui !== this.ui) return;
+        ui?.notify("Workflow inspector unavailable; showing retained children only (no workflow controls).", "warning");
+      } finally {
+        if (!this.externalTimer && generation === this.overlayGeneration) this.externalOpening = false;
+      }
+    }
+    if (generation !== this.overlayGeneration || ui !== this.ui) return;
+    if (!group.records.length) { ui?.notify("No retained child conversations for this workflow.", "info"); return; }
     void this.openOverlay((tui, theme, keys, done) => new OwnerGroupViewer(tui, theme, group.runId,
       () => this.groups().find(candidate => candidate.id === group.id)?.records ?? [],
-      (record, back) => this.conversation(record, tui, theme, keys, back),
+      (record, back) => this.conversation(captureAgentSelection(this.manager, record), tui, theme, keys, back),
       () => done(undefined), keys));
   }
 
-  private async openOverlay(factory: (tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void) => Component): Promise<void> {
+  private async openOverlay(factory: (tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void) => Component,
+    mode: "fullscreen" | "overlay" = "overlay", deferConstruction = false): Promise<void> {
     const ui = this.ui;
     if (!ui) return;
     const generation = ++this.overlayGeneration;
     this.viewerClose = () => {}; // reserve input during asynchronous construction
     try {
+      if (deferConstruction) await Promise.resolve();
+      if (generation !== this.overlayGeneration || ui !== this.ui) return;
       await ui.custom<undefined>((tui, theme, keys, done) => {
         if (generation !== this.overlayGeneration || ui !== this.ui) {
           done(undefined);
           return { render: () => [], invalidate: () => {} };
         }
         this.viewerClose = () => done(undefined);
-        return borderedComponent(factory(tui, theme, keys, done), text => theme.fg("borderAccent", text));
-      }, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` } });
+        const component = factory(tui, theme, keys, done);
+        return mode === "fullscreen" ? component : borderedComponent(component, text => theme.fg("borderAccent", text));
+      }, { overlay: true, overlayOptions: getConversationOverlayOptions({ mode: mode === "fullscreen" ? "fullscreen" : undefined }) });
     } catch {
       if (generation === this.overlayGeneration) ui.notify("Cannot open conversation; try again.", "error");
     } finally {
@@ -403,6 +508,7 @@ export class FleetList {
   // ---- Rendering ----
 
   private renderBar(width: number, theme: Theme): string[] {
+    if (width <= 0) return [];
     const roster = this.roster();
     this.clampSelection(roster);
     const agents = roster.slice(1);
@@ -415,9 +521,13 @@ export class FleetList {
     const hint = this.active
       ? "↑↓ navigate · Enter view · Esc back"
       : "Esc interrupt · ← agents · ↓ manage";
+    const height = Math.max(0, Math.floor((this.tui?.terminal.rows ?? 24) / 2));
+    if (height === 0) return [];
     const lines: string[] = [];
-    lines.push(truncateToWidth(`  ${theme.fg("dim", hint)}`, width));
-    lines.push("");
+    if (height >= 7) {
+      lines.push(truncateToWidth(`  ${theme.fg("dim", hint)}`, width));
+      lines.push("");
+    }
 
     const mainColor = sel === 0 ? "accent" : "dim";
     const main = sel === 0
@@ -427,7 +537,8 @@ export class FleetList {
     const mainMark = theme.fg(mainColor, getAgentStatusMark("running"));
     lines.push(truncateToWidth(`  ${mainMark} ${main} ${theme.fg("dim", "·")} ${theme.fg("dim", "current")}`, width));
 
-    const visible = Math.min(MAX_AGENT_ROWS, agents.length);
+    const rowBudget = Math.max(1, Math.floor((this.tui?.terminal.rows ?? 24) / 2) - 7);
+    const visible = Math.min(MAX_AGENT_ROWS, rowBudget, agents.length);
     const selAgent = Math.max(0, sel - 1);
     const start = selAgent < visible ? 0 : selAgent - visible + 1;
     const hiddenBelow = agents.length - (start + visible);
@@ -437,13 +548,27 @@ export class FleetList {
       const entry = agents[a];
       if (entry.kind === "agent") lines.push(this.renderAgentRow(a + 1, sel, entry.record, width, theme));
       else if (entry.kind === "group") {
-        const label = `  ▸ Workflow ${sanitizeDisplayText(entry.group.runId)} · ${entry.group.records.length} retained children`;
-        lines.push(truncateToWidth(theme.fg(a + 1 === sel ? "accent" : "muted", label), width));
+        const run = entry.group.summary;
+        if (run) {
+          const selected = a + 1 === sel;
+          const status = run.status === "failed" ? "error" : run.status === "pending" || run.status === "paused" ? "queued" :
+            run.status === "stopped" || run.status === "interrupted" ? "stopped" : run.status === "completed" ? "completed" : "running";
+          const color = status === "error" ? "error" : status === "stopped" ? "warning" : selected ? "accent" : "dim";
+          const name = sanitizeDisplayText(run.name);
+          const phase = run.currentPhase ? ` · ${sanitizeDisplayText(run.currentPhase)}` : "";
+          const left = `  ${theme.fg(color, getAgentStatusMark(status))} ${theme.fg(selected ? "accent" : "muted", name)} · ${theme.fg(color, run.status)}${phase} · ${run.runningCalls}/${run.callCount} running · ${run.completedCalls} done · ${run.failedCalls} failed${run.restored ? " · restored" : ""}`;
+          const right = `${formatFleetElapsed(run.elapsedMs)}${run.tokenCount === undefined ? "" : ` · ${formatFleetTokens(run.tokenCount)}`}`;
+          lines.push(rightAlign(left, theme.fg("dim", right), width));
+        } else {
+          const label = `  ▸ Workflow ${sanitizeDisplayText(entry.group.runId)} · ${entry.group.records.length} retained children`;
+          lines.push(truncateToWidth(theme.fg(a + 1 === sel ? "accent" : "muted", label), width));
+        }
       }
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `${hiddenBelow} more below`), width));
 
-    return lines;
+    lines.push(""); // breathing room below the roster, including narrow terminals
+    return [...lines.slice(0, height - 1), ""].map(line => truncateToWidth(line, Math.max(0, width)));
   }
 
   private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {

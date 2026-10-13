@@ -154,7 +154,9 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
         (item) => `${item.runId}/${item.nodeId}/${item.attemptId ?? "attempt-1"}` === spawnKey,
       );
       if (spawn && !stopped.includes(spawn.id)) stopped.push(spawn.id);
-      return undefined;
+      // Recorded allocations remain discoverable even when their spawn reply
+      // rejected; positive quiescence still comes from the owned check above.
+      return spawn ? { id: spawn.id, state: "queued" } : undefined;
     },
     complete(agentId: string, result: string) {
       const spawn = spawned.find((item) => item.id === agentId);

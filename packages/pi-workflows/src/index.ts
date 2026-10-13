@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
 import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMING_MESSAGE_TYPE, WorkflowTurnArming } from "./arming.js";
@@ -25,6 +25,7 @@ import {
   type WorkflowStrengthTable,
 } from "./strengths.js";
 import { liveWidgetLines, showWorkflowNavigator } from "./ui.js";
+import { buildWorkflowUiSnapshot, openOwnedConversation, WorkflowUiBridge, type WorkflowUiSurface } from "./ui-bus.js";
 import {
   loadProjectWorkflowSettings,
   loadWorkflowSettings,
@@ -109,6 +110,15 @@ function textResult(text: string, details: unknown = {}) {
     content: [{ type: "text" as const, text }],
     details,
   };
+}
+
+/** Bounded display copies; command notifications never render stored control bytes. */
+function notifyWorkflow(
+  ctx: Pick<ExtensionContext, "ui">,
+  message: string,
+  type: "info" | "warning" | "error" = "info",
+): void {
+  ctx.ui.notify(sanitizeDisplayText(message.slice(0, 8_000), { multiline: true }).slice(0, 4_000), type);
 }
 
 /**
@@ -366,6 +376,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   const PENDING_DELIVERY_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
   let widgetTimer: ReturnType<typeof setInterval> | undefined;
   let widgetUi: ExtensionContext["ui"] | undefined;
+  let workflowUiBridge: WorkflowUiBridge | undefined;
+  let workflowUiSurfaceId = randomUUID();
+  let refreshQueued = false;
 
   const currentEngine = (): WorkflowEngine => {
     if (!active || !engine || engine.isDisposed())
@@ -391,11 +404,13 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     if (!busy) return undefined;
     const notice =
       "Navigation blocked while agents or workflows are active or cleaning up. Wait for them to finish, or stop them explicitly and retry.";
-    if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+    if (ctx.hasUI) notifyWorkflow(ctx, notice, "warning");
     else console.warn(`[pi-workflows] ${notice}`);
     return { cancel: true };
   };
   const invalidateDelivery = (): void => {
+    workflowUiBridge?.retire(workflowUiSurfaceId);
+    workflowUiSurfaceId = randomUUID();
     deliveryGeneration++;
     deliveryObservers.clear();
     turnArming.retire();
@@ -467,16 +482,55 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       .list()
       .map((summary) => workflowEngine.getRun(String(summary.runId)))
       .filter((run): run is NonNullable<typeof run> => run !== undefined);
-    const lines = liveWidgetLines(runs, workflowSettings.progressMode, workflowSettings.maxAgentsShown);
-    tui.setWidget("pi-workflows", lines.length > 0 ? lines : undefined);
-    if (lines.length > 0 && !widgetTimer) {
+    const hasActive = runs.some((run) => !["completed", "failed", "stopped"].includes(run.status));
+    const surfaceId = workflowUiSurfaceId;
+    tui.setWidget(
+      "pi-workflows",
+      hasActive
+        ? (host, theme) => ({
+            render(width) {
+              if (
+                !active ||
+                engine !== workflowEngine ||
+                workflowEngine.isDisposed() ||
+                workflowUiSurfaceId !== surfaceId ||
+                !Number.isFinite(width) ||
+                width < 1
+              )
+                return [];
+              const height = Number.isFinite(host.terminal.rows) ? Math.max(0, host.terminal.rows) : 24;
+              const rowBudget = Math.max(1, Math.min(12, Math.floor(height / 4)));
+              return liveWidgetLines(
+                runs,
+                workflowSettings.progressMode,
+                workflowSettings.maxAgentsShown,
+                rowBudget,
+              ).map((line, index) =>
+                truncateToWidth(theme.fg(index === 0 ? "accent" : "muted", line), Math.floor(width)),
+              );
+            },
+            invalidate() {},
+          })
+        : undefined,
+    );
+    workflowUiBridge?.publish();
+    if (hasActive && !widgetTimer) {
       widgetTimer = setInterval(refreshWidget, 2_000);
-    } else if (lines.length === 0 && widgetTimer) {
+    } else if (!hasActive && widgetTimer) {
       clearInterval(widgetTimer);
       widgetTimer = undefined;
     }
   };
-  const notifyRunChanged = (): void => refreshWidget();
+  const notifyRunChanged = (): void => {
+    if (refreshQueued) return;
+    refreshQueued = true;
+    const surfaceId = workflowUiSurfaceId;
+    queueMicrotask(() => {
+      refreshQueued = false;
+      if (surfaceId !== workflowUiSurfaceId) return;
+      refreshWidget();
+    });
+  };
 
   const DEFAULT_EXCLUDED_TOOLS = ["workflow", "workflow_control"] as const;
 
@@ -524,6 +578,71 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     throw new Error("Provide either `script` or `name`.");
   };
 
+  const showNavigator = async (ctx: ExtensionContext, initialRunId?: string): Promise<void> => {
+    if (ctx.mode !== "tui" || !ctx.hasUI) {
+      await showWorkflowNavigator(ctx, currentEngine, { initialRunId });
+      return;
+    }
+    const selectedEngine = currentEngine();
+    const surfaceId = workflowUiSurfaceId;
+    const manager = ctx.sessionManager;
+    const sessionId = manager.getSessionId();
+    const resolve = (): WorkflowEngine => {
+      if (
+        surfaceId !== workflowUiSurfaceId ||
+        selectedEngine !== currentEngine() ||
+        manager !== deliveryContext?.sessionManager ||
+        manager.getSessionId() !== sessionId ||
+        !ownsDeliveryBranch()
+      )
+        throw new Error("Workflow inspector belongs to a retired session or branch.");
+      return selectedEngine;
+    };
+    await showWorkflowNavigator(ctx, resolve, {
+      initialRunId,
+      getPresentation: (runId) => resolve().getInspection(runId),
+      openConversation: async (runId, callIndex) => {
+        const current = resolve();
+        if (!/^(?:0|[1-9]\d*)$/u.test(callIndex)) throw new Error("This call has no retained root conversation.");
+        const state = current.getState(runId);
+        const run = state?.run;
+        const agentId = run?.agentIds[callIndex];
+        const attempt = run?.attempts[callIndex];
+        if (!state || !run || !agentId || !Number.isInteger(attempt) || (attempt ?? 0) < 1)
+          throw new Error("No retained conversation is available for this call.");
+        const executionGeneration = state.executionGeneration;
+        await openOwnedConversation(
+          pi.events,
+          agentId,
+          { extension: "pi-workflows", runId, nodeId: `call-${callIndex}`, attemptId: `attempt-${attempt}` },
+          () => {
+            try {
+              return (
+                resolve().getState(runId) === state &&
+                state.executionGeneration === executionGeneration &&
+                run.agentIds[callIndex] === agentId &&
+                run.attempts[callIndex] === attempt
+              );
+            } catch {
+              return false;
+            }
+          },
+        );
+      },
+    });
+  };
+
+  const workflowUiSurface = (): WorkflowUiSurface | undefined => {
+    const ctx = deliveryContext;
+    if (!active || !engine || engine.isDisposed() || ctx?.mode !== "tui" || !ctx.hasUI || !ownsDeliveryBranch())
+      return undefined;
+    return {
+      snapshot: buildWorkflowUiSnapshot(engine, workflowUiSurfaceId),
+      open: (runId) => showNavigator(ctx, runId),
+      notifyError: (message) => notifyWorkflow(ctx, message, "error"),
+    };
+  };
+
   const registerSurface = (): void => {
     if (active) return;
     active = true;
@@ -531,6 +650,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     workflowEngine.onRunSettled = notifyRunChanged;
     workflowEngine.onBackgroundExecution = (runId) => void deliverBackgroundResult(workflowEngine, runId);
     workflowEngine.onRuntimeEvent = notifyRunChanged;
+    workflowEngine.onInspectionChanged = notifyRunChanged;
     if (typeof pi.registerMessageRenderer === "function") {
       pi.registerMessageRenderer("pi-workflows:delivery", (message, { expanded }, theme) => {
         const original =
@@ -549,6 +669,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // never frozen onto a run. Without this they would resume with no table and
     // re-run every finished call untabled.
     workflowEngine.strengths = () => workflowSettings.strengths;
+    workflowEngine.loadSavedWorkflow = resolveNestedWorkflow;
     // Command/tool registrations persist across session replacement, but the
     // widget belongs to the newly restored engine and must be refreshed too.
     refreshWidget();
@@ -712,21 +833,21 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           try {
             return currentEngine();
           } catch (error: unknown) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "error");
             return undefined;
           }
         };
         if (!subcommand) {
-          await showWorkflowNavigator(ctx, currentEngine);
+          await showNavigator(ctx);
           return;
         }
         if (subcommand === "run") {
           if (!restArgs) {
-            ctx.ui.notify("/workflows run <prompt-or-script>", "warning");
+            notifyWorkflow(ctx, "/workflows run <prompt-or-script>", "warning");
             return;
           }
           const runId = await runWorkflowFromPrompt(ctx, restArgs);
-          if (runId) ctx.ui.notify(`Workflow started in background: ${runId}`, "info");
+          if (runId) notifyWorkflow(ctx, `Workflow started in background: ${runId}`, "info");
           return;
         }
         if (subcommand === "status") {
@@ -735,14 +856,15 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           if (restArgs) {
             const run = workflowEngine.getRun(restArgs);
             if (!run) {
-              ctx.ui.notify(`Workflow run not found: ${restArgs}`, "warning");
+              notifyWorkflow(ctx, `Workflow run not found: ${restArgs}`, "warning");
               return;
             }
-            ctx.ui.notify(`${run.runId} · ${run.status} · ${String(run.meta?.name ?? run.runId)}`, "info");
+            notifyWorkflow(ctx, `${run.runId} · ${run.status} · ${String(run.meta?.name ?? run.runId)}`, "info");
             return;
           }
           const runs = workflowEngine.list();
-          ctx.ui.notify(
+          notifyWorkflow(
+            ctx,
             runs.length === 0
               ? "No workflow runs."
               : runs.map((r) => `${r.runId} · ${r.status} · ${String(r.name)}`).join("\n"),
@@ -755,11 +877,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           if (!workflowEngine) return;
           const runId = restArgs || String(workflowEngine.list()[0]?.runId ?? "");
           if (!runId) {
-            ctx.ui.notify("No workflow runs to watch.", "warning");
+            notifyWorkflow(ctx, "No workflow runs to watch.", "warning");
             return;
           }
-          const run = await workflowEngine.waitFor(runId).catch(() => undefined);
-          if (run) ctx.ui.notify(`${run.runId} settled as ${run.status}`, "info");
+          const run = workflowEngine.getRun(runId);
+          if (!run) {
+            notifyWorkflow(ctx, `Workflow run not found: ${runId}`, "warning");
+            return;
+          }
+          if (ctx.mode === "tui" && ctx.hasUI) await showNavigator(ctx, runId);
+          else notifyWorkflow(ctx, `${run.runId} · ${run.status} — use workflow_control outside TUI.`, "info");
           return;
         }
         if (subcommand === "stop" || subcommand === "pause" || subcommand === "resume" || subcommand === "rm") {
@@ -773,7 +900,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           );
           if (!runId) {
             const destructive = subcommand === "stop" || subcommand === "rm";
-            ctx.ui.notify(
+            notifyWorkflow(
+              ctx,
               destructive
                 ? `/workflows ${subcommand} <runId> — a run id is required; /workflows status lists them`
                 : `/workflows ${subcommand} <runId>`,
@@ -786,16 +914,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             if (!workflowEngine) return;
             await workflowEngine.control(subcommand, runId);
             if (subcommand === "resume") void deliverBackgroundResult(workflowEngine, runId);
-            ctx.ui.notify(`Workflow ${subcommand} requested: ${runId}`, "info");
+            notifyWorkflow(ctx, `Workflow ${subcommand} requested: ${runId}`, "info");
           } catch (error: unknown) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "error");
           }
           return;
         }
         if (subcommand === "save") {
           const name = rest[0] ?? "";
           if (!name) {
-            ctx.ui.notify("/workflows save <name> [runId]", "warning");
+            notifyWorkflow(ctx, "/workflows save <name> [runId]", "warning");
             return;
           }
           const workflowEngine = engineForCommand();
@@ -803,13 +931,13 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           // Fallback to most recent run when runId omitted — matches upstream runs.find(r=>r.script)
           const runId = rest[1] ?? String(workflowEngine.list()[0]?.runId ?? "");
           if (!runId) {
-            ctx.ui.notify("No workflow runs to save.", "warning");
+            notifyWorkflow(ctx, "No workflow runs to save.", "warning");
             return;
           }
           try {
             await saveWorkflowFromRun(ctx, name, runId);
           } catch (error: unknown) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "error");
           }
           return;
         }
@@ -881,15 +1009,19 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           };
           const [strength, target] = rest;
           if (strength === undefined) {
-            ctx.ui.notify(describe(), "info");
+            notifyWorkflow(ctx, describe(), "info");
             return;
           }
           if (!isWorkflowStrength(strength)) {
-            ctx.ui.notify(`"${strength}" is not a workflow strength. Use one of ${WORKFLOW_STRENGTH_LIST}.`, "warning");
+            notifyWorkflow(
+              ctx,
+              `"${strength}" is not a workflow strength. Use one of ${WORKFLOW_STRENGTH_LIST}.`,
+              "warning",
+            );
             return;
           }
           if (target === undefined || rest.length !== 2) {
-            ctx.ui.notify(`/workflows strength [<${WORKFLOW_STRENGTHS.join("|")}> <tier>|off]`, "warning");
+            notifyWorkflow(ctx, `/workflows strength [<${WORKFLOW_STRENGTHS.join("|")}> <tier>|off]`, "warning");
             return;
           }
           // `off` reads as "unset" unless the host really defines a tier by
@@ -898,7 +1030,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           // to clear one.
           const unset = target === "off" && catalogue?.includes("off") !== true;
           if (!unset && catalogue && !catalogue.includes(target)) {
-            ctx.ui.notify(
+            notifyWorkflow(
+              ctx,
               `"${target}" is not a tier this host defines. Available: ${catalogue.join(", ") || "(none)"}. ` +
                 "Define it in /agents → Model tiers first.",
               "warning",
@@ -911,7 +1044,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             // table, and this key replaces rather than merges — so the other two
             // strengths would go from routed to unmapped as a side effect of
             // setting this one. Refusing costs a retry; writing costs a run.
-            ctx.ui.notify(
+            notifyWorkflow(
+              ctx,
               "The tier catalogue is unavailable, so the current table cannot be read. " +
                 "Retry once the managed peer is reachable.",
               "warning",
@@ -931,7 +1065,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           try {
             persistWorkflowSetting({ strengths: unset ? others : { ...others, [strength]: target } });
           } catch (error: unknown) {
-            ctx.ui.notify(
+            notifyWorkflow(
+              ctx,
               `Could not save workflow strength routing: ${error instanceof Error ? error.message : String(error)}`,
               "warning",
             );
@@ -958,10 +1093,10 @@ export default function piWorkflows(pi: ExtensionAPI): void {
                 "than as the clear keyword. To leave a strength unmapped here, remove its entry from the " +
                 "`strengths` object in this project's settings.json."
               : "";
-          ctx.ui.notify(`${describe()}${shadowed}`, "info");
+          notifyWorkflow(ctx, `${describe()}${shadowed}`, "info");
           return;
         }
-        ctx.ui.notify(`Unknown /workflows subcommand: ${subcommand}`, "warning");
+        notifyWorkflow(ctx, `Unknown /workflows subcommand: ${subcommand}`, "warning");
       },
     });
 
@@ -972,7 +1107,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
         const action = tokens[0] ?? "status";
         if (action === "status") {
-          ctx.ui.notify(
+          notifyWorkflow(
+            ctx,
             `Workflow progress: ${workflowSettings.progressMode}, max agents shown: ${workflowSettings.maxAgentsShown}`,
             "info",
           );
@@ -984,23 +1120,25 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         } else if (action === "max") {
           const max = Number(tokens[1]);
           if (!Number.isInteger(max) || max < 1 || max > 32) {
-            ctx.ui.notify("Usage: /workflows-progress max <1-32>", "warning");
+            notifyWorkflow(ctx, "Usage: /workflows-progress max <1-32>", "warning");
             return;
           }
           patch = { maxAgentsShown: max };
         } else {
-          ctx.ui.notify("Usage: /workflows-progress compact|detailed|status|max <N>", "warning");
+          notifyWorkflow(ctx, "Usage: /workflows-progress compact|detailed|status|max <N>", "warning");
           return;
         }
         try {
           persistWorkflowSetting(patch);
           refreshWidget();
-          ctx.ui.notify(
+          notifyWorkflow(
+            ctx,
             `Workflow progress set to ${workflowSettings.progressMode}, max ${workflowSettings.maxAgentsShown}.`,
             "info",
           );
         } catch (error: unknown) {
-          ctx.ui.notify(
+          notifyWorkflow(
+            ctx,
             `Could not save workflow progress settings: ${error instanceof Error ? error.message : String(error)}`,
             "warning",
           );
@@ -1029,24 +1167,25 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         if (token === "off") {
           keywordTriggerEnabled = false;
           persistTriggerSettings();
-          ctx.ui.notify("Workflow keyword trigger disabled.", "info");
+          notifyWorkflow(ctx, "Workflow keyword trigger disabled.", "info");
           return;
         }
         if (token === "on") {
           keywordTriggerEnabled = true;
           persistTriggerSettings();
-          ctx.ui.notify(`Workflow keyword trigger armed on "${triggerKeyword ?? DEFAULT_TRIGGER_WORD}".`, "info");
+          notifyWorkflow(ctx, `Workflow keyword trigger armed on "${triggerKeyword ?? DEFAULT_TRIGGER_WORD}".`, "info");
           return;
         }
         if (token === "reset") {
           triggerKeyword = undefined;
           keywordTriggerEnabled = true;
           persistTriggerSettings();
-          ctx.ui.notify(`Workflow keyword trigger reset to default "${DEFAULT_TRIGGER_WORD}".`, "info");
+          notifyWorkflow(ctx, `Workflow keyword trigger reset to default "${DEFAULT_TRIGGER_WORD}".`, "info");
           return;
         }
         if (token === "status") {
-          ctx.ui.notify(
+          notifyWorkflow(
+            ctx,
             `Workflow keyword trigger: ${keywordTriggerEnabled ? "armed" : "disabled"} on "${triggerKeyword ?? DEFAULT_TRIGGER_WORD}"`,
             "info",
           );
@@ -1054,13 +1193,17 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         }
         const keyword = token === "set" ? (args.trim().split(/\s+/)[1] ?? "") : token;
         if (!TRIGGER_WORD_PATTERN.test(keyword)) {
-          ctx.ui.notify("Usage: /workflows-trigger set <one-word-keyword> | off | on | reset | status", "warning");
+          notifyWorkflow(
+            ctx,
+            "Usage: /workflows-trigger set <one-word-keyword> | off | on | reset | status",
+            "warning",
+          );
           return;
         }
         triggerKeyword = keyword.toLowerCase();
         keywordTriggerEnabled = true;
         persistTriggerSettings();
-        ctx.ui.notify(`Workflow keyword trigger armed on "${keyword}".`, "info");
+        notifyWorkflow(ctx, `Workflow keyword trigger armed on "${keyword}".`, "info");
       },
     });
 
@@ -1132,7 +1275,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         const level = args.trim().toLowerCase();
         if (level !== "off" && level !== "high" && level !== "ultra") {
-          ctx.ui.notify(`Effort is currently "${effortLevel}". Usage: /effort off|high|ultra`, "info");
+          notifyWorkflow(ctx, `Effort is currently "${effortLevel}". Usage: /effort off|high|ultra`, "info");
           return;
         }
         effortLevel = level;
@@ -1141,7 +1284,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         } catch {
           /* warning is non-fatal */
         }
-        ctx.ui.notify(
+        notifyWorkflow(
+          ctx,
           level === "off"
             ? "Effort off — messages are no longer auto-armed."
             : `Effort ${level} enabled for substantive messages.`,
@@ -1158,7 +1302,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         } catch {
           /* warning is non-fatal */
         }
-        ctx.ui.notify(
+        notifyWorkflow(
+          ctx,
           effortLevel === "off"
             ? "Ultracode off."
             : "Ultracode on — substantive messages use exhaustive workflow guidance.",
@@ -1186,7 +1331,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           if (name === "code-review") {
             const cwd = ctx.cwd;
             const scope = resolveCodeReviewScope(text, (file, argv) => runCommand(file, argv, cwd));
-            for (const notice of scope.notices) ctx.ui.notify(notice, "warning");
+            for (const notice of scope.notices) notifyWorkflow(ctx, notice, "warning");
             if (!scope.diff.trim()) return;
             scriptArgs = { diff: scope.diff, diffSource: scope.diffSource };
           } else {
@@ -1195,7 +1340,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           try {
             validateBuiltinArgs(name, scriptArgs);
           } catch (error: unknown) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+            notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "warning");
             return;
           }
           const options: ScriptStartOptions = {
@@ -1210,9 +1355,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             const workflowEngine = currentEngine();
             const result = await workflowEngine.start(descriptor.script, options);
             void deliverBackgroundResult(workflowEngine, result.runId);
-            ctx.ui.notify(`Workflow ${name} started in background: ${result.runId}`, "info");
+            notifyWorkflow(ctx, `Workflow ${name} started in background: ${result.runId}`, "info");
           } catch (error: unknown) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "error");
           }
         },
       });
@@ -1528,7 +1673,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       void deliverBackgroundResult(workflowEngine, result.runId);
       return result.runId;
     } catch (error: unknown) {
-      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      notifyWorkflow(ctx, error instanceof Error ? error.message : String(error), "error");
       return undefined;
     }
   };
@@ -1539,7 +1684,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       throw new Error(`Workflow run not found: ${runId ?? "(none)"}`);
     }
     saveWorkflow(name, state.run.script, sessionCwd);
-    ctx.ui.notify(`Saved workflow "${name}" (${state.run.script.length} chars).`, "info");
+    notifyWorkflow(ctx, `Saved workflow "${name}" (${state.run.script.length} chars).`, "info");
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1654,6 +1799,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // ownership, not a captured function value, provide session affinity.
     deliveryContext = ctx;
     deliveryBranchAnchor = journalBranchAnchor;
+    workflowUiBridge ??= new WorkflowUiBridge(pi.events, workflowUiSurface);
+    workflowUiBridge.publish();
     inputPreparing = false;
     compacting = false;
     navigating = false;
@@ -1688,9 +1835,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             };
             const result = await workflowEngine.start(script, options);
             void deliverBackgroundResult(workflowEngine, result.runId);
-            commandCtx.ui.notify(`Workflow ${savedName} started in background: ${result.runId}`, "info");
+            notifyWorkflow(commandCtx, `Workflow ${savedName} started in background: ${result.runId}`, "info");
           } catch (error: unknown) {
-            commandCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            notifyWorkflow(commandCtx, error instanceof Error ? error.message : String(error), "error");
           }
         },
       });
@@ -1701,6 +1848,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     // This synchronous boundary is shared with the bus-first shutdown path.
     const quiescence = beginShutdownQuiesce();
+    workflowUiBridge?.dispose();
+    workflowUiBridge = undefined;
     clearWidget();
     widgetUi = undefined;
     if (widgetTimer) {

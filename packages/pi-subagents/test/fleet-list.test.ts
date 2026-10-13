@@ -40,7 +40,10 @@ function fakeManager(agents: AgentRecord[]): AgentManager {
   return {
     listAgentsMutable: () => agents,
     abort: () => true,
-    steer: vi.fn(() => true),
+    steerAccepted: vi.fn(async () => true),
+    canHandoff: vi.fn(() => false),
+    handoff: vi.fn(() => true),
+    handoffUnavailableReason: vi.fn(() => "Background pool is full"),
   } as unknown as AgentManager;
 }
 
@@ -495,7 +498,7 @@ describe("FleetList overlay lifecycle", () => {
     h.overlayComponent()!.handleInput(ENTER);
     for (const ch of "draft") h.overlayComponent()!.handleInput(ch);
     h.overlayComponent()!.handleInput(ENTER);
-    expect(h.manager.steer).toHaveBeenCalledWith("wanted", "draft");
+    expect(h.manager.steerAccepted).toHaveBeenCalledWith("wanted", "draft", { session: agents[0].session, owner: undefined });
     vi.restoreAllMocks();
   });
 
@@ -513,7 +516,7 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.render()).toEqual([]);
   });
 
-  it("wires the viewer's steer composer to manager.steer with the agent id", () => {
+  it("wires the viewer's steer composer to accepted steering with the captured session", () => {
     const agents = [makeRecord({ id: "live", description: "the one" })];
     const h = harness(agents);
     h.press(DOWN);  // activate (main)
@@ -526,7 +529,7 @@ describe("FleetList overlay lifecycle", () => {
     for (const ch of "go left") viewer!.handleInput(ch);
     viewer!.handleInput("\r");                       // Enter → send
 
-    expect(h.manager.steer).toHaveBeenCalledWith("live", "go left");
+    expect(h.manager.steerAccepted).toHaveBeenCalledWith("live", "go left", { session: agents[0].session, owner: undefined });
   });
 
   it("does NOT auto-close when the viewed agent finishes (final output stays readable)", () => {

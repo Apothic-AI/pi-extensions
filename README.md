@@ -239,3 +239,8 @@ packages are packed or published only when intentionally selected.
 
 See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 [`AGENTS.md`](AGENTS.md) for the repository's authoring rules.
+
+## Reference reviews
+
+- [Community extension survey](docs/community-extension-survey.md): Todo/checklist alternatives, project task ledgers, and additive plugin patterns with primary-source links and compatibility caveats.
+- [Workflow and subagent UI synchronization](docs/workflow-ui-upstream-sync.md): selective upstream adoption, interactive ownership and verification boundaries.
