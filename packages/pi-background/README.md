@@ -13,9 +13,38 @@ pi install npm:@signalridge/pi-background
 pi -e ./packages/pi-background
 ```
 
-This experimental package is opt-in. Activation adds its six model-facing tools
-without a new settings schema, global configuration writes by the extension, or
-changes to other extensions' configuration. Do not load this package alongside
+This experimental package is opt-in. It registers six model-facing tools without
+a new settings schema, global configuration writes by the extension, or changes
+to other extensions' configuration. Registration is distinct from exposure: if
+Pi's current tool selection hides these tools, the model cannot call them.
+
+For one invocation, add them without replacing the default tool selection:
+
+```bash
+pi -e npm:@signalridge/pi-background --tools +bash_background,+monitor,+background_list,+background_logs,+background_stop,+background_clear
+```
+
+For persistent activation, merge the package into Pi's existing `packages` and
+the tool names into its existing `defaultTools`; do not overwrite either list.
+An additive selection for otherwise-default tools is:
+
+```json
+{
+  "defaultTools": [
+    "+bash_background", "+monitor", "+background_list",
+    "+background_logs", "+background_stop", "+background_clear"
+  ]
+}
+```
+
+If an explicit plain-name allowlist is already configured, append the six plain
+tool names instead. Reload or restart Pi after changing resources/tool selection;
+CLI exclusions and permission policies still apply. Guidance encourages model
+selection, but does not guarantee that every model chooses background execution.
+Older releases such as 1.3.0 provide tools/status, not the interactive task UI
+below.
+
+Do not load this package alongside
 another extension owning `bash_background`, `monitor`, or `background_*` tools.
 The package refuses to start if Pi resolves one of its tool names to an earlier
 extension. Pi can disambiguate duplicate commands; load only one background
@@ -138,6 +167,10 @@ scrolling, follow-tail, and both/stdout/stderr filters. Keyboard controls:
 - **↑/↓**, **Home/End**, **PgUp/PgDn**: select tasks or scroll logs; End follows the log tail.
 - **Enter**: open selected logs; **Esc**: return to tasks, then close.
 - **f**: toggle tail following; **s**: cycle both/stdout/stderr.
+  Pausing keeps one bounded, sanitized snapshot stable while output continues;
+  End or resuming follow refreshes the current retained tail. Resize preserves
+  the snapshot's source position. A one-column terminal marks oversized
+  graphemes as `?`; widening restores their original text.
 - **x**, then **y**: stop exactly the captured owned job and wait for confirmed exit.
 - **d**, then **y**: clear exactly one confirmed terminal job, never a running job.
   Any other key cancels confirmation; repeated keys and Enter do not confirm.
@@ -286,6 +319,14 @@ modules and Node builtins.
 ```bash
 bun run --cwd packages/pi-background check
 ```
+
+Task-viewer acceptance includes 108 passing package tests and the complete
+repository gate. Actual Pi 1.0.4 CLI runs through isolated fullscreen/regular PTYs
+passed 161 recorded checks, covering model tool exposure, asynchronous real shell
+execution alongside independent work, live logs, paging, CJK resize, distinct-key
+stop/clear, editor draft restoration and process-group cleanup. Fixtures use an
+offline faux provider and harmless local processes, not live provider credentials
+or physical-terminal qualification.
 
 ## License
 

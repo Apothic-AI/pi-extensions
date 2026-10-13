@@ -112,6 +112,154 @@ function fixture(ids = ["one", "two"], fullscreen = true, id?: string) {
 }
 
 describe("explicit background task UI", () => {
+  it.each([true, false])(
+    "preserves every ASCII cell through native width-one scrolling (fullscreen=%s)",
+    async (fullscreen) => {
+      const h = fixture(["one"], fullscreen, "one");
+      h.setLogs("abcdef");
+      h.native.resize(1, 8); // six headers, one log cell, reserved footer space
+      h.view.mount();
+      const viewing = h.native.ui.custom(
+        (_tui, _theme, _keys, done) => {
+          h.done.mockImplementation(() => done(undefined));
+          return h.view;
+        },
+        {
+          overlay: true,
+          overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" },
+        },
+      );
+      await vi.waitFor(() => expect(h.native.component()).toBe(h.view));
+      h.native.key("\x1b[H");
+      const cells: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        cells.push(utilities.stripTerminalSequences(h.native.render()[6]).trim());
+        h.native.key("\x1b[B");
+      }
+      expect(cells.join("")).toBe("abcdef");
+      // Oversized graphemes get an explicit placeholder without consuming neighbors.
+      h.native.key("\x1b[F");
+      h.setLogs("a中b😀c");
+      h.native.render();
+      h.native.key("\x1b[H");
+      const mixed: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        mixed.push(utilities.stripTerminalSequences(h.native.render()[6]).trim());
+        h.native.key("\x1b[B");
+      }
+      expect(mixed.join("")).toBe("a?b?c");
+      h.native.resize(40, 12);
+      h.native.key("\x1b[H");
+      expect(h.native.render().join("\n")).toContain("a中b😀c");
+      h.view.close();
+      await viewing;
+    },
+  );
+
+  it.each(["lines", "bytes"])(
+    "keeps a bounded paused snapshot stable across rolling %s, duplicates and rewrap",
+    (cap) => {
+      const h = fixture(["one"], true, "one");
+      h.view.mount();
+      const line = (i: number) => (i % 3 === 0 ? "repeated" : `line-${i}-${"a".repeat(cap === "bytes" ? 90 : 0)}`);
+      const window = (start: number) => Array.from({ length: 1000 }, (_, i) => line(start + i)).join("\n");
+      h.setLogs(window(0));
+      h.text();
+      h.view.handleInput("\x1b[H");
+      for (let i = 0; i < 500; i++) h.view.handleInput("\x1b[B");
+      const before = h.view.render(100).slice(6, 15);
+      const reads = vi.mocked(h.manager.logs).mock.calls.length;
+      for (const start of [1, 8, 100, 1500]) {
+        h.setLogs(window(start));
+        expect(h.view.render(100).slice(6, 15)).toEqual(before);
+      }
+      expect(h.text()).toContain("snapshot");
+      h.native.terminal.columns = 40;
+      expect(h.view.render(40)[6]).toContain(before[0].slice(0, 30));
+      h.native.terminal.columns = 100;
+      expect(h.view.render(100).slice(6, 15)).toEqual(before);
+      expect(vi.mocked(h.manager.logs).mock.calls.length).toBe(reads);
+      h.view.handleInput("\x1b[F");
+      expect(h.text()).toContain("line-2498");
+      expect(h.text()).not.toContain("snapshot");
+      h.view.handleInput("f");
+      h.text();
+      h.setLogs("fresh-output");
+      h.view.handleInput("f");
+      expect(h.text()).toContain("fresh-output");
+    },
+  );
+
+  it.each([true, false])(
+    "uses a full public overlay above host chrome with encoded paging (fullscreen=%s)",
+    async (fullscreen) => {
+      const selected = "b3fb95b7-df76-44a2-bb85-5f2d85c8a11c";
+      const h = fixture([selected], fullscreen);
+      const ctx = { mode: "tui", hasUI: true, ui: h.native.ui } as unknown as ExtensionContext;
+      const viewing = showBackgroundUI(ctx, {
+        manager: h.manager,
+        live: () => true,
+        cancel: h.cancel,
+        mount: () => () => {},
+      });
+      await vi.waitFor(() => expect(h.native.component()).toBeDefined());
+      for (const [width, height] of [
+        [80, 24],
+        [40, 12],
+      ]) {
+        h.native.resize(width, height);
+        let screen = h.native.render().map(utilities.stripTerminalSequences).join("\n");
+        expect(screen).toContain("Background tasks");
+        expect(screen).toContain(`ID: ${selected}`);
+        expect(screen).toContain(`> ${selected}`);
+        expect(h.native.overlayBounds()).toEqual({ row: 0, col: 0, width, height });
+        for (const control of ["Enter logs", "x stop", "d clear", "Esc close"]) expect(screen).toContain(control);
+        h.native.key("x");
+        screen = h.native.render().map(utilities.stripTerminalSequences).join("\n");
+        expect(screen).toContain("y confirms");
+        h.native.key("n");
+        h.native.key("\r");
+        screen = h.native.render().map(utilities.stripTerminalSequences).join("\n");
+        expect(screen).toContain("Background logs");
+        expect(screen).toContain(`ID: ${selected}`);
+        expect(screen).toContain("line-59");
+        for (const control of ["f follow", "s stream", "x stop", "d clear", "Esc tasks"])
+          expect(screen).toContain(control);
+        h.native.key("\x1b[H");
+        const first = h.native
+          .render()
+          .map(utilities.stripTerminalSequences)
+          .filter((row) => row.trim().startsWith("line-"));
+        expect(first[0]?.trim()).toBe("line-0");
+        h.native.key("\x1b[6~");
+        const second = h.native
+          .render()
+          .map(utilities.stripTerminalSequences)
+          .filter((row) => row.trim().startsWith("line-"));
+        expect(second[0]?.trim()).toBe(`line-${first.length}`);
+        h.native.key("\x1b[5~");
+        expect(h.native.render().join("\n")).toContain("line-0");
+        h.native.key("\x1b[F");
+        expect(h.native.render().join("\n")).toContain("line-59");
+        h.native.key("\x1b");
+        h.setJobs([job(selected, true)]);
+        h.native.key("d");
+        screen = h.native.render().map(utilities.stripTerminalSequences).join("\n");
+        expect(screen).toContain("Clear");
+        expect(screen).toContain("y confirms");
+        expect(screen).toContain("other keys cancel");
+        h.native.key("n");
+        h.setJobs([job(selected)]);
+      }
+      expect(h.native.custom).toHaveBeenCalledWith(expect.any(Function), {
+        overlay: true,
+        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 },
+      });
+      h.native.key("\x1b");
+      await viewing;
+      expect(h.native.render().join("\n")).toContain("Host draft");
+    },
+  );
   it("has no subscription in construction and releases exactly once on close/dispose", () => {
     const h = fixture();
     expect(h.manager.subscribe).not.toHaveBeenCalled();

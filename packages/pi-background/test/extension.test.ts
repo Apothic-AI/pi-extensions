@@ -548,6 +548,31 @@ describe("extension lifecycle", () => {
     }
   });
 
+  it("refreshes status after an idle UI stop without a later tool or lifecycle event", async () => {
+    const native = nativeUIFixture();
+    const h = harness();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    try {
+      await h.emit("session_start");
+      await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "1 running · 0 finished");
+      const opening = h.commands.get("background")?.handler("", h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      native.key("x");
+      native.key("y");
+      await vi.waitFor(() => expect(fake.managers[0].manager.get("job-0").endedAt).toBeDefined());
+      await vi.waitFor(() =>
+        expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished"),
+      );
+      native.key("\x1b");
+      await opening;
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished");
+    } finally {
+      await h.emit("session_shutdown");
+      native.dispose();
+    }
+  });
+
   it("retires an old same-ID view before late IO and prevents wrong-branch controls before tree callbacks", async () => {
     const native = nativeUIFixture();
     const h = harness();

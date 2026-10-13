@@ -201,12 +201,22 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
       if (input && input !== "status" && !viewId) throw new Error("Usage: /background [view <id>|status|retry]");
       if (viewId) owner.manager.get(viewId);
       if (input !== "status" && ctx.mode === "tui" && ctx.hasUI) {
+        const manager = owner.ownership.guard(owner.manager, () => {
+          requireOwner(ctx, owner);
+        });
         await showBackgroundUI(
           ctx,
           {
-            manager: owner.ownership.guard(owner.manager, () => {
-              requireOwner(ctx, owner);
-            }),
+            manager: {
+              ...manager,
+              stop: async (id) => {
+                try {
+                  return await manager.stop(id);
+                } finally {
+                  if (live(owner, ctx)) updateStatus(owner);
+                }
+              },
+            },
             live: () => ctx.mode === "tui" && ctx.hasUI && live(owner, ctx),
             cancel: (id) => {
               requireOwner(ctx, owner);
