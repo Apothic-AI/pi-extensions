@@ -41,6 +41,17 @@ export class Ownership {
   /** Bind all accesses and post-await results to the owner that began the call. */
   guard(manager: JobManager, check: () => void): JobManager {
     return {
+      subscribe: (listener) => {
+        check();
+        return manager.subscribe(() => {
+          try {
+            check();
+          } catch {
+            return;
+          }
+          listener();
+        });
+      },
       start: async (options, signal) => {
         check();
         const result = await manager.start(options, signal);

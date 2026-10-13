@@ -79,6 +79,17 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
   }
   const jobs = new Map<string, Job>();
   const starting = new Set<Promise<JobSnapshot>>();
+  const listeners = new Set<() => void>();
+  const changed = (): void => {
+    for (const listener of [...listeners]) {
+      if (!listeners.has(listener)) continue;
+      try {
+        listener();
+      } catch {
+        // UI invalidation cannot interrupt process supervision or other listeners.
+      }
+    }
+  };
   let pending = 0;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -111,6 +122,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
     });
     job.matcher = matcher;
     job.state.watch = { ...matcher.options, patterns: [...matcher.options.patterns] };
+    changed();
   };
   const signalGroup = (job: Job, signal: NodeJS.Signals): void => {
     // Never address a group after observing its leader exit, or after releasing it.
@@ -123,6 +135,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
         job.state.error = safeEventText(error instanceof Error ? error.message : String(error));
+        changed();
       }
     }
   };
@@ -132,6 +145,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
     if (job.stopReason) return;
     job.stopReason = reason;
     job.state.status = reason;
+    changed();
     clearTimeout(job.timeout);
     if (job.released) return;
     signalGroup(job, "SIGTERM");
@@ -148,6 +162,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         // A lost IPC connection makes the helper kill its own group;
         // successful release keeps the leader alive through descendant cleanup.
         job.state.error = safeEventText(error.message);
+        changed();
         if (job.child.connected) job.child.disconnect();
       }
     });
@@ -167,8 +182,10 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
             oldest = candidate;
           }
         }
-        if (oldest) jobs.delete(oldest.state.id);
-        else throw new Error("Background history is full");
+        if (oldest) {
+          jobs.delete(oldest.state.id);
+          changed();
+        } else throw new Error("Background history is full");
       }
       const child = spawn(process.versions.bun ? "node" : process.execPath, ["-e", SUPERVISOR_SOURCE], {
         cwd: options.cwd,
@@ -200,6 +217,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         done,
       };
       jobs.set(job.state.id, job);
+      changed();
       pending--;
       reserved = false;
       if (options.watch) setWatch(job, options.watch);
@@ -212,6 +230,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
           job.suppressExit = true;
           job.stopReason = "stopped";
           job.state.status = "stopped";
+          changed();
           clearTimeout(startupTimer);
           clearTimeout(job.killTimer);
           signalGroup(job, "SIGKILL");
@@ -226,6 +245,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
           job.suppressExit = true;
           job.stopReason = "stopped";
           job.state.status = "stopped";
+          changed();
           signalGroup(job, "SIGKILL");
         }, LIMITS.startupMs);
         signal?.addEventListener("abort", cancel, { once: true });
@@ -243,10 +263,12 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         child.stdout?.on("data", (chunk: Buffer) => {
           const text = job.logs.append("stdout", chunk);
           job.matcher?.feed("stdout", text);
+          changed();
         });
         child.stderr?.on("data", (chunk: Buffer) => {
           const text = job.logs.append("stderr", chunk);
           job.matcher?.feed("stderr", text);
+          changed();
         });
         child.on("message", (value: unknown) => {
           const message = messageObject(value);
@@ -259,6 +281,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
               child.send({ kind: "run", command: options.command, cwd: options.cwd }, (error) => {
                 if (!error) return;
                 job.state.error = safeEventText(error.message);
+                changed();
                 signalGroup(job, "SIGKILL");
               });
             }
@@ -275,9 +298,11 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
             if (options.timeoutMs !== undefined) {
               job.timeout = setTimeout(() => terminate(job, "timed_out"), options.timeoutMs);
             }
+            changed();
             resolve(snapshot(job));
           } else if (message.kind === "failure" && typeof message.error === "string") {
             job.state.error = safeEventText(message.error);
+            changed();
           } else if (
             message.kind === "result" &&
             (message.code === null || typeof message.code === "number") &&
@@ -289,6 +314,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         });
         child.on("error", (error) => {
           job.state.error = safeEventText(error.message);
+          changed();
         });
         child.on("close", (code, childSignal) => {
           if (job.closed) return;
@@ -319,6 +345,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
               text: `${status}: ${job.state.description}; code=${result.code}; signal=${result.signal}${job.state.error ? `; ${job.state.error}` : ""}`,
             });
           }
+          changed();
           finishDone();
           if (!acknowledged) {
             if (startupError) reject(startupError);
@@ -332,6 +359,13 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
   }
 
   const manager: JobManager = {
+    subscribe(listener) {
+      if (shuttingDown) return () => {};
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
     start(options, signal) {
       if (shuttingDown) return Promise.reject(new Error("Background manager is shutting down"));
       let validated: StartOptions;
@@ -373,6 +407,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         const job = requireJob(id);
         if (!job.closed) throw new Error("Cannot clear a running job");
         jobs.delete(id);
+        changed();
         return 1;
       }
       let cleared = 0;
@@ -381,10 +416,15 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         jobs.delete(jobId);
         cleared++;
       }
+      if (cleared) changed();
       return cleared;
     },
     shutdown() {
-      shuttingDown = true;
+      if (!shuttingDown) {
+        shuttingDown = true;
+        changed();
+        listeners.clear();
+      }
       if (!shutdownPromise) {
         for (const job of jobs.values()) terminate(job, "stopped");
         shutdownPromise = (async () => {

@@ -5,14 +5,17 @@ Opt-in, experimental background shell jobs and low-noise log monitors for the
 There are no model calls while a job is running or a monitor is waiting. Only an
 exit or a configured literal log match can request another agent turn.
 
-## Try from this checkout
+## Activate
 
 ```bash
-pi -ne -e ./packages/pi-background
+pi install npm:@signalridge/pi-background
+# Or load directly from this checkout:
+pi -e ./packages/pi-background
 ```
 
-After this package is published, install it with
-`pi install npm:@signalridge/pi-background`. Do not load this package alongside
+This experimental package is opt-in. Activation adds its six model-facing tools
+without a new settings schema, global configuration writes by the extension, or
+changes to other extensions' configuration. Do not load this package alongside
 another extension owning `bash_background`, `monitor`, or `background_*` tools.
 The package refuses to start if Pi resolves one of its tool names to an earlier
 extension. Pi can disambiguate duplicate commands; load only one background
@@ -43,9 +46,13 @@ fails rather than silently starting an unmanaged command.
 Tools return structured results as well as model-facing text. IDs are opaque and
 unique to an extension runtime. There is no tool accepting an arbitrary PID.
 
-Use background execution when the user asks for it or useful independent work
-remains. If a command's result is needed immediately, use foreground `bash` rather
-than starting a job and repeatedly inspecting its status.
+The model-facing tool and namespace guidance encourages **proactive**
+`bash_background` for long builds, tests, and commands when useful independent
+work remains. No separate user request is needed. If a result is an immediate
+dependency, use regular `bash` instead. Background tools return opaque job IDs
+immediately and notify on completion by default: do independent work rather than
+polling or sleeping. Inspect deliberately with `background_list` or
+`background_logs`. Ordinary `bash` is never auto-detached or overridden.
 
 ### Finite work
 
@@ -111,6 +118,47 @@ background_logs({ id: "<job-id>", tail: 200, stream: "stderr" })
 background_stop({ id: "<job-id>" })
 background_clear({ id: "<completed-job-id>" })
 ```
+
+## Interactive task UI
+
+Only explicit human commands open a screen; job output and model tool calls never
+steal focus:
+
+```text
+/background                 # live task list
+/background view <job-id>   # live stdout/stderr log viewer
+/background status         # notification/status snapshot, no custom screen
+/background retry          # existing explicit notification recovery
+```
+
+Task selection follows the opaque ID as jobs change. The selected task shows its
+command, cwd, status, exit code/signal, and dropped log bytes. The log viewer has
+scrolling, follow-tail, and both/stdout/stderr filters. Keyboard controls:
+
+- **↑/↓**, **Home/End**, **PgUp/PgDn**: select tasks or scroll logs; End follows the log tail.
+- **Enter**: open selected logs; **Esc**: return to tasks, then close.
+- **f**: toggle tail following; **s**: cycle both/stdout/stderr.
+- **x**, then **y**: stop exactly the captured owned job and wait for confirmed exit.
+- **d**, then **y**: clear exactly one confirmed terminal job, never a running job.
+  Any other key cancels confirmation; repeated keys and Enter do not confirm.
+
+Stop/clear use the same manager and cancellation ownership as tools, including
+cancelling only undelivered notices. Stop failures remain visible and recoverable
+without changing selection. Session retirement closes the old screen and releases
+its subscriptions before late output or async results can draw or control jobs.
+Cancelled navigation preflight does not retire jobs.
+
+Layout fits the current terminal height in regular and fullscreen modes, including
+narrow/CJK terminals. Untrusted logs are byte-bounded **before** sanitization and
+wrapping, without Markdown interpretation or terminal control sequences. The
+viewer shows at most the latest 1,000 retained lines and 64 KiB before wrapping;
+manager retention stays at 256 KiB per job. Closing a view releases its local
+subscriptions; output changes request coalesced TUI renders, not model turns.
+
+Custom screens require both `ctx.mode === "tui"` and `ctx.hasUI`. RPC/JSON/print
+keep all tools and command snapshots/hints, but never call custom UI. The TUI
+module is host-provided and deferred until an explicit TUI command. There is no
+PTY attachment, raw-PID control, SSH support, or durable job scope.
 
 ## Lifecycle and limits
 
