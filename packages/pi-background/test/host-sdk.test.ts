@@ -16,6 +16,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import background from "../src/extension.js";
 import { MESSAGE_TYPE, Notifications } from "../src/notifications.js";
+import { nativeUIFixture } from "./tui-fixture.js";
 
 // Real host loader, lifecycle, provider dispatch and tool pipeline. No paid model.
 describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "win32")(
@@ -26,7 +27,11 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       for (const dispose of cleanup.splice(0).reverse()) await dispose();
     });
 
-    async function fixture(inputGate?: (pi: ExtensionAPI) => void, laterGate?: (pi: ExtensionAPI) => void) {
+    async function fixture(
+      inputGate?: (pi: ExtensionAPI) => void,
+      laterGate?: (pi: ExtensionAPI) => void,
+      native?: ReturnType<typeof nativeUIFixture>,
+    ) {
       const cwd = mkdtempSync(join(tmpdir(), "background-host-"));
       const agentDir = join(cwd, "agent");
       mkdirSync(agentDir);
@@ -94,7 +99,10 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
         session.dispose();
         faux.setResponses([]);
       });
-      await session.bindExtensions({ onError: (error) => errors.push(String(error)) });
+      await session.bindExtensions({
+        onError: (error) => errors.push(String(error)),
+        ...(native ? { mode: "tui" as const, uiContext: native.ui } : {}),
+      });
       const host = new AgentSessionRuntime(
         session,
         { cwd, agentDir, modelRuntime: runtime, settingsManager, resourceLoader: loader, diagnostics: [] },
@@ -104,6 +112,46 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       );
       return { session, host, faux, errors, prompts, inputs };
     }
+
+    it("opens native task/log screens only on commands and confirms an owned stop through public UI bindings", async () => {
+      const native = nativeUIFixture();
+      cleanup.push(async () => native.dispose());
+      const { session, faux, errors } = await fixture(undefined, undefined, native);
+      faux.setResponses([
+        fauxAssistantMessage(
+          fauxToolCall("bash_background", {
+            command: "printf 'stdout-marker\\n'; printf 'stderr-marker\\n' >&2; sleep 20",
+            notify: "off",
+          }),
+          { stopReason: "toolUse" },
+        ),
+        fauxAssistantMessage("Independent work remains."),
+      ]);
+      await session.prompt("Start useful independent work.");
+      expect(native.custom).not.toHaveBeenCalled();
+      const command = session.prompt("/background");
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      expect(native.render().join("\n")).toContain("Background tasks");
+      native.key("\r");
+      native.key("s");
+      native.key("s");
+      await vi.waitFor(() => expect(native.render().join("\n")).toContain("stderr-marker"));
+      native.key("x");
+      native.key("x");
+      native.key("y");
+      expect(native.render().join("\n")).toContain("Status: running");
+      native.key("x");
+      native.key("y");
+      await vi.waitFor(() => expect(native.render().join("\n")).toContain("Status: stopped"));
+      native.key("\x1b");
+      native.key("\x1b");
+      await command;
+      expect(native.component()).toBeUndefined();
+      expect(session.messages.some((message) => message.role === "custom" && message.customType === MESSAGE_TYPE)).toBe(
+        false,
+      );
+      expect(errors).toEqual([]);
+    });
 
     it("wakes once at idle exit, delivers the matching custom message and has a valid structured tool result", async () => {
       const { session, faux, errors, prompts, inputs } = await fixture();

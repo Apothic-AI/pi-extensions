@@ -3,12 +3,30 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JobEvent, JobManager, JobSnapshot, StartOptions } from "../src/contracts.js";
 import extension from "../src/extension.js";
 import { MESSAGE_TYPE } from "../src/notifications.js";
+import { nativeUIFixture } from "./tui-fixture.js";
 
-const fake = vi.hoisted(() => ({ managers: [] as Array<{ manager: JobManager; emit: (event: JobEvent) => void }> }));
+const fake = vi.hoisted(() => ({
+  managers: [] as Array<{
+    manager: JobManager;
+    emit: (event: JobEvent) => void;
+    changes: () => void;
+    listeners: Set<() => void>;
+  }>,
+}));
 vi.mock("../src/manager.js", () => ({
   createJobManager: (emit: (event: JobEvent) => void): JobManager => {
     const jobs: JobSnapshot[] = [];
+    const listeners = new Set<() => void>();
+    const changes = () => {
+      for (const listener of [...listeners]) listener();
+    };
     const manager: JobManager = {
+      subscribe: vi.fn((listener) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      }),
       start: vi.fn(async (options: StartOptions) => {
         const job: JobSnapshot = {
           id: `job-${jobs.length}`,
@@ -21,6 +39,7 @@ vi.mock("../src/manager.js", () => ({
           droppedBytes: 0,
         };
         jobs.push(job);
+        changes();
         return job;
       }),
       watch: vi.fn((id, watch) => {
@@ -38,14 +57,22 @@ vi.mock("../src/manager.js", () => ({
       stop: vi.fn(async (id) => {
         const job = manager.get(id);
         job.status = "stopped";
+        job.endedAt = 2;
+        changes();
         return job;
       }),
-      clear: vi.fn(() => 0),
+      clear: vi.fn((id) => {
+        const index = jobs.findIndex((job) => job.id === id && job.endedAt !== undefined);
+        if (index < 0) throw new Error("Cannot clear a running job");
+        jobs.splice(index, 1);
+        changes();
+        return 1;
+      }),
       shutdown: vi.fn(async () => {
         jobs.length = 0;
       }),
     };
-    fake.managers.push({ manager, emit });
+    fake.managers.push({ manager, emit, changes, listeners });
     return manager;
   },
 }));
@@ -81,6 +108,7 @@ function harness(mode = "tui") {
   const userMessages: string[] = [];
   const status = vi.fn();
   const notify = vi.fn();
+  const custom = vi.fn();
   const messages: Array<{
     customType: string;
     content: string;
@@ -92,7 +120,7 @@ function harness(mode = "tui") {
     hasUI: mode === "tui" || mode === "rpc",
     cwd: process.cwd(),
     model: {},
-    ui: { setStatus: status, notify },
+    ui: { setStatus: status, notify, custom },
     sessionManager: {
       getSessionId: () => sessionId,
       getBranch: () => [
@@ -152,6 +180,7 @@ function harness(mode = "tui") {
     },
     status,
     notify,
+    custom,
     emit: async (name: string, data: Record<string, unknown> = {}) => handlers.get(name)?.(data, ctx),
     setIdle: (value: boolean) => {
       idle = value;
@@ -490,11 +519,116 @@ describe("extension lifecycle", () => {
     await h.emit("session_shutdown");
   });
 
+  it("opens only explicit commands, cancels owned notices and releases UI subscriptions", async () => {
+    const native = nativeUIFixture();
+    const h = harness();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    try {
+      await h.emit("session_start");
+      await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      h.setIdle(false);
+      fake.managers[0].emit(event());
+      expect(native.custom).not.toHaveBeenCalled();
+      await h.commands.get("background")?.handler("status", h.ctx);
+      expect(native.custom).not.toHaveBeenCalled();
+      const opening = h.commands.get("background")?.handler("", h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      expect(fake.managers[0].listeners.size).toBe(1);
+      native.key("x");
+      native.key("y");
+      await vi.waitFor(() => expect(fake.managers[0].manager.stop).toHaveBeenCalledWith("job-0"));
+      const list = await h.tools.get("background_list")?.execute("inspect", {}, undefined, undefined, h.ctx);
+      expect(list?.details.pendingNotifications).toBe(0);
+      native.key("\x1b");
+      await opening;
+      expect(fake.managers[0].listeners.size).toBe(0);
+    } finally {
+      await h.emit("session_shutdown");
+      native.dispose();
+    }
+  });
+
+  it("refreshes status after an idle UI stop without a later tool or lifecycle event", async () => {
+    const native = nativeUIFixture();
+    const h = harness();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    try {
+      await h.emit("session_start");
+      await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "1 running · 0 finished");
+      const opening = h.commands.get("background")?.handler("", h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      native.key("x");
+      native.key("y");
+      await vi.waitFor(() => expect(fake.managers[0].manager.get("job-0").endedAt).toBeDefined());
+      await vi.waitFor(() =>
+        expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished"),
+      );
+      native.key("\x1b");
+      await opening;
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished");
+    } finally {
+      await h.emit("session_shutdown");
+      native.dispose();
+    }
+  });
+
+  it("retires an old same-ID view before late IO and prevents wrong-branch controls before tree callbacks", async () => {
+    const native = nativeUIFixture();
+    const h = harness();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    try {
+      await h.emit("session_start");
+      await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      const opening = h.commands.get("background")?.handler("view job-0", h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      const old = fake.managers[0];
+      const oldView = native.component();
+      const late = [...old.listeners][0];
+      h.setBranch(["diverged"]);
+      late();
+      await opening;
+      expect(native.component()).toBeUndefined();
+      expect(old.manager.shutdown).toHaveBeenCalledOnce();
+      expect(old.listeners.size).toBe(0);
+      await h.emit("session_tree");
+      await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      const newer = h.commands.get("background")?.handler("view job-0", h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      oldView?.handleInput?.("x");
+      oldView?.handleInput?.("y");
+      late();
+      expect(old.manager.stop).not.toHaveBeenCalled();
+      expect(fake.managers[1].manager.stop).not.toHaveBeenCalled();
+      native.key("\x1b");
+      native.key("\x1b");
+      await newer;
+    } finally {
+      await h.emit("session_shutdown");
+      native.dispose();
+    }
+  });
+
+  it("does not call custom UI in TUI mode without hasUI", async () => {
+    const h = harness();
+    Object.defineProperty(h.ctx, "hasUI", { value: false });
+    await h.emit("session_start");
+    await h.commands.get("background")?.handler("", h.ctx);
+    expect(h.custom).not.toHaveBeenCalled();
+    expect(h.status).not.toHaveBeenCalled();
+    await h.emit("session_shutdown");
+  });
+
   it("never draws terminal status in RPC/headless modes", async () => {
     for (const mode of ["rpc", "json", "print"]) {
       const h = harness(mode);
       await h.emit("session_start");
       fake.managers.at(-1)?.emit(event());
+      await h.commands.get("background")?.handler("", h.ctx);
+      await h.commands.get("background")?.handler("status", h.ctx);
+      await h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx);
+      await h.commands.get("background")?.handler("view job-0", h.ctx);
+      expect(h.custom).not.toHaveBeenCalled();
       expect(h.status).not.toHaveBeenCalled();
       await h.emit("session_shutdown");
     }

@@ -3,6 +3,7 @@ import type { JobManager } from "./contracts.js";
 import { createJobManager } from "./manager.js";
 import { MESSAGE_TYPE, Notifications, safeText, WAKE_PREFIX, wakeIdFromText } from "./notifications.js";
 import { Ownership } from "./ownership.js";
+import { showBackgroundUI } from "./task-ui.js";
 import { registerTools } from "./tools.js";
 import { WakeTokens } from "./wake-tokens.js";
 
@@ -15,6 +16,7 @@ interface Owner {
   promptPending: boolean;
   compacting: boolean;
   navigating: boolean;
+  closeView?: () => void;
 }
 
 /** One extension instance owns one live branch; nothing starts in the factory. */
@@ -29,6 +31,13 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   function retire(owner: Owner): void {
     if (active !== owner) return;
     active = undefined;
+    const closeView = owner.closeView;
+    owner.closeView = undefined;
+    try {
+      closeView?.();
+    } catch {
+      // A disposed host UI must not prevent process/outbox retirement.
+    }
     owner.notifications.dispose();
     cleanup = Promise.all([cleanup, owner.manager.shutdown()]).then(() => {});
   }
@@ -38,7 +47,7 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   }
 
   function updateStatus(owner = active): void {
-    if (!live(owner) || owner.context.mode !== "tui") return;
+    if (!live(owner) || owner.context.mode !== "tui" || !owner.context.hasUI) return;
     const jobs = owner.manager.list();
     const running = jobs.filter((job) => job.status === "running").length;
     const pending = owner.notifications.count;
@@ -64,7 +73,8 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   async function close(): Promise<void> {
     generation += 1;
     const owner = active;
-    if (live(owner) && owner.context.mode === "tui") owner.context.ui.setStatus("pi-background", undefined);
+    if (live(owner) && owner.context.mode === "tui" && owner.context.hasUI)
+      owner.context.ui.setStatus("pi-background", undefined);
     if (owner) retire(owner);
     await cleanup;
   }
@@ -171,7 +181,7 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("background", {
-    description: "Background job status; /background retry explicitly retries pending notifications.",
+    description: "Open background tasks; view <id> opens logs, status summarizes, retry recovers notifications.",
     handler: async (args, ctx) => {
       const owner = requireOwner(ctx);
       const jobs = owner.manager.list();
@@ -186,13 +196,60 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
         updateStatus(owner);
         return;
       }
-      if (args.trim() && args.trim() !== "status") throw new Error("Usage: /background [status|retry]");
-      if (!ctx.hasUI) throw new Error("Use background_list for status in headless modes.");
+      const input = args.trim();
+      const viewId = /^view\s+(\S+)$/.exec(input)?.[1];
+      if (input && input !== "status" && !viewId) throw new Error("Usage: /background [view <id>|status|retry]");
+      if (viewId) owner.manager.get(viewId);
+      if (input !== "status" && ctx.mode === "tui" && ctx.hasUI) {
+        const manager = owner.ownership.guard(owner.manager, () => {
+          requireOwner(ctx, owner);
+        });
+        await showBackgroundUI(
+          ctx,
+          {
+            manager: {
+              ...manager,
+              stop: async (id) => {
+                try {
+                  return await manager.stop(id);
+                } finally {
+                  if (live(owner, ctx)) updateStatus(owner);
+                }
+              },
+            },
+            live: () => ctx.mode === "tui" && ctx.hasUI && live(owner, ctx),
+            cancel: (id) => {
+              requireOwner(ctx, owner);
+              owner.notifications.cancel(id);
+              updateStatus(owner);
+            },
+            mount: (closeView) => {
+              requireOwner(ctx, owner);
+              owner.closeView?.();
+              owner.closeView = closeView;
+              return () => {
+                if (owner.closeView === closeView) owner.closeView = undefined;
+              };
+            },
+          },
+          viewId,
+        );
+        return;
+      }
       const rows = jobs.map((job) => `${job.id} [${job.status}] ${safeText(job.description)}`);
       rows.push(
         `Pending notifications: ${owner.notifications.count}${owner.notifications.deliveryPaused ? " (paused)" : ""}.`,
       );
-      if (live(owner, ctx)) ctx.ui.notify(rows.join("\n"), "info");
+      rows.push(
+        "Use background_list/background_logs for inspection; /background and /background view <id> open task UI in TUI mode.",
+      );
+      if (!live(owner, ctx)) return;
+      if (ctx.hasUI) ctx.ui.notify(rows.join("\n"), "info");
+      else
+        pi.sendMessage(
+          { customType: "pi-background:status", content: rows.join("\n"), display: true },
+          { triggerTurn: false },
+        );
     },
   });
 

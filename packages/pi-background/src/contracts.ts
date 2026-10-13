@@ -50,6 +50,8 @@ export interface JobEvent {
 }
 
 export interface JobManager {
+  /** Local UI invalidation only; never a model wake. Unsubscribe is idempotent. */
+  subscribe(listener: () => void): () => void;
   start(options: StartOptions, signal?: AbortSignal): Promise<JobSnapshot>;
   watch(id: string, options: WatchOptions): JobSnapshot;
   list(): JobSnapshot[];

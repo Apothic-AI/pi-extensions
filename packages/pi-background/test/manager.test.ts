@@ -435,6 +435,59 @@ describe("job manager", () => {
     expect(instance.list()).toHaveLength(1);
   });
 
+  it("publishes isolated local changes for start/output/watch/confirmed stop/clear without model events", async () => {
+    const events: JobEvent[] = [];
+    const instance = manager(events);
+    const states: Array<{ count: number; status?: string; ended?: number; output?: string }> = [];
+    const throwing = instance.subscribe(() => {
+      throw new Error("UI failure");
+    });
+    const unsubscribe = instance.subscribe(() => {
+      const current = instance.list()[0];
+      states.push({
+        count: instance.list().length,
+        status: current?.status,
+        ended: current?.endedAt,
+        output: current ? instance.logs(current.id).text : undefined,
+      });
+    });
+    const job = await instance.start({ command: "sleep .1; printf 'live-output\\n'; sleep 20", cwd, attention: "off" });
+    expect(states.some((state) => state.status === "running")).toBe(true);
+    const beforeWatch = states.length;
+    instance.watch(job.id, { patterns: ["never"] });
+    expect(states.length).toBeGreaterThan(beforeWatch);
+    await until(() => states.some((state) => state.output?.includes("live-output")));
+    const stopped = await instance.stop(job.id);
+    expect(stopped.endedAt).toBeDefined();
+    expect(states.some((state) => state.status === "stopped" && state.ended !== undefined)).toBe(true);
+    instance.clear(job.id);
+    expect(states.at(-1)?.count).toBe(0);
+    expect(events).toEqual([]);
+    unsubscribe();
+    unsubscribe();
+    throwing();
+    const count = states.length;
+    await instance.shutdown();
+    expect(states.length).toBe(count);
+  });
+
+  it("notifies shutdown once and releases subscribers before late child output; late subscriptions are inert", async () => {
+    const instance = manager();
+    await instance.start({ command: "sleep 20", cwd, attention: "off" });
+    const listener = vi.fn();
+    instance.subscribe(listener);
+    const shutdown = instance.shutdown();
+    expect(listener).toHaveBeenCalledOnce();
+    const later = vi.fn();
+    const unsubscribe = instance.subscribe(later);
+    await shutdown;
+    await instance.shutdown();
+    unsubscribe();
+    unsubscribe();
+    expect(listener).toHaveBeenCalledOnce();
+    expect(later).not.toHaveBeenCalled();
+  });
+
   it("explicitly rejects unsupported Windows", () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     expect(() => createJobManager(() => {})).toThrow("win32");
