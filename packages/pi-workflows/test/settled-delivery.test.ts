@@ -1,3 +1,4 @@
+import { KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
@@ -99,7 +100,7 @@ function fixture(
     ui: { notify: vi.fn(), setWidget: vi.fn() },
     isIdle: () => idle,
     hasPendingMessages: () => queued,
-    sessionManager: { getBranch: branch, getLeafId: () => leaf },
+    sessionManager: { getBranch: branch, getLeafId: () => leaf, getSessionId: () => "delivery-session" },
   };
   const emit = async (name: string, event: unknown = { type: name }) => {
     let input = name === "input" ? (event as { text: string; source: string }) : undefined;
@@ -307,7 +308,7 @@ describe("settled workflow result delivery", () => {
         else {
           f.ctx.mode = "tui";
           f.ctx.hasUI = true;
-          let screen = 0;
+          let mounts = 0;
           Object.assign(f.ctx.ui, {
             custom: async (
               factory: (
@@ -315,29 +316,33 @@ describe("settled workflow result delivery", () => {
                 theme: unknown,
                 keys: unknown,
                 done: (value: unknown) => void,
-              ) => { handleInput(key: string): void },
+              ) => { handleInput(key: string): void; render(width: number): string[]; dispose?(): void },
             ) => {
-              let selected: unknown;
+              mounts++;
+              let closed = false;
               const component = factory(
                 { terminal: { rows: 24 }, requestRender() {} },
                 { fg: (_name: string, text: string) => text, bold: (text: string) => text },
-                {},
-                (value) => {
-                  selected = value;
+                new KeybindingsManager(TUI_KEYBINDINGS),
+                () => {
+                  closed = true;
                 },
               );
-              if (++screen === 1) component.handleInput("\r");
-              else if (screen === 2) {
-                component.handleInput("\u001b[B");
-                component.handleInput("\r");
-              } else component.handleInput("\u001b");
-              return selected;
+              component.render(80);
+              component.handleInput("\r"); // Drill into the current run, in the same live mount.
+              expect(component.render(80).join("\n")).toContain("Resume");
+              component.handleInput("r");
+              component.handleInput("\u001b"); // Return to runs, even while resume settles.
+              component.handleInput("\u001b"); // Close and release the mount's timer.
+              component.dispose?.();
+              expect(closed).toBe(true);
             },
           });
           const command = f.pi.registerCommand.mock.calls.find(([name]) => name === "workflows")?.[1] as {
             handler: (args: string, ctx: unknown) => Promise<void>;
           };
           await command.handler("", f.ctx);
+          expect(mounts).toBe(1);
         }
       }
       await vi.waitFor(() => expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 3000 });

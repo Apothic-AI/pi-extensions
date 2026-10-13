@@ -1,13 +1,14 @@
 /** Observation-only retained workflow children; no workflow engine/RPC dependency. */
-import { type Component, isKeyRelease, matchesKey, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, isKeyRelease, matchesKey, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import type { WorkflowUiRunSummary } from "@signalridge/pi-subagents-protocol";
 import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import type { AgentRecord } from "../types.js";
 import type { Theme } from "./agent-display.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
-type DisposableComponent = Component & { dispose?(): void };
+type DisposableComponent = Component & Partial<Focusable> & { dispose?(): void };
 
-export type OwnerGroup = { id: string; runId: string; records: AgentRecord[] };
+export type OwnerGroup = { id: string; runId: string; records: AgentRecord[]; summary?: WorkflowUiRunSummary };
 
 export function workflowGroupId(record: AgentRecord): string | undefined {
   const owner = record.owner;
@@ -16,7 +17,13 @@ export function workflowGroupId(record: AgentRecord): string | undefined {
 }
 
 /** A bounded child list that swaps its body for the existing conversation viewer. */
-export class OwnerGroupViewer implements Component {
+export class OwnerGroupViewer implements Component, Focusable {
+  private hasFocus = false;
+  get focused(): boolean { return this.hasFocus; }
+  set focused(value: boolean) {
+    this.hasFocus = value;
+    if (this.child && typeof this.child.focused === "boolean") this.child.focused = value;
+  }
   private selectedId: string | undefined;
   private initialized = false;
   private child: DisposableComponent | undefined;
@@ -65,6 +72,7 @@ export class OwnerGroupViewer implements Component {
             this.child = undefined;
             this.tui.requestRender();
           });
+          if (typeof this.child.focused === "boolean") this.child.focused = this.focused;
           this.error = undefined;
         } catch { this.error = "Cannot open conversation; try again"; }
       }

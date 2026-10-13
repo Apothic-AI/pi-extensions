@@ -241,6 +241,18 @@ workflow, and the review skill before accepting a topology or recovery change.
   `session_start` (Pi cannot unregister commands, so registration happens there
   rather than at factory time, and existing commands are never overwritten).
 
+### Live command center
+
+`/workflows` opens a live, explicitly focused navigator; `/workflows watch <runId>` opens that run directly. Outside TUI, watch reports a snapshot rather than occupying an uncancellable wait. Escape closes observation without stopping execution.
+
+Select a run, then a phase/task/call or its final result. Details have an independently scrollable viewport, while legal controls and help remain pinned. Navigation follows stable identities across updates, removal and resize. Use the displayed selection keybindings, Tab for controls, `p` to pause and `r` to resume. Stop is non-resumable and requires the displayed explicit confirmation; repeating a legacy-terminal key must not confirm it. A pending cleanup is not completion: the inspector keeps uncertainty visible and can recheck owned cleanup.
+
+Phase entry, task attempts and call attribution come from fenced runtime observations. Declared phases never prove completion, and restored journal-only facts do not invent historical labels or entered phases. Exact phase identities distinguish labels whose bounded display copies look the same. Logical calls, replayed calls and physical dispatches are separate counters. Presentation snapshots are detached and bounded; they contain no prompts or conversation histories.
+
+A selected root agent call can open its retained conversation through the subagent owner's optional exact-attempt UI endpoint. Unknown or reused old attempts are not redirected to a newer child. Workflow controls remain here; steering, child stop, sessions, model policy and foreground handoff remain in `pi-subagents`. The optional UI protocol does not change the required managed v4 handshake.
+
+The passive progress panel uses a terminal-height row budget, prioritizes live calls and reports overflow rather than growing as runs × calls. Names/results are sanitized only in display copies; journals and stored source remain unchanged. Fullscreen, regular terminal, RPC and print paths retain their distinct public API boundaries.
+
 ### Background result notifications
 
 Completed background runs are buffered in branch-local pending-delivery markers
@@ -342,7 +354,7 @@ generic reminder stripping is used. Regression tests exercise the real SDK,
 faux provider, and native user-message component, not a physical terminal or a
 live model service.
 
-Navigator/result metadata is sanitized only in display copies through `pi-ui`;
+Navigator, command-notification and result metadata is sanitized only in display copies through `pi-ui`;
 stored results and journals stay original. Detail screens keep actions reachable
 in a row-bounded viewport; PgUp/PgDn scroll the detail independently of ↑↓ actions.
 

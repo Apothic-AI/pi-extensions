@@ -19,6 +19,23 @@ function tui(rows = 24): TUI {
 }
 
 describe("retained workflow children", () => {
+  it("propagates initial and changing native focus to its swapped-in conversation", () => {
+    const child = { focused: false, render: () => ["conversation"], invalidate() {}, dispose: vi.fn() };
+    let back: (() => void) | undefined;
+    const viewer = new OwnerGroupViewer(tui(), theme, "run", () => [record("a")], (_record, done) => { back = done; return child; }, vi.fn());
+    const framed = borderedComponent(viewer, text => text);
+    (framed as typeof framed & { focused: boolean }).focused = true;
+    viewer.handleInput("\r");
+    expect(child.focused).toBe(true);
+    (framed as typeof framed & { focused: boolean }).focused = false;
+    expect(child.focused).toBe(false);
+    (framed as typeof framed & { focused: boolean }).focused = true;
+    expect(child.focused).toBe(true);
+    back?.();
+    expect(child.dispose).toHaveBeenCalledOnce();
+    viewer.dispose();
+  });
+
   it("validates only known owner extension and a nonempty run id", () => {
     for (const owner of [undefined, {}, { extension: "other", runId: "run" }, { extension: "pi-workflows", runId: 12 }, { extension: "pi-workflows", runId: " " }]) {
       expect(workflowGroupId(record("a", { owner: owner as AgentRecord["owner"] }))).toBeUndefined();
