@@ -1,0 +1,48 @@
+# @signalridge/pi-sessions
+
+Experimental, opt-in human-controlled session navigation and editable summary handoffs. Tested with Pi **1.0.4**; host packages are peers, not bundled. MIT, independent implementation. This is not Plan mode's approved-plan implementation action.
+
+Try explicitly with `pi -e ./packages/pi-sessions/src/index.ts`. This package is not enabled by default. Session mutations are human-command-only, never model-callable.
+
+## Commands
+
+- `/sessions`: list sessions whose native workspace matches the active workspace. `/sessions all`: explicitly include other workspaces from Pi's default session store and the current configured session directory.
+- Filter by name, stable session ID or workspace; select to inspect bounded metadata and recent user/assistant text. Confirm before native switching. There is **no delete or rename** operation. The native selector includes deletion, so this package uses a bounded independent picker.
+- `/handoff <goal>`: optionally ask the **currently selected model** to synthesize a goal-oriented summary. An omitted goal opens human input. `recover` as the complete argument is reserved for recovery, not a goal; write a descriptive goal such as `recover interrupted work` instead.
+- `/handoff recover`: explicitly inspect the approved summary saved on the current branch, review/edit it, then separately confirm replacing the current unsent draft. No automatic recovery overwrite, new session or model turn.
+
+TUI and dialog-capable RPC are supported. Print/JSON commands are rejected before authentication, provider requests or session mutations. RPC clients must implement confirm/input/select/editor; Pi cannot synchronously read RPC client drafts, so replacement requires explicit consent (and a destination confirmation). Clients should preserve later drafts until they approve replacement.
+
+## Sharing and handoff
+
+Generation is opt-in **for every invocation**. Only at most 16 KiB UTF-8 of the most recent 12 user/assistant text messages is offered; each message is capped at 2 KiB. Tool results/arguments, images, thinking, system messages, custom entries, compaction summaries and credential objects are not copied. Common credential patterns are redacted, but prose may still contain secrets: inspect/redact the exact excerpt in the multiline editor before a second sharing confirmation. The goal (at most 2 KiB) is also sent to that selected model. No upload/share service is used.
+
+Authentication/generation failures produce a generic message, never raw provider errors, and offer a **manual** summary editor. Declining generation also offers a manual editor, not a fake generated summary. Escape cancels live TUI loading/generation; requests time out after 60 seconds. Ownership retirement aborts our requests and closes only our overlays. RPC pending-editor results are fenced when retired (the host has no editor cancellation API).
+
+Review/edit the summary in a multiline editor. TUI text and complete bracketed-paste payloads are sanitized **before** native insertion, including split paste markers: sanitization does not move the insertion cursor or add dirty Undo snapshots. Native cursor movement, Kitty printable keys, CJK/IME and atomic paste Undo are retained. Approval preserves the exact expanded document's leading/trailing whitespace, not Pi 1.0.4's trimmed submit callback. A collapsed large paste requires one Enter to expand for review and another to approve. Approved text must be nonempty, terminal-safe and **at most 16 KiB UTF-8**; oversized approved text is rejected, never truncated. Explicit draft-replacement consent and final creation confirmation precede native `newSession({ parentSession, setup, withSession })`.
+
+The destination saves `pi-sessions:handoff` version 1 as a **non-model custom entry** with the approved summary, goal and parent identity. Its optional prefill intent stores the source model identity and, for TUI only, the SHA256 hash of the explicitly consented source unsent draft—**never the raw unsent draft**. RPC cannot read that draft and stores no draft hash. Older records without intent remain explicitly recoverable, but never auto-prefill.
+
+After native setup, the **destination controller's `session_start` with reason `new`** owns prefill under the same interaction lock and lifecycle fences as commands. The source `withSession` callback only reports setup/model warnings, without asynchronous dialogs or editor writes. The destination first vets its current file: the exact custom entry ID/data and native parent link must be durably present, not just in memory after failed setup. It revalidates before writing the editor. RPC requires fresh destination consent; TUI only replaces an empty editor or the consented source draft matching its saved hash. Later TUI drafts are preserved. A missing/different destination model is reported, not submitted to. Nothing sends a message, starts a turn or invokes implementation; you decide whether and when to send the draft.
+
+## Native storage and recovery
+
+The native session manager remains authoritative; no parallel session-history database is kept. Pi 1.0.4 defers custom-only file persistence until the first user/assistant message. To make the reviewed handoff durable **before** that first turn, setup writes the public native header and entries to a unique, exclusive `0600` JSONL file, then reloads it using public `setSessionFile`. It never adds a synthetic model-context message.
+
+An existing saved source file is the linked parent. If a nonempty source has no saved file (including an allocated-but-unwritten path), its active native branch is cloned into a unique private `0600` snapshot in a private temporary directory. A cancelled/vetoed/failed **pre-replacement** creation removes this snapshot. Once native replacement begins it is retained, even if later setup/rebinding/prefill fails, so the source remains resumable by the parent path. In-memory destinations also receive a native recovery file; their later conversation remains subject to the host's no-session policy. Retained temporary parent/recovery files survive reload, but OS temporary-directory cleanup can eventually remove them; retain important source sessions in normal persistent storage.
+
+Setup/prefill errors never start a model turn. Missing, unreadable or mismatched durable handoff data prevents automatic prefill. If setup failed, resume the native parent and retry. If the summary was saved but prefill failed, `/handoff recover` can inspect it after reload. Startup, reload, resume and fork never consume prefill intent or automatically modify the editor; recovery remains explicit.
+
+## Workspaces and limits
+
+**Actual Pi 1.0.4 runtime switching opens the session header workspace and recreates cwd-bound services there**; it does not change the process's global cwd. Cross-workspace selection requires a separate explicit warning/confirmation. After switching we report both history workspace and the actual fresh context's tool/resource workspace. A host retaining its execution workspace is reported as restoring history only; this package never patches private cwd state. Missing workspaces are rejected before switching rather than invoking a private fallback.
+
+Every candidate is revalidated immediately before native switching: path, native header ID/cwd, JSONL tree and content digest must still match the preview. Preflight checks native restoration payloads, including usage/cost numbers and role-appropriate persisted content, then runs public nonmutating context projection before source teardown. Reads stop at 32 MiB plus one oversize probe byte even if a file grows, and check cancellation between chunks. Detected unreadable/malformed data is rejected without opening or repairing its native manager. Validation accepts supported native v2/v3 payloads with entries up to 4 MiB; unsupported/older/oversized files can still be opened with Pi's own facilities. Arbitrary extension-owned custom data remains opaque; preflight is not a proof that every third-party renderer or external filesystem writer is safe. Preview text is inert and excludes non-user/assistant content. Preview is capped at 6 KiB, retained rows at 200, and visible rows adapt to the terminal while reserving controls. Undersized terminals require resizing before approval. Terminal controls/bidi instructions are stripped; CJK and narrow widths are supported in regular/fullscreen UI.
+
+**Pi's SDK list/listAll may load full session bodies and return all results. These calls do not promise bounded memory.** Limits above bound this package's retained display data, not SDK memory or disk scan work. Abort signals are passed to SDK list operations.
+
+Ownership captures the manager/session identity, full native active-branch fingerprint (including latest entry data), model identity and TUI draft/editor-factory identity. Changes retire the operation permanently; switching back does not revive approval. All await boundaries are checked, including after authentication and destination consent. While destination RPC consent is pending, `/sessions` and `/handoff` report the existing interaction warning. Native switch/tree/fork/compact attempts (even vetoed ones), shutdown, agent start or model selection retire that consent promptly; a late client Yes cannot revive it or overwrite a newer draft. Source and destination ownership are runtime-local and do not rely on shared event buses. This package does not install a custom main editor/footer or restore stale editor snapshots.
+
+## Development
+
+`bun run --cwd packages/pi-sessions check` runs lint, typecheck and native-SDK/unit tests. Tests do not require provider credentials and assert no destination model turn.

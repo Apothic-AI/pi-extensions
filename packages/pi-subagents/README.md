@@ -114,6 +114,14 @@ Foreground parent-mode calls are rejected **before spawn**: a main model blocked
 
 Install the changed package and reload/restart Pi to use this feature; an already running older installed package does not acquire new tools or parameters from checkout edits.
 
+### Root-owned operation approvals
+
+When a root approval service is present at child creation, admitted canonical `edit`, `write`, and `bash` tools use `@signalridge/pi-approval-core` reviewed SDK definitions. Each operation awaits the root human service with its exact final inputs, file diff or command, working directory, and a distinct `child:<agent-id>` source. Ordinary parent clarification answers never authorize operations. No service means existing behavior is unchanged; malformed or duplicate services refuse before child allocation. A captured service cannot reconnect after retirement or replacement.
+
+Tool admission, denylist, `ask_tools`, project trust, and isolation still apply first: approval adds no tools, including to internal zero-tool generation. The gate survives in-memory resume, steering, and nested `ctx.executeTool` calls. Conflicting canonical extension tools are refused rather than silently replacing the reviewed binding. While root review is pending, only human waiting time is excluded from the child's default tool timeout; execution retains its remaining budget and native bash timeouts still apply after approval. Cancellation and divergent root/child branch ownership deny execution.
+
+Inherited `pi-approvals` resources are excluded before factory loading when the root service is captured, including package aliases. Explicit selection is rejected with guidance to integrate approvals in the root session. Children do not load another approval extension or forward their UI to impersonate a human; no UI/model mode is enabled automatically. This is an in-process trusted extension integration, not an OS sandbox for arbitrary extension code. Managed protocol and journal formats remain v4.
+
 ### Scheduling
 
 Add a `schedule` field to register the agent to fire later instead of running now:

@@ -150,8 +150,20 @@ background_clear({ id: "<completed-job-id>" })
 
 ## Interactive task UI
 
-Only explicit human commands open a screen; job output and model tool calls never
-steal focus:
+Only explicit human commands or **Ctrl+Alt+B** open a screen; job output and model
+tool calls never steal focus. Press **Ctrl+Alt+B** from Pi's native prompt editor
+to choose a task (including an empty list when no jobs exist). While jobs or
+notifications are retained, the owned status line shows `Ctrl+Alt+B tasks` beside
+compact counts: `R` running, `F` finished, `P` pending notifications, and
+`PAUSED` when notification delivery needs attention. The pending/paused markers
+remain readable in a 40-column status allocation. This is a keyboard entry hint,
+not a clickable status-bar button: Pi's `setStatus` API accepts text only. The shortcut uses Pi's
+editor shortcut route, not a raw terminal listener; focused dialogs and viewers
+retain their input and a repeated shortcut does not reset selection. Custom
+editors must forward Pi's extension shortcuts to support it. **Ctrl+B** is unchanged.
+Escape returns to the original editor draft and cursor.
+
+Commands remain available:
 
 ```text
 /background                 # live task list
@@ -190,7 +202,7 @@ subscriptions; output changes request coalesced TUI renders, not model turns.
 
 Custom screens require both `ctx.mode === "tui"` and `ctx.hasUI`. RPC/JSON/print
 keep all tools and command snapshots/hints, but never call custom UI. The TUI
-module is host-provided and deferred until an explicit TUI command. There is no
+module is host-provided and deferred until an explicit TUI command or shortcut. There is no
 PTY attachment, raw-PID control, SSH support, or durable job scope.
 
 ## Lifecycle and limits
@@ -318,6 +330,8 @@ modules and Node builtins.
 
 ```bash
 bun run --cwd packages/pi-background check
+# Actual CLI shortcut/focus acceptance (macOS/Linux, Python 3 standard library):
+python3 packages/pi-background/test/shortcut-cli.py
 ```
 
 Task-viewer acceptance includes 108 passing package tests and the complete
@@ -326,7 +340,12 @@ passed 161 recorded checks, covering model tool exposure, asynchronous real shel
 execution alongside independent work, live logs, paging, CJK resize, distinct-key
 stop/clear, editor draft restoration and process-group cleanup. Fixtures use an
 offline faux provider and harmless local processes, not live provider credentials
-or physical-terminal qualification.
+or physical-terminal qualification. Shortcut acceptance adds 72 recorded checks
+across 100×30 and 40×12 fullscreen/regular CLI PTYs: empty entry, repeated keys,
+CJK draft/cursor restoration, native dialog/foreign overlay focus, stable task
+selection, log/stop navigation without model turns, and committed session
+retirement. Its instrumentation observes public component renders and editor text;
+Pi still owns actual terminal input, global shortcut routing, focus, and rendering.
 
 ## License
 

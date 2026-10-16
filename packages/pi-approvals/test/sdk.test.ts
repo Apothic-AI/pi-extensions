@@ -1,0 +1,999 @@
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import {
+  AgentSession,
+  AgentSessionRuntime,
+  createAgentSession,
+  createBashTool,
+  createBashToolDefinition,
+  createEditTool,
+  createEventBus,
+  createWriteTool,
+  DefaultResourceLoader,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type ExtensionUIContext,
+  type ExtensionUIDialogOptions,
+  InteractiveMode,
+  initTheme,
+  ModelRegistry,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
+import { type Component, type Terminal, Text, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  APPROVAL_ADAPTER_QUERY_CHANNEL,
+  APPROVAL_LIFECYCLE_CHANNEL,
+  APPROVAL_QUERY_CHANNEL,
+  type ApprovalLifecycle,
+  hashBytes,
+  queryApprovalService,
+  validateAdapterQuery,
+  validateLifecycle,
+  validateOperation,
+  validateQuery,
+} from "@signalridge/pi-approval-core";
+import { Type } from "typebox";
+import { afterEach, expect, it, vi } from "vitest";
+import { ApprovalBroker, MAX_PENDING, MAX_RETAINED } from "../src/broker.js";
+import approvals from "../src/index.js";
+import { confirmOperation, createReviewComponent } from "../src/review.js";
+
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const dispose of cleanups.splice(0).reverse()) await dispose();
+});
+async function fixture(
+  later?: (pi: ExtensionAPI) => void,
+  mode: "rpc" | "tui" | "print" = "rpc",
+  extension = true,
+  uiOverride?: Partial<ExtensionUIContext>,
+  earlier?: (pi: ExtensionAPI) => void,
+  config: { native?: boolean; tools?: string[]; override?: boolean } = {},
+) {
+  expect(VERSION).toBe("1.0.4");
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), "approvals-sdk-")));
+  const faux = fauxProvider({ provider: "approval-faux", models: [{ id: "model" }] });
+  const runtime = await ModelRuntime.create({
+    authPath: join(cwd, "auth.json"),
+    modelsPath: null,
+    allowModelNetwork: false,
+  });
+  runtime.registerNativeProvider(faux.provider);
+  await runtime.refresh({ allowNetwork: false });
+  const model = new ModelRegistry(runtime).find("approval-faux", "model");
+  let api: ExtensionAPI | undefined;
+  let context: ExtensionContext | undefined;
+  const events: ApprovalLifecycle[] = [];
+  const errors: string[] = [];
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: cwd,
+    noExtensions: true,
+    noContextFiles: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    extensionFactories: [
+      ...(earlier ? [earlier] : []),
+      ...(extension ? [approvals] : []),
+      ...(later ? [later] : []),
+      (pi) => {
+        api = pi;
+        pi.on("session_start", (_event, ctx) => {
+          context = ctx;
+        });
+        pi.events.on(APPROVAL_LIFECYCLE_CHANNEL, (value) => events.push(validateLifecycle(value)));
+      },
+    ],
+  });
+  await loader.reload();
+  if (config.native !== false) loader.getExtensions().runtime.flagValues.set("approvals-native-tools", true);
+  const manager = SessionManager.inMemory(cwd);
+  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+  const created = await createAgentSession({
+    cwd,
+    agentDir: cwd,
+    model,
+    modelRuntime: runtime,
+    resourceLoader: loader,
+    sessionManager: manager,
+    settingsManager: settings,
+    tools: config.tools,
+  });
+  const backendMkdir = vi.fn(async () => {
+    throw new Error("custom backend refuses mkdir");
+  });
+  const backendWrite = vi.fn(async () => {
+    throw new Error("custom backend refuses write");
+  });
+  const override = createWriteTool(cwd, { operations: { mkdir: backendMkdir, writeFile: backendWrite } });
+  let session = created.session;
+  if (config.override) {
+    session.dispose();
+    await loader.reload();
+    if (config.native !== false) loader.getExtensions().runtime.flagValues.set("approvals-native-tools", true);
+    session = new AgentSession({
+      agent: session.agent,
+      cwd,
+      resourceLoader: loader,
+      modelRuntime: runtime,
+      sessionManager: manager,
+      settingsManager: settings,
+      baseToolsOverride: {
+        write: override,
+        edit: createEditTool(cwd),
+        bash: createBashTool(cwd),
+      },
+    });
+  }
+  const beforeStartup = api ? queryApprovalService(api.events) : undefined;
+  const beforeStartupError = beforeStartup
+    ? await beforeStartup.request(operation(cwd), { isCurrent: () => true }).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+    : undefined;
+  const baseUI = session.extensionRunner.getUIContext();
+  const confirm = vi.fn(async (_title: string, _message: string, _options?: ExtensionUIDialogOptions) => true);
+  const custom = vi.fn();
+  const customUI: ExtensionUIContext["custom"] = (factory, options) => {
+    custom();
+    return baseUI.custom(factory, options);
+  };
+  const notify = vi.fn(baseUI.notify);
+  const ui: ExtensionUIContext = { ...baseUI, confirm, custom: customUI, notify, ...uiOverride };
+  await session.bindExtensions({
+    mode,
+    ...(mode === "print" ? {} : { uiContext: ui }),
+    onError: (error) => errors.push(error.error),
+  });
+  cleanups.push(async () => {
+    await session.abort();
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  });
+  if (!api || !context) throw new Error("Missing SDK context");
+  const service = queryApprovalService(api.events);
+  return {
+    session,
+    services: {
+      cwd,
+      agentDir: cwd,
+      modelRuntime: runtime,
+      settingsManager: settings,
+      resourceLoader: loader,
+      diagnostics: [],
+    },
+    override,
+    backendMkdir,
+    backendWrite,
+    beforeStartup,
+    beforeStartupError,
+    manager,
+    faux,
+    cwd,
+    api,
+    context,
+    events,
+    errors,
+    get service() {
+      if (!service) throw new Error("Missing approval service");
+      return service;
+    },
+    confirm,
+    custom,
+    notify,
+    ui,
+    getApi: () => {
+      if (!api) throw new Error("Missing API");
+      return api;
+    },
+  };
+}
+async function pending(host: Awaited<ReturnType<typeof fixture>>, count = 1) {
+  await vi.waitFor(() => expect(host.events.filter((event) => event.phase === "waiting")).toHaveLength(count));
+  return host.events.filter((event) => event.phase === "waiting");
+}
+it("handles two parallel actual root tool requests individually, with /approvals during a paused turn", async () => {
+  const host = await fixture();
+  host.faux.setResponses([
+    fauxAssistantMessage(
+      [fauxToolCall("write", { path: "a", content: "A" }), fauxToolCall("write", { path: "b", content: "B" })],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write two");
+  const requests = await pending(host, 2);
+  host.session.setSessionName("parallel rename");
+  host.api.appendEntry("parallel ordinary append", { value: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(host.events.filter((event) => event.phase === "resolved")).toEqual([]);
+  expect(host.confirm).not.toHaveBeenCalled();
+  await host.session.prompt("/approvals", { streamingBehavior: "steer" });
+  expect(host.notify).toHaveBeenCalled();
+  await host.session.prompt(`/approvals approve ${requests[0].requestId}`, { streamingBehavior: "steer" });
+  expect(host.confirm).toHaveBeenCalledOnce();
+  expect(host.events.filter((event) => event.phase === "resolved")).toHaveLength(1);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(host.events.filter((event) => event.phase === "resolved")).toHaveLength(1);
+  await host.session.prompt(`/approvals deny ${requests[1].requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  expect(
+    host.events
+      .filter((event) => event.phase === "resolved")
+      .map((event) => event.outcome)
+      .sort(),
+  ).toEqual(["approved", "denied"]);
+  expect(host.errors).toEqual([]);
+});
+it("revalidates and reviews final late-handler mutations including nested executeTool", async () => {
+  const host = await fixture((pi) => {
+    pi.on("tool_call", (event) => {
+      if (event.toolName === "write") Object.assign(event.input, { content: "late final" });
+    });
+    pi.registerTool({
+      name: "nested",
+      label: "nested",
+      description: "nested",
+      parameters: Type.Object({}),
+      execute: async (_id, _params, signal, _update, ctx) => {
+        const outcome = await ctx.executeTool("write", { path: "nested", content: "original" }, { signal });
+        return outcome.result;
+      },
+    });
+  });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("nested", {}, { id: "call_nested|fc_nested" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("nested write");
+  const [request] = await pending(host);
+  expect(request.toolCallId).toBe("call_nested|fc_nested/1");
+  await host.session.prompt(`/approvals approve ${request.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  expect(host.confirm.mock.calls[0][1]).toContain("late final");
+  expect(await readFile(join(host.cwd, "nested"), "utf8")).toBe("late final");
+  expect(host.errors).toEqual([]);
+});
+it("refuses schema corruption by a handler after SDK validation, without a human prompt", async () => {
+  const host = await fixture((pi) => {
+    pi.on("tool_call", (event) => {
+      if (event.toolName === "write") Object.assign(event.input, { content: 42 });
+    });
+  });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "file", content: "original" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("invalid write");
+  expect(host.events).toEqual([]);
+  expect(host.confirm).not.toHaveBeenCalled();
+  await expect(readFile(join(host.cwd, "file"))).rejects.toThrow();
+});
+it("print/no-UI denies bash and write without a process or filesystem mutation", async () => {
+  const host = await fixture(undefined, "print");
+  host.faux.setResponses([
+    fauxAssistantMessage(
+      [
+        fauxToolCall("bash", { command: "touch process-marker" }),
+        fauxToolCall("write", { path: "missing/dir/file", content: "secret" }),
+      ],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("deny no UI");
+  expect(host.events).toEqual([]);
+  await expect(readFile(join(host.cwd, "process-marker"))).rejects.toThrow();
+  await expect(readFile(join(host.cwd, "missing"))).rejects.toThrow();
+});
+it("retirement on branch navigation/shutdown is sticky for previously captured services", async () => {
+  const host = await fixture();
+  if (!host.service) throw new Error("missing service");
+  const operation = validateOperation({
+    kind: "command",
+    toolName: "bash",
+    source: "test",
+    cwd: host.cwd,
+    toolCallId: "owned",
+    inputHash: hashBytes("true"),
+    command: "true",
+    preview: "true",
+  });
+  const call = host.service.request(operation, { isCurrent: () => true });
+  const rejected = expect(call).rejects.toThrow();
+  await pending(host);
+  await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+  await rejected;
+  await expect(host.service.request(operation, { isCurrent: () => true })).rejects.toThrow("retired");
+});
+it("detects effective earlier custom canonical bindings and later runtime ownership loss", async () => {
+  const earlier = await fixture(undefined, "rpc", true, undefined, (pi) => {
+    pi.registerTool(createBashToolDefinition("/"));
+  });
+  expect(earlier.service).toBeDefined();
+  await expect(earlier.service?.request(operation(earlier.cwd), { isCurrent: () => true })).rejects.toThrow("bindings");
+  await earlier.session.prompt("/approvals");
+  expect(String(earlier.notify.mock.calls[0][0])).toContain("custom canonical bash");
+  let foreign: ExtensionAPI | undefined;
+  const host = await fixture(undefined, "rpc", true, undefined, (pi) => {
+    foreign = pi;
+  });
+  if (!foreign) throw new Error("Missing foreign runtime");
+  foreign.registerTool({ ...createBashToolDefinition(host.cwd), description: "foreign canonical" });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "touch foreign" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("collision");
+  await expect(readFile(join(host.cwd, "foreign"))).rejects.toThrow();
+});
+it("Plan-style stronger admission is never restored by the approval wrappers", async () => {
+  const host = await fixture((pi) => {
+    pi.on("session_start", () => {
+      pi.setActiveTools(["read"]);
+    });
+  });
+  expect(host.session.getActiveToolNames()).toEqual(["read"]);
+});
+it("abort closes only owned pending requests; timeout, callback errors, caps and metadata retention are bounded", async () => {
+  const host = await fixture(undefined, "rpc", false);
+  const broker = new ApprovalBroker(
+    host.api.events,
+    () => host.context,
+    () => true,
+    10000,
+  );
+  const operation = validateOperation({
+    kind: "command",
+    toolName: "bash",
+    source: "test",
+    cwd: host.cwd,
+    toolCallId: "test",
+    inputHash: hashBytes("true"),
+    command: "true",
+    preview: "true",
+  });
+  const abort = new AbortController();
+  const a = broker.request(operation, { signal: abort.signal, isCurrent: () => true });
+  const aRejected = expect(a).rejects.toThrow("cancelled");
+  const b = broker.request(operation, { isCurrent: () => true });
+  abort.abort();
+  await aRejected;
+  expect(broker.pending.size).toBe(1);
+  await broker.review([...broker.pending.keys()][0], host.context, async () => true);
+  await b;
+  for (let i = 0; i < MAX_RETAINED + 1; i++) {
+    const request = broker.request(operation, { isCurrent: () => true });
+    await broker.review([...broker.pending.keys()][0], host.context, async () => true);
+    await request;
+  }
+  expect(broker.retained).toHaveLength(MAX_RETAINED);
+  const calls = Array.from({ length: MAX_PENDING }, () =>
+    broker.request(operation, { isCurrent: () => true }).catch(() => {}),
+  );
+  await expect(broker.request(operation, { isCurrent: () => true })).rejects.toThrow("Too many");
+  broker.retire();
+  await Promise.all(calls);
+  expect(broker.pending.size).toBe(0);
+  const expired = new ApprovalBroker(
+    host.api.events,
+    () => host.context,
+    () => true,
+    1,
+  );
+  await expect(expired.request(operation, { isCurrent: () => true })).rejects.toThrow("expired");
+  const errors = new ApprovalBroker(
+    host.api.events,
+    () => host.context,
+    () => true,
+  );
+  await expect(
+    errors.request(operation, {
+      isCurrent: () => {
+        throw new Error("owner error");
+      },
+    }),
+  ).rejects.toThrow("owner error");
+});
+it("missing peer closes captured owned requests and never reconnects; native leaf/manager changes retire", async () => {
+  const host = await fixture(undefined, "rpc", false);
+  const events = createEventBus();
+  const broker = new ApprovalBroker(
+    events,
+    () => host.context,
+    () => true,
+  );
+  const off = events.on(APPROVAL_QUERY_CHANNEL, (value) => validateQuery(value).respond(broker.service));
+  const captured = queryApprovalService(events);
+  if (!captured) throw new Error("Missing captured peer");
+  const operation = validateOperation({
+    kind: "command",
+    toolName: "bash_background",
+    source: "test",
+    cwd: host.cwd,
+    toolCallId: "owned",
+    inputHash: hashBytes("true"),
+    command: "true",
+    preview: "true",
+  });
+  const call = captured.request(operation, { isCurrent: () => true });
+  const rejected = expect(call).rejects.toThrow("retired");
+  off();
+  await rejected;
+  expect(broker.pending.size).toBe(0);
+  events.on(APPROVAL_QUERY_CHANNEL, (value) => validateQuery(value).respond(broker.service));
+  await expect(captured.request(operation, { isCurrent: () => true })).rejects.toThrow("retired");
+  const fresh = new ApprovalBroker(
+    events,
+    () => host.context,
+    () => true,
+  );
+  const pendingCall = fresh.request(operation, { isCurrent: () => true });
+  const pendingRejected = expect(pendingCall).rejects.toThrow("retired");
+  host.manager.appendCustomEntry("new-native-entry", {});
+  host.manager.branch(host.manager.getBranch()[0].id);
+  await pendingRejected;
+  await expect(fresh.request(operation, { isCurrent: () => true })).rejects.toThrow("retired");
+});
+it("public reload aborts old service requests and captures a distinct fresh service", async () => {
+  const host = await fixture();
+  if (!host.service) throw new Error("Missing service");
+  const operation = validateOperation({
+    kind: "command",
+    toolName: "bash",
+    source: "test",
+    cwd: host.cwd,
+    toolCallId: "reload",
+    inputHash: hashBytes("true"),
+    command: "true",
+    preview: "true",
+  });
+  const request = host.service.request(operation, { isCurrent: () => true });
+  const rejected = expect(request).rejects.toThrow();
+  await pending(host);
+  await host.session.reload();
+  await rejected;
+  await expect(host.service.request(operation, { isCurrent: () => true })).rejects.toThrow();
+  const next = queryApprovalService(host.getApi().events);
+  expect(next?.id).not.toBe(host.service.id);
+});
+it("command-only TUI reviews preserve native focus/draft; arrivals never grab foreign dialog focus", async () => {
+  const terminal: Terminal = {
+    columns: 100,
+    rows: 20,
+    kittyProtocolActive: false,
+    start() {},
+    stop() {},
+    drainInput: async () => {},
+    write() {},
+    moveBy() {},
+    hideCursor() {},
+    showCursor() {},
+    clearLine() {},
+    clearFromCursor() {},
+    clearScreen() {},
+    setTitle() {},
+    setProgress() {},
+  };
+  const tui = new TuiMainScreen(terminal);
+  const draft = new Text("untouched draft", 0, 0);
+  const foreign = new Text("foreign dialog", 0, 0);
+  tui.addChild(draft);
+  tui.setFocus(foreign);
+  const host = await fixture(undefined, "tui");
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "file", content: "after\u202e" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  expect(tui.getFocusedComponent()).toBe(foreign);
+  expect(host.custom).not.toHaveBeenCalled();
+  await host.session.extensionRunner.emit({ type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+  await host.session.prompt(`/approvals approve ${request.requestId}`, { streamingBehavior: "steer" });
+  expect(host.errors.join(" ")).toContain("current");
+  expect(tui.getFocusedComponent()).toBe(foreign);
+  await host.session.extensionRunner.emit({ type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+  tui.setFocus(draft);
+  await host.session.prompt(`/approvals approve ${request.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  expect(host.custom).toHaveBeenCalledOnce();
+  // The fixture's public no-op custom UI cannot approve; it does not steal focus.
+  expect(tui.getFocusedComponent()).toBe(draft);
+  expect(draft.render(100).join("\n")).toContain("untouched draft");
+  const operation = validateOperation({
+    kind: "command",
+    toolName: "bash",
+    source: "test",
+    toolCallId: "screen",
+    cwd: host.cwd,
+    command: "true",
+    inputHash: hashBytes("true"),
+    preview: `\\u{202e}\\n${Array.from({ length: 50 }, (_, index) => `Line ${index}`).join("\n")}`,
+  });
+  const done = vi.fn();
+  const component = createReviewComponent(tui, operation, new AbortController().signal, done);
+  expect(component.render(100).join("\n")).toContain("\\u{202e}");
+  component.handleInput?.("\r");
+  expect(done).not.toHaveBeenCalled();
+  component.handleInput?.("\x1b[6~");
+  expect(component.render(40).join("\n")).toContain("Line 15");
+  component.handleInput?.("\x01");
+  component.handleInput?.("\x01");
+  expect(done).toHaveBeenCalledExactlyOnceWith(true);
+  component.dispose();
+});
+
+function operation(cwd: string, toolCallId = "owned") {
+  return validateOperation({
+    kind: "command",
+    toolName: "bash_background",
+    source: "test",
+    cwd,
+    toolCallId,
+    inputHash: hashBytes("true"),
+    command: "true",
+    preview: "true",
+  });
+}
+it("a loaded plugin advertises a rejecting service before startup", async () => {
+  const host = await fixture();
+  expect(host.beforeStartup).toBeDefined();
+  expect(host.beforeStartupError).toBeInstanceOf(Error);
+  await expect(host.beforeStartup?.request(operation(host.cwd), { isCurrent: () => true })).rejects.toThrow();
+});
+it("SDK custom base backend is not replaced or executed locally without certification", async () => {
+  const host = await fixture(undefined, "rpc", true, undefined, undefined, { native: false, override: true });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "marker", content: "local" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  let settled = false;
+  const turn = host.session.prompt("write").then(() => {
+    settled = true;
+  });
+  await vi.waitFor(() => expect(host.events.length > 0 || settled).toBe(true));
+  const waiting = host.events.find((item) => item.phase === "waiting");
+  if (waiting) await host.session.prompt(`/approvals approve ${waiting.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  await expect(readFile(join(host.cwd, "marker"))).rejects.toThrow();
+  expect(host.api.getAllTools().find((tool) => tool.name === "write")?.parameters).toBe(host.override.parameters);
+  expect(host.backendMkdir.mock.calls.length).toBe(0);
+  expect(host.backendWrite.mock.calls.length).toBe(0);
+  expect(host.service).toBeDefined();
+});
+it("two owned requests survive native rename and custom appends", async () => {
+  const host = await fixture();
+  const calls = [
+    host.service?.request(operation(host.cwd, "a"), { isCurrent: () => true }),
+    host.service?.request(operation(host.cwd, "b"), { isCurrent: () => true }),
+  ];
+  const outcomes = calls.map((call) =>
+    call.then(
+      () => "approved",
+      () => "retired",
+    ),
+  );
+  const waiting = await pending(host, 2);
+  host.session.setSessionName("renamed");
+  host.api.appendEntry("ordinary", { value: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(host.events.filter((item) => item.phase === "resolved")).toEqual([]);
+  for (const item of waiting) await host.session.prompt(`/approvals review ${item.requestId}`);
+  expect(await Promise.all(outcomes)).toEqual(["approved", "approved"]);
+  const third = host.service?.request(operation(host.cwd, "third"), { isCurrent: () => true });
+  const thirdOutcome = third.catch(() => {});
+  const requests = await pending(host, 3);
+  await host.session.prompt(`/approvals review ${requests[2].requestId}`);
+  await thirdOutcome;
+});
+it("actual tree veto keeps pending service usable", async () => {
+  const host = await fixture((pi) => pi.on("session_before_tree", () => ({ cancel: true })));
+  const target = host.manager.appendCustomEntry("target", {});
+  host.manager.appendCustomEntry("later", {});
+  const call = host.service?.request(operation(host.cwd), { isCurrent: () => true });
+  const outcome = call.then(
+    () => "approved",
+    () => "retired",
+  );
+  const [request] = await pending(host);
+  expect((await host.session.navigateTree(target)).cancelled).toBe(true);
+  await host.session.prompt(`/approvals review ${request.requestId}`);
+  expect(await outcome).toBe("approved");
+});
+it("committed native tree navigation rebinds and permits reviewed write", async () => {
+  const host = await fixture();
+  const target = host.manager.appendCustomEntry("target", {});
+  host.manager.appendCustomEntry("later", {});
+  expect((await host.session.navigateTree(target)).cancelled).toBe(false);
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "tree", content: "new" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  await host.session.prompt(`/approvals review ${request.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  expect(await readFile(join(host.cwd, "tree"), "utf8")).toBe("new");
+  await expect(host.service?.request(operation(host.cwd), { isCurrent: () => true })).rejects.toThrow();
+});
+it("actual SDK pipeline accepts OpenAI Responses opaque call identity", async () => {
+  const host = await fixture();
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "opaque", content: "new" }, { id: "call_123|fc_456" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  expect(request.toolCallId).toBe("call_123|fc_456");
+  await host.session.prompt(`/approvals review ${request.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+});
+it("late wrappers preserve earlier deactivation despite SDK initial allowlist", async () => {
+  const host = await fixture(
+    undefined,
+    "rpc",
+    true,
+    undefined,
+    (pi) => pi.on("session_start", () => pi.setActiveTools(["read"])),
+    { tools: ["read", "write", "bash", "edit"] },
+  );
+  expect(host.session.getActiveToolNames()).toEqual(["read"]);
+});
+it("command-shaped uncooperative aliases never execute", async () => {
+  const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }], details: undefined }));
+  const host = await fixture((pi) =>
+    pi.registerTool({
+      name: "hypa_shell",
+      label: "hypa_shell",
+      description: "alias",
+      parameters: Type.Object({ command: Type.String() }),
+      execute,
+    }),
+  );
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("hypa_shell", { command: "touch unsafe" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("command");
+  expect(execute.mock.calls.length).toBe(0);
+});
+
+function terminalFixture(columns = 40, rows = 12) {
+  return {
+    columns,
+    rows,
+    kittyProtocolActive: false,
+    start() {},
+    stop() {},
+    drainInput: async () => {},
+    write() {},
+    moveBy() {},
+    hideCursor() {},
+    showCursor() {},
+    clearLine() {},
+    clearFromCursor() {},
+    clearScreen() {},
+    setTitle() {},
+    setProgress() {},
+  };
+}
+async function nativeHost() {
+  const host = await fixture(undefined, "tui");
+  initTheme("dark", false);
+  const runtime = new AgentSessionRuntime(host.session, host.services, async () => {
+    throw new Error("Unexpected replacement");
+  });
+  const mode = new InteractiveMode(runtime, { terminal: terminalFixture(), tuiMode: "regular" });
+  // Inspect the actual host's existing UI context; do not replace its stack or close callback.
+  const access = mode as unknown as {
+    ui: TuiMainScreen;
+    editor: Component;
+    createExtensionUIContext(): ExtensionUIContext;
+  };
+  const ui = access.createExtensionUIContext();
+  access.ui.setFocus(access.editor);
+  access.ui.stop();
+  return { host, tui: access.ui, ui, ctx: { ...host.context, mode: "tui" as const, ui, hasUI: true } };
+}
+it.each(["overlay", "confirm"])("cancellation defers native review close behind foreign %s", async (kind) => {
+  const { host, tui, ui, ctx } = await nativeHost();
+  ui.setEditorText("untouched draft");
+  const abort = new AbortController();
+  let aResolved = false;
+  const initialFocus = tui.getFocusedComponent();
+  const a = confirmOperation(ctx, operation(host.cwd), abort.signal).then((value) => {
+    aResolved = true;
+    return value;
+  });
+  await vi.waitFor(() => expect(tui.getFocusedComponent() !== initialFocus).toBe(true));
+  const review = tui.getFocusedComponent();
+  const b =
+    kind === "overlay"
+      ? ui.custom<boolean>(
+          (_tui, _theme, _keys, done) => {
+            const foreign: Component = { render: () => ["FOREIGN"], handleInput: () => done(true), invalidate() {} };
+            return foreign;
+          },
+          { overlay: true },
+        )
+      : ui.confirm("FOREIGN", "Still respondable");
+  await vi.waitFor(() => expect(tui.getFocusedComponent() !== review).toBe(true));
+  const bFocus = tui.getFocusedComponent();
+  abort.abort();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(aResolved).toBe(false);
+  expect(tui.getFocusedComponent() === bFocus).toBe(true);
+  bFocus?.handleInput?.("\r");
+  expect(await b).toBe(true);
+  expect(await a).toBe(false);
+  expect(tui.hasOverlay()).toBe(false);
+  expect(tui.getFocusedComponent() === initialFocus).toBe(true);
+  expect(ui.getEditorText()).toBe("untouched draft");
+});
+it("review controls/body remain reachable at 40x12 and one-column fallback", () => {
+  const terminal = terminalFixture();
+  const tui = new TuiMainScreen(terminal);
+  const op = { ...operation("/test"), preview: `${Array.from({ length: 50 }, (_, i) => `Line ${i}`).join("\n")}\n界` };
+  const component = createReviewComponent(tui, op, new AbortController().signal, () => {});
+  const seen = new Set<string>();
+  for (let i = 0; i < 50; i++) {
+    const lines = component.render(40);
+    expect(lines.length).toBeLessThanOrEqual(12);
+    expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+    for (const line of lines) seen.add(line.trim());
+    component.handleInput?.("\x1b[B");
+  }
+  for (let i = 0; i < 50; i++) expect(seen.has(`Line ${i}`)).toBe(true);
+  terminal.columns = 1;
+  component.handleInput?.("\x1b[H");
+  let all = "";
+  for (let i = 0; i < 1000; i++) {
+    const lines = component.render(1);
+    expect(lines.length).toBeLessThanOrEqual(12);
+    expect(lines.every((line) => visibleWidth(line) <= 1)).toBe(true);
+    all += lines.join("");
+    component.handleInput?.("\x1b[B");
+  }
+  expect(all).toContain("Ctrl+A");
+  expect(all).toContain("Line49");
+  expect(all).toContain("\\u{754c}");
+  component.dispose();
+});
+
+it.each([{ tools: [] }, { tools: ["read"] }, { tools: ["write"] }])(
+  "partial native admission %j keeps a present service without activating excluded tools",
+  async ({ tools }) => {
+    const host = await fixture(undefined, "rpc", true, undefined, undefined, { tools });
+    expect(host.service).toBeDefined();
+    expect(
+      host.api
+        .getAllTools()
+        .filter((tool) => ["write", "edit", "bash"].includes(tool.name))
+        .map((tool) => tool.name),
+    ).toEqual(tools.filter((name) => name === "write"));
+    expect(host.session.getActiveToolNames()).toEqual(tools);
+    const call = host.service?.request(operation(host.cwd), { isCurrent: () => true });
+    const [request] = await pending(host);
+    await host.session.prompt(`/approvals review ${request.requestId}`);
+    await call;
+  },
+);
+it("uncertified root canonical calls are denied but the shared human service remains functional", async () => {
+  const host = await fixture(undefined, "rpc", true, undefined, undefined, { native: false });
+  expect(
+    host.api
+      .getAllTools()
+      .filter((tool) => ["write", "edit", "bash"].includes(tool.name))
+      .every((tool) => tool.sourceInfo.path.startsWith("builtin:")),
+  ).toBe(true);
+  host.faux.setResponses([
+    fauxAssistantMessage(
+      [
+        fauxToolCall("bash", { command: "touch process" }),
+        fauxToolCall("write", { path: "directory/file", content: "x" }),
+        fauxToolCall("edit", { path: "file", edits: [{ oldText: "x", newText: "y" }] }),
+      ],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("blocked");
+  expect(host.events).toEqual([]);
+  await expect(readFile(join(host.cwd, "process"))).rejects.toThrow();
+  await expect(readFile(join(host.cwd, "directory"))).rejects.toThrow();
+  const call = host.service?.request(operation(host.cwd), { isCurrent: () => true });
+  const [request] = await pending(host);
+  await host.session.prompt(`/approvals review ${request.requestId}`);
+  await call;
+});
+it.each(["switch", "fork"])(
+  "actual native %s veto does not retire pending requests or future service",
+  async (kind) => {
+    const host = await fixture((pi) => {
+      pi.on("session_before_switch", () => ({ cancel: true }));
+      pi.on("session_before_fork", () => ({ cancel: true }));
+    });
+    const runtime = new AgentSessionRuntime(host.session, host.services, async () => {
+      throw new Error("Unexpected replacement");
+    });
+    const call = host.service?.request(operation(host.cwd), { isCurrent: () => true });
+    const outcome = call.then(
+      () => "approved",
+      () => "retired",
+    );
+    const [request] = await pending(host);
+    const result = kind === "switch" ? await runtime.switchSession("unused") : await runtime.fork("unused");
+    expect(result.cancelled).toBe(true);
+    await host.session.prompt(`/approvals review ${request.requestId}`);
+    expect(await outcome).toBe("approved");
+    const later = host.service?.request(operation(host.cwd, "later"), { isCurrent: () => true });
+    const requests = await pending(host, 2);
+    await host.session.prompt(`/approvals review ${requests[1].requestId}`);
+    await later;
+  },
+);
+it("native aborted tree summarization leaves the original broker usable", async () => {
+  let abortSummary = () => {};
+  const host = await fixture((pi) =>
+    pi.on("session_before_tree", () => {
+      abortSummary();
+    }),
+  );
+  const target = host.manager.appendMessage(fauxAssistantMessage("first"));
+  host.manager.appendMessage({ role: "user", content: "second", timestamp: Date.now() });
+  host.manager.appendMessage(fauxAssistantMessage("second answer"));
+  const leaf = host.manager.getLeafId();
+  abortSummary = () => host.session.abortBranchSummary();
+  const call = host.service?.request(operation(host.cwd), { isCurrent: () => true });
+  const outcome = call.then(
+    () => "approved",
+    () => "retired",
+  );
+  const [request] = await pending(host);
+  await expect(host.session.navigateTree(target, { summarize: true })).rejects.toMatchObject({ name: "AbortError" });
+  expect(host.manager.getLeafId()).toBe(leaf);
+  await host.session.prompt(`/approvals review ${request.requestId}`);
+  expect(await outcome).toBe("approved");
+});
+it.each(["none", "valid", "copy", "duplicate", "malformed", "late", "wrong-name", "replaced"])(
+  "SDK command admission requires one current synchronous adapter capability: %s",
+  async (mode) => {
+    const parameters = Type.Object({ command: Type.String() });
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }], details: undefined }));
+    const host = await fixture(
+      (pi) => {
+        pi.registerTool({
+          name: "command_adapter",
+          label: "command_adapter",
+          description: "trusted test adapter",
+          parameters,
+          execute,
+        });
+        if (mode === "none") return;
+        pi.events.on(APPROVAL_ADAPTER_QUERY_CHANNEL, (value) => {
+          const query = validateAdapterQuery(value);
+          if (query.toolName !== "command_adapter") return;
+          const response = {
+            version: mode === "malformed" ? 2 : 1,
+            toolName: mode === "wrong-name" ? "other" : query.toolName,
+            parameters: mode === "copy" ? structuredClone(parameters) : parameters,
+          };
+          if (mode === "late") {
+            queueMicrotask(() => query.respond(response));
+            return;
+          }
+          query.respond(response);
+          if (mode === "duplicate") query.respond(response);
+        });
+        if (mode === "replaced")
+          pi.on("session_start", () => {
+            pi.registerTool({
+              name: "command_adapter",
+              label: "command_adapter",
+              description: "replacement",
+              parameters: Type.Object({ command: Type.String() }),
+              execute,
+            });
+          });
+      },
+      "rpc",
+      true,
+      undefined,
+      undefined,
+      { native: false },
+    );
+    host.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("command_adapter", { command: "true" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("done"),
+    ]);
+    await host.session.prompt("command");
+    expect(execute.mock.calls.length).toBe(mode === "valid" ? 1 : 0);
+  },
+);
+it("unrelated metadata tools are not blanket-blocked", async () => {
+  const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "metadata" }], details: undefined }));
+  const host = await fixture((pi) =>
+    pi.registerTool({
+      name: "metadata",
+      label: "metadata",
+      description: "metadata",
+      parameters: Type.Object({ title: Type.String() }),
+      execute,
+    }),
+  );
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("metadata", { title: "note" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("metadata");
+  expect(execute.mock.calls.length).toBe(1);
+});
+it("actual native human command opens overlay while tool pending and leaves the editor draft intact", async () => {
+  const { host, tui, ui } = await nativeHost();
+  await host.session.bindExtensions({ mode: "tui", uiContext: ui });
+  ui.setEditorText("draft");
+  const focus = tui.getFocusedComponent();
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "native-ui", content: "reviewed" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  expect(tui.getFocusedComponent() === focus).toBe(true);
+  const review = host.session.prompt(`/approvals review ${request.requestId}`, { streamingBehavior: "steer" });
+  await vi.waitFor(() => expect(tui.hasOverlay()).toBe(true));
+  const component = tui.getFocusedComponent();
+  if (!component) throw new Error("Missing native review focus");
+  expect(component.render(40).length).toBeLessThanOrEqual(12);
+  component.handleInput?.("\x01");
+  await review;
+  await turn;
+  expect(tui.hasOverlay()).toBe(false);
+  expect(tui.getFocusedComponent() === focus).toBe(true);
+  expect(ui.getEditorText()).toBe("draft");
+  expect(await readFile(join(host.cwd, "native-ui"), "utf8")).toBe("reviewed");
+});
+it("human denial cancels only its reviewed request behind a later native overlay", async () => {
+  const { host, tui, ui } = await nativeHost();
+  await host.session.bindExtensions({ mode: "tui", uiContext: ui });
+  const service = queryApprovalService(host.api.events);
+  if (!service) throw new Error("Missing native approval service");
+  const a = service.request(operation(host.cwd, "a"), { isCurrent: () => true });
+  const aDenied = expect(a).rejects.toThrow("denied");
+  const b = service.request(operation(host.cwd, "b"), { isCurrent: () => true });
+  const bDenied = expect(b).rejects.toThrow("denied");
+  const [request, other] = await pending(host, 2);
+  const review = host.session.prompt(`/approvals review ${request.requestId}`);
+  await vi.waitFor(() => expect(tui.hasOverlay()).toBe(true));
+  const aFocus = tui.getFocusedComponent();
+  const foreign = ui.custom<boolean>(
+    (_tui, _theme, _keys, done) => ({
+      render: () => ["foreign"],
+      handleInput: () => done(true),
+      invalidate() {},
+    }),
+    { overlay: true },
+  );
+  await vi.waitFor(() => expect(tui.getFocusedComponent() !== aFocus).toBe(true));
+  const bFocus = tui.getFocusedComponent();
+  await host.session.prompt(`/approvals deny ${request.requestId}`);
+  await aDenied;
+  expect(tui.getFocusedComponent() === bFocus).toBe(true);
+  expect(host.events.filter((event) => event.phase === "resolved")).toHaveLength(1);
+  bFocus?.handleInput?.("\r");
+  expect(await foreign).toBe(true);
+  await review;
+  expect(tui.hasOverlay()).toBe(false);
+  await host.session.prompt(`/approvals deny ${other.requestId}`);
+  await bDenied;
+});
