@@ -227,6 +227,12 @@ export function assertCurrent(options: ApprovalRequestOptions): void {
 }
 /** Local trusted callbacks, not a wire protocol or a serialization/security boundary. */
 export function queryApprovalService(events: ApprovalEvents): ApprovalService | undefined {
+  return captureApprovalService(events)?.service;
+}
+/** A launch may await after approval; retain the SAME peer guard through dispatch. */
+export function captureApprovalService(
+  events: ApprovalEvents,
+): { readonly service: ApprovalService; readonly assertCurrent: () => void } | undefined {
   const peer = discover(events);
   if (!peer) return undefined;
   const id = peer.id;
@@ -243,7 +249,7 @@ export function queryApprovalService(events: ApprovalEvents): ApprovalService | 
       throw error;
     }
   };
-  return Object.freeze({
+  const service: ApprovalService = Object.freeze({
     version: 1,
     id,
     request: async (operation: ApprovalOperation, options: ApprovalRequestOptions) => {
@@ -266,4 +272,5 @@ export function queryApprovalService(events: ApprovalEvents): ApprovalService | 
       assertCurrent(owner);
     },
   });
+  return Object.freeze({ service, assertCurrent: checkPeer });
 }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { empty, STATE_TYPE } from "../src/state.js";
+import { empty, MAX_BYTES, STATE_TYPE } from "../src/state.js";
 import { TodoStore } from "../src/store.js";
 
 const cleanups: (() => void)[] = [];
@@ -54,6 +54,33 @@ function reopened(f: ReturnType<typeof fixture>) {
 }
 
 describe("native file-backed durability (no private SDK writes or rollback)", () => {
+  it.each(["CRLF", "JSON whitespace"])(
+    "accepts canonical bounded conversation records in %s sessions and recovers meaningful mutations",
+    (format) => {
+      const f = fixture();
+      const first = f.store.mutate(f.ctx, add);
+      const original = readFileSync(f.file, "utf8");
+      const formatted =
+        original
+          .trimEnd()
+          .split("\n")
+          .map((line) =>
+            format === "CRLF" ? line : ` \t${line.replaceAll('":', '" : ').replaceAll(',"', ', \t"')} \t`,
+          )
+          .join(format === "CRLF" ? "\r\n" : "\n") + (format === "CRLF" ? "\r\n" : "\n");
+      writeFileSync(f.file, formatted);
+      const open = reopened(f);
+      expect(open.store.read(open.ctx)).toEqual(first);
+      const changed = open.store.mutate(open.ctx, {
+        action: "update",
+        baseRevision: 1,
+        updates: [{ id: first.tasks[0].id, status: "completed" }],
+      });
+      expect(changed).toMatchObject({ revision: 2, tasks: [{ status: "completed" }] });
+      const again = reopened(f);
+      expect(again.store.read(again.ctx)).toEqual(changed);
+    },
+  );
   it("rejects a fresh manual edit BEFORE append; no phantom success before first conversation", () => {
     const f = fixture(false);
     expect(existsSync(f.file)).toBe(false);
@@ -196,11 +223,18 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
     expect(open.store.read(open.ctx)).toEqual(first);
   });
   it("bounds streaming lines without rejecting a large unrelated persisted conversation", () => {
+    const nativeParse = JSON.parse;
+    const parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MAX_BYTES * 2);
+      return nativeParse(text, reviver);
+    });
     const f = fixture(false);
     f.manager.appendMessage({ role: "user", content: "x".repeat(1024 * 1024), timestamp: 1 });
     f.manager.appendCustomEntry("other-extension", { blob: "x".repeat(1024 * 1024) });
     f.store.reconcile(f.ctx);
     const first = f.store.mutate(f.ctx, add);
+    expect(parse).toHaveBeenCalled();
+    parse.mockRestore(); // Native SDK open may parse huge messages; Todo must not.
     expect(first.revision).toBe(1);
     const open = reopened(f);
     expect(open.store.read(open.ctx)).toEqual(first);

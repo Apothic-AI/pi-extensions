@@ -36,6 +36,7 @@ export class Owner<Context extends ExtensionContext = ExtensionCommandContext> {
   committing: "new" | "resume" | undefined;
   target: string | undefined;
   replacementStarted = false;
+  replacementApproved = false;
   private retired = false;
   private timer: ReturnType<typeof setInterval>;
 
@@ -92,9 +93,13 @@ export class Owner<Context extends ExtensionContext = ExtensionCommandContext> {
   }
 
   shutdown(event: SessionShutdownEvent): void {
-    // Native shutdown is already a replacement boundary. Keep a parent snapshot
-    // even if creation/rebinding fails after the source runtime has been disposed.
-    if (this.committing && event.reason === this.committing) this.replacementStarted = true;
+    // Retain recovery data once native replacement begins, even when approval
+    // was revoked during a later asynchronous before-switch handler. Only a
+    // still-current owner may carry prefill approval across normal teardown.
+    if (this.committing && event.reason === this.committing) {
+      this.replacementStarted = true;
+      this.replacementApproved = this.current();
+    }
     this.retire();
   }
 

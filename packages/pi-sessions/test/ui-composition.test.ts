@@ -158,11 +158,9 @@ for (const mode of ["regular", "fullscreen"] as const) {
       void pasted.then(settled, () => {});
       await s.opened();
       s.key(`\x1b[200~${large}\x1b[201~`);
-      s.frame();
-      s.key("\r");
+      expect(plain(s.frame().join("\n"))).not.toContain("[paste #");
       await Promise.resolve();
       expect(settled).not.toHaveBeenCalled();
-      s.frame();
       s.key("\r");
       expect(await pasted).toBe(large);
     } finally {
@@ -505,7 +503,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     }
   });
 
-  test(`${mode} large native bracketed paste must expand before approval, with every line reachable`, async () => {
+  test(`${mode} large bracketed paste is immediately expanded for review, with every line reachable`, async () => {
     const s = await screen(mode, 40, 12);
     try {
       const pending = s.ui.editor("Review paste");
@@ -514,10 +512,9 @@ for (const mode of ["regular", "fullscreen"] as const) {
       void pending.then(settled, () => {});
       await s.opened();
       s.key(`\x1b[200~${prefill.slice(0, 30)}`);
-      s.frame(); // incomplete paste remains in native buffer
+      s.frame(); // incomplete paste remains in SafeInput's buffer
       s.key(`${prefill.slice(30)}\x1b[201~`);
-      expect(plain(s.frame().join("\n"))).toContain("expand paste");
-      s.key("\r");
+      expect(plain(s.frame().join("\n"))).not.toContain("[paste #");
       await Promise.resolve();
       expect(settled).not.toHaveBeenCalled();
       expect(plain(s.frame().join("\n"))).toContain("line-34 中文");
@@ -626,6 +623,81 @@ for (const mode of ["regular", "fullscreen"] as const) {
       s.key("\r");
       expect(await pending).toBe(true);
     } finally {
+      await s.cleanup();
+    }
+  });
+
+  test(`${mode} expanded large paste Undo retains nonempty document and earlier edits`, async () => {
+    const s = await screen(mode, 40, 12);
+    try {
+      const pending = s.ui.editor("Review Undo history", "original");
+      void pending.catch(() => {});
+      await s.opened();
+      s.frame();
+      s.key(" earlier");
+      s.key(`\x1b[200~${"X".repeat(1100)}\x1b[201~`);
+      s.frame();
+      // Expansion is either immediate, or requires a non-destructive review step.
+      if (plain(s.frame().join("\n")).includes("expand paste")) s.key("\r");
+      s.key("\x1f");
+      const restored = plain(s.frame().join("\n"));
+      expect(restored).toContain("original earlier");
+      expect(restored).not.toContain("XXXX");
+      s.key("\x1f");
+      expect(plain(s.frame().join("\n"))).toContain("original");
+      s.key("\r");
+      expect(await pending).toBe("original");
+    } finally {
+      await s.cleanup();
+    }
+  });
+
+  test(`${mode} remapped selection actions govern choice and picker without default acceptance`, async () => {
+    const previousKeys = getKeybindings();
+    const s = await screen(mode, 80, 24);
+    setKeybindings(
+      new KeybindingsManager(TUI_KEYBINDINGS, {
+        "tui.select.confirm": "ctrl+y",
+        "tui.select.cancel": "ctrl+x",
+        "tui.select.up": "ctrl+k",
+        "tui.select.down": "ctrl+j",
+        "tui.select.pageUp": "ctrl+u",
+        "tui.select.pageDown": "ctrl+d",
+      }),
+    );
+    try {
+      const load = async (publish: (rows: SessionRow[], loaded: number, total: number, complete: boolean) => void) => {
+        publish(sessions, sessions.length, sessions.length, true);
+        return sessions;
+      };
+      for (const kind of ["choice", "picker"] as const) {
+        const pending = kind === "choice" ? s.ui.confirm("Confirm", prefill) : s.ui.pick(load);
+        void pending.catch(() => {});
+        const settled = vi.fn();
+        void pending.then(settled, () => {});
+        await s.opened();
+        await vi.waitFor(() => expect(plain(s.frame().join("\n"))).toContain("ctrl+y"));
+        expect(plain(s.frame().join("\n"))).toContain("ctrl+x");
+        for (const key of ["\r", "\x1b", "\x1b[B"]) s.key(key);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(settled).not.toHaveBeenCalled();
+        s.key("\x0a"); // configured down, not a submit
+        s.key("\x0b"); // configured up returns to No/first row
+        s.key("\x0a");
+        s.key("\x04"); // configured page down scrolls preview/moves picker
+        s.key("\x15"); // configured page up restores selection
+        s.frame();
+        s.frame();
+        s.key("\x19");
+        expect(await pending).toEqual(kind === "choice" ? true : sessions[1]);
+        const cancelled = kind === "choice" ? s.ui.confirm("Cancel", "prompt") : s.ui.pick(load);
+        void cancelled.catch(() => {});
+        await s.opened();
+        s.key("\x18");
+        expect(await cancelled).toBe(kind === "choice" ? false : undefined);
+      }
+    } finally {
+      setKeybindings(previousKeys);
       await s.cleanup();
     }
   });

@@ -1,10 +1,64 @@
-import { Editor, Input } from "@earendil-works/pi-tui";
+import { Editor, getKeybindings, Input, setKeybindings, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { expect, it, vi } from "vitest";
 import { nativeTerminal } from "./native-terminal.js";
 
 const attack = "X\x1b[31m\x1b]52;c;test\x07\u202e\x1b[2J";
 for (const fullscreen of [false, true]) {
   const mode = fullscreen ? "fullscreen" : "regular";
+  it.each([false, true])(
+    `${mode} remapped submit preserves description, native Undo and newline precedence (Enter newline=%s)`,
+    async (enterNewline) => {
+      const originalKeys = getKeybindings();
+      const originalBindings = { ...originalKeys.getUserBindings() };
+      const f = await nativeTerminal(fullscreen);
+      let running: Promise<void> | undefined;
+      try {
+        const keys = getKeybindings();
+        keys.setUserBindings({
+          ...keys.getUserBindings(),
+          "tui.input.submit": ["ctrl+g", "shift+enter"], // Newline must win the shared Shift+Enter binding.
+          ...(enterNewline ? { "tui.input.newLine": ["enter", "shift+enter", "ctrl+j"] as const } : {}),
+        });
+        const before = f.store.mutate(f.ctx, {
+          action: "add",
+          baseRevision: 0,
+          title: "Keep title",
+          description: "  first line\nlast  ",
+        });
+        running = f.command.run(f.ctx);
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+        f.key("e");
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+        f.key("\t");
+        f.key("\x1b[200~X\x1b[201~");
+        f.key("Y");
+        expect(f.lines().map(stripTerminalSequences).join("\n")).toContain("last  XY");
+        f.key("\x07"); // Public configured tui.input.submit, not literal Return.
+        expect(f.lines().join("\n")).toContain("Dependency UUIDs");
+        f.key("\x1b[Z");
+        expect(f.lines().map(stripTerminalSequences).join("\n")).toContain("last  XY");
+        f.key("\x1f");
+        expect(f.lines().map(stripTerminalSequences).join("\n")).toContain("last  X");
+        expect(f.lines().map(stripTerminalSequences).join("\n")).not.toContain("last  XY");
+        f.key("\x1f"); // Paste remains one native Undo step across field navigation.
+        f.key(enterNewline ? "\r" : "\x1b[13;2u");
+        expect(f.lines().join("\n")).toContain("Description (0-512");
+        f.key("Z");
+        f.key("\x07");
+        f.key("\x13");
+        await vi.waitFor(() => expect(f.store.read(f.ctx).revision).toBe(2));
+        expect(f.store.read(f.ctx).tasks[0]).toMatchObject({ description: `${before.tasks[0].description}\nZ` });
+      } finally {
+        f.command.retire();
+        await running;
+        await f.dispose();
+        setKeybindings(originalKeys);
+        originalKeys.setUserBindings(originalBindings);
+        expect(getKeybindings().getUserBindings()).toEqual(originalBindings);
+        expect(getKeybindings()).toBe(originalKeys);
+      }
+    },
+  );
   it(`${mode} sanitizes model-supplied edit prefill before native rendering and preserves unchanged state`, async () => {
     const f = await nativeTerminal(fullscreen);
     let running: Promise<void> | undefined;

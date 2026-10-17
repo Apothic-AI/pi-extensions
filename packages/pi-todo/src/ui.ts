@@ -5,13 +5,14 @@ import {
   CURSOR_MARKER,
   Editor,
   type Focusable,
+  getKeybindings,
   Input,
   matchesKey,
   type OverlayHandle,
   type TUI,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { DraftInput } from "./draft-input.js";
+import { commandCharacter, DraftInput } from "./draft-input.js";
 import type { NativeUI } from "./native-ui.js";
 import type { Status, Task } from "./state.js";
 
@@ -79,9 +80,10 @@ export class SourceViewport {
     return Math.max(0, this.rows.length - this.capacity);
   }
   navigate(data: string): boolean {
+    const char = commandCharacter(data);
     let next = this.offset;
-    if (matchesKey(data, "up") || data === "p") next--;
-    else if (matchesKey(data, "down") || data === "n") next++;
+    if (matchesKey(data, "up") || char === "p") next--;
+    else if (matchesKey(data, "down") || char === "n") next++;
     else if (matchesKey(data, "pageUp")) next -= this.capacity;
     else if (matchesKey(data, "pageDown")) next += this.capacity;
     else if (matchesKey(data, "home")) next = 0;
@@ -283,10 +285,12 @@ export class TaskForm implements Component, Focusable {
       },
       { paddingX: 0 },
     );
+    // Embedded drafts must never enter Editor's trimming/clearing submit path.
+    this.description.disableSubmit = true;
     this.description.setText(display((task?.description ?? "").replace(/\t/gu, "    ")));
     this.normalizedDescription = this.description.getExpandedText();
     this.title.onSubmit = () => this.move(1);
-    // Enter is intercepted below: Editor's submission trims and clears its draft.
+    // Submission navigates fields below without destroying the native Undo stack.
     this.dependencies.onSubmit = () => this.save();
   }
   private get input() {
@@ -357,10 +361,13 @@ export class TaskForm implements Component, Focusable {
       else this.message.navigate(data);
     } else if (matchesKey(data, "escape")) this.cancel();
     else if (this.tui.terminal.columns < 16 || this.tui.terminal.rows < 12) this.message.navigate(data);
+    else if (this.field === 1 && getKeybindings().matches(data, "tui.input.newLine"))
+      this.description.handleInput(data);
     else if (matchesKey(data, "tab")) this.move(1);
     else if (matchesKey(data, "shift+tab")) this.move(-1);
     else if (matchesKey(data, "ctrl+s")) this.save();
-    else if (this.field === 1 && matchesKey(data, "return")) this.move(1);
+    else if (this.field === 1 && (getKeybindings().matches(data, "tui.input.submit") || matchesKey(data, "return")))
+      this.move(1);
     else this.input.handleInput(data);
     this.tui.requestRender();
   }
@@ -404,6 +411,9 @@ export class StatusForm implements Component {
   focused = false;
   private index: number;
   private readonly viewport = new SourceViewport();
+  private readonly commands = new DraftInput(display, (data, paste) => {
+    if (!paste) this.handleKey(data);
+  });
   private readonly choices: Status[] = ["pending", "in_progress", "completed"];
   constructor(
     private readonly tui: TUI,
@@ -413,6 +423,12 @@ export class StatusForm implements Component {
     this.index = this.choices.indexOf(status);
   }
   handleInput(data: string) {
+    this.commands.handleInput(data);
+  }
+  dispose() {
+    this.commands.dispose();
+  }
+  private handleKey(data: string) {
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) this.done();
     else if (matchesKey(data, "return")) this.done(this.choices[this.index]);
     else if (matchesKey(data, "up")) this.index = Math.max(0, this.index - 1);

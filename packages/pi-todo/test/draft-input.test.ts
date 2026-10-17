@@ -1,9 +1,30 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { DraftInput } from "../src/draft-input.js";
+import { commandCharacter, DraftInput } from "../src/draft-input.js";
 import { modelJson } from "../src/state.js";
 import { display } from "../src/ui.js";
 
 afterEach(() => vi.useRealTimers());
+it.each([
+  ["\x1b[97u", "a"],
+  ["\x1b[101u", "e"],
+  ["\x1b[115u", "s"],
+  ["\x1b[100u", "d"],
+  ["\x1b[68u", "D"],
+  ["\x1b[100;2u", "D"],
+  ["\x1b[100:68;2u", "D"],
+  ["\x1b[63u", "?"],
+  ["\x1b[121u", "y"],
+  ["\x1b[112u", "p"],
+  ["\x1b[110u", "n"],
+  ["\x1b[110;2u", "N"],
+  ["\x1b[100;3u", undefined],
+  ["\x1b[100;5u", undefined],
+  ["\x1b[100;9u", undefined],
+  ["\x1b[100;1:3u", undefined],
+  ["\x1b[200~a\x1b[201~", undefined],
+])("decodes character command %j as %j", (data, expected) => {
+  expect(commandCharacter(data ?? "")).toBe(expected);
+});
 it("disposes ambiguous paste-prefix timers and discards buffered input", () => {
   vi.useFakeTimers();
   const dispatch = vi.fn();
@@ -15,6 +36,22 @@ it("disposes ambiguous paste-prefix timers and discards buffered input", () => {
   input.handleInput("0~late\x1b[201~");
   vi.advanceTimersByTime(100);
   expect(dispatch).not.toHaveBeenCalled();
+});
+it("keeps Escape separate from a subsequent complete key while still consuming split paste", () => {
+  vi.useFakeTimers();
+  const dispatch = vi.fn();
+  const input = new DraftInput(display, dispatch);
+  input.handleInput("\x1b");
+  input.handleInput("\x1b[H");
+  expect(dispatch.mock.calls).toEqual([
+    ["\x1b", false],
+    ["\x1b[H", false],
+  ]);
+  dispatch.mockClear();
+  for (const chunk of ["\x1b", "[20", "0~", "a", "\x1b[201~"]) input.handleInput(chunk);
+  expect(dispatch.mock.calls).toEqual([["\x1b[200~a\x1b[201~", true]]);
+  input.dispose();
+  expect(vi.getTimerCount()).toBe(0);
 });
 it("filters encoded unsafe printable keys without replacing native keyboard semantics", () => {
   const dispatch = vi.fn();

@@ -10,7 +10,9 @@ import {
   createBashToolDefinition,
   createEditTool,
   createEventBus,
+  createReadTool,
   createWriteTool,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   type ExtensionAPI,
   type ExtensionContext,
@@ -24,12 +26,20 @@ import {
   SettingsManager,
   VERSION,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, type Terminal, Text, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  type Terminal,
+  Text,
+  type TuiAltScreen,
+  TuiMainScreen,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import {
   APPROVAL_ADAPTER_QUERY_CHANNEL,
   APPROVAL_LIFECYCLE_CHANNEL,
   APPROVAL_QUERY_CHANNEL,
   type ApprovalLifecycle,
+  captureApprovalService,
   hashBytes,
   queryApprovalService,
   validateAdapterQuery,
@@ -53,7 +63,7 @@ async function fixture(
   extension = true,
   uiOverride?: Partial<ExtensionUIContext>,
   earlier?: (pi: ExtensionAPI) => void,
-  config: { native?: boolean; tools?: string[]; override?: boolean } = {},
+  config: { native?: boolean; tools?: string[]; override?: boolean; readOnlyBase?: boolean } = {},
 ) {
   expect(VERSION).toBe("1.0.4");
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "approvals-sdk-")));
@@ -112,7 +122,7 @@ async function fixture(
   });
   const override = createWriteTool(cwd, { operations: { mkdir: backendMkdir, writeFile: backendWrite } });
   let session = created.session;
-  if (config.override) {
+  if (config.override || config.readOnlyBase) {
     session.dispose();
     await loader.reload();
     if (config.native !== false) loader.getExtensions().runtime.flagValues.set("approvals-native-tools", true);
@@ -123,11 +133,13 @@ async function fixture(
       modelRuntime: runtime,
       sessionManager: manager,
       settingsManager: settings,
-      baseToolsOverride: {
-        write: override,
-        edit: createEditTool(cwd),
-        bash: createBashTool(cwd),
-      },
+      baseToolsOverride: config.readOnlyBase
+        ? { read: createReadTool(cwd) }
+        : {
+            write: override,
+            edit: createEditTool(cwd),
+            bash: createBashTool(cwd),
+          },
     });
   }
   const beforeStartup = api ? queryApprovalService(api.events) : undefined;
@@ -311,6 +323,7 @@ it("retirement on branch navigation/shutdown is sticky for previously captured s
   await pending(host);
   await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
   await rejected;
+  await expect(host.service.request(operation, { isCurrent: () => true })).rejects.toThrow("unavailable or replaced");
   await expect(host.service.request(operation, { isCurrent: () => true })).rejects.toThrow("retired");
 });
 it("detects effective earlier custom canonical bindings and later runtime ownership loss", async () => {
@@ -318,7 +331,9 @@ it("detects effective earlier custom canonical bindings and later runtime owners
     pi.registerTool(createBashToolDefinition("/"));
   });
   expect(earlier.service).toBeDefined();
-  await expect(earlier.service?.request(operation(earlier.cwd), { isCurrent: () => true })).rejects.toThrow("bindings");
+  await expect(earlier.service?.request(operation(earlier.cwd), { isCurrent: () => true })).rejects.toThrow(
+    "unavailable",
+  );
   await earlier.session.prompt("/approvals");
   expect(String(earlier.notify.mock.calls[0][0])).toContain("custom canonical bash");
   let foreign: ExtensionAPI | undefined;
@@ -687,16 +702,16 @@ function terminalFixture(columns = 40, rows = 12) {
     setProgress() {},
   };
 }
-async function nativeHost() {
+async function nativeHost(tuiMode: "regular" | "fullscreen" = "regular") {
   const host = await fixture(undefined, "tui");
   initTheme("dark", false);
   const runtime = new AgentSessionRuntime(host.session, host.services, async () => {
     throw new Error("Unexpected replacement");
   });
-  const mode = new InteractiveMode(runtime, { terminal: terminalFixture(), tuiMode: "regular" });
+  const mode = new InteractiveMode(runtime, { terminal: terminalFixture(), tuiMode });
   // Inspect the actual host's existing UI context; do not replace its stack or close callback.
   const access = mode as unknown as {
-    ui: TuiMainScreen;
+    ui: TuiMainScreen | TuiAltScreen;
     editor: Component;
     createExtensionUIContext(): ExtensionUIContext;
   };
@@ -705,8 +720,10 @@ async function nativeHost() {
   access.ui.stop();
   return { host, tui: access.ui, ui, ctx: { ...host.context, mode: "tui" as const, ui, hasUI: true } };
 }
-it.each(["overlay", "confirm"])("cancellation defers native review close behind foreign %s", async (kind) => {
-  const { host, tui, ui, ctx } = await nativeHost();
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((tuiMode) => ["overlay", "confirm"].map((kind) => ({ tuiMode, kind }))),
+)("cancellation closes native review before foreign $kind closes ($tuiMode)", async ({ tuiMode, kind }) => {
+  const { host, tui, ui, ctx } = await nativeHost(tuiMode);
   ui.setEditorText("untouched draft");
   const abort = new AbortController();
   let aResolved = false;
@@ -720,22 +737,33 @@ it.each(["overlay", "confirm"])("cancellation defers native review close behind 
   const b =
     kind === "overlay"
       ? ui.custom<boolean>(
-          (_tui, _theme, _keys, done) => {
-            const foreign: Component = { render: () => ["FOREIGN"], handleInput: () => done(true), invalidate() {} };
-            return foreign;
-          },
+          (_tui, _theme, _keys, done) => ({
+            render: () => ["FOREIGN"],
+            handleInput: () => done(true),
+            invalidate() {},
+          }),
           { overlay: true },
         )
       : ui.confirm("FOREIGN", "Still respondable");
   await vi.waitFor(() => expect(tui.getFocusedComponent() !== review).toBe(true));
   const bFocus = tui.getFocusedComponent();
-  abort.abort();
-  await new Promise((resolve) => setImmediate(resolve));
-  expect(aResolved).toBe(false);
-  expect(tui.getFocusedComponent() === bFocus).toBe(true);
-  bFocus?.handleInput?.("\r");
-  expect(await b).toBe(true);
-  expect(await a).toBe(false);
+  try {
+    // Even a stale input callback cannot approve a review behind foreign focus.
+    review?.handleInput?.("\x01");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(aResolved).toBe(false);
+    abort.abort();
+    await vi.waitFor(() => expect(aResolved).toBe(true), { timeout: 300 });
+    expect(await a).toBe(false);
+    expect(tui.getFocusedComponent() === bFocus).toBe(true);
+    expect(ui.getEditorText()).toBe("untouched draft");
+  } finally {
+    // Also clean up the old, focus-deferred implementation when this probe fails.
+    abort.abort();
+    bFocus?.handleInput?.("\r");
+    expect(await b).toBe(true);
+    await a;
+  }
   expect(tui.hasOverlay()).toBe(false);
   expect(tui.getFocusedComponent() === initialFocus).toBe(true);
   expect(ui.getEditorText()).toBe("untouched draft");
@@ -963,37 +991,300 @@ it("actual native human command opens overlay while tool pending and leaves the 
   expect(ui.getEditorText()).toBe("draft");
   expect(await readFile(join(host.cwd, "native-ui"), "utf8")).toBe("reviewed");
 });
-it("human denial cancels only its reviewed request behind a later native overlay", async () => {
-  const { host, tui, ui } = await nativeHost();
-  await host.session.bindExtensions({ mode: "tui", uiContext: ui });
-  const service = queryApprovalService(host.api.events);
-  if (!service) throw new Error("Missing native approval service");
-  const a = service.request(operation(host.cwd, "a"), { isCurrent: () => true });
-  const aDenied = expect(a).rejects.toThrow("denied");
-  const b = service.request(operation(host.cwd, "b"), { isCurrent: () => true });
-  const bDenied = expect(b).rejects.toThrow("denied");
-  const [request, other] = await pending(host, 2);
-  const review = host.session.prompt(`/approvals review ${request.requestId}`);
-  await vi.waitFor(() => expect(tui.hasOverlay()).toBe(true));
-  const aFocus = tui.getFocusedComponent();
-  const foreign = ui.custom<boolean>(
-    (_tui, _theme, _keys, done) => ({
-      render: () => ["foreign"],
-      handleInput: () => done(true),
-      invalidate() {},
-    }),
-    { overlay: true },
-  );
-  await vi.waitFor(() => expect(tui.getFocusedComponent() !== aFocus).toBe(true));
-  const bFocus = tui.getFocusedComponent();
-  await host.session.prompt(`/approvals deny ${request.requestId}`);
-  await aDenied;
-  expect(tui.getFocusedComponent() === bFocus).toBe(true);
-  expect(host.events.filter((event) => event.phase === "resolved")).toHaveLength(1);
-  bFocus?.handleInput?.("\r");
-  expect(await foreign).toBe(true);
-  await review;
-  expect(tui.hasOverlay()).toBe(false);
-  await host.session.prompt(`/approvals deny ${other.requestId}`);
-  await bDenied;
+it.each(["capturing", "nonCapturing"])(
+  "human denial cancels only its reviewed request behind a later native overlay (%s)",
+  async (kind) => {
+    const { host, tui, ui } = await nativeHost();
+    await host.session.bindExtensions({ mode: "tui", uiContext: ui });
+    const service = queryApprovalService(host.api.events);
+    if (!service) throw new Error("Missing native approval service");
+    const a = service.request(operation(host.cwd, "a"), { isCurrent: () => true });
+    const aDenied = expect(a).rejects.toThrow("denied");
+    const b = service.request(operation(host.cwd, "b"), { isCurrent: () => true });
+    const bDenied = expect(b).rejects.toThrow("denied");
+    const [request, other] = await pending(host, 2);
+    const review = host.session.prompt(`/approvals review ${request.requestId}`);
+    await vi.waitFor(() => expect(tui.hasOverlay()).toBe(true));
+    const aFocus = tui.getFocusedComponent();
+    let focusForeign: (() => void) | undefined;
+    const foreign = ui.custom<boolean>(
+      (_tui, _theme, _keys, done) => ({
+        render: () => ["foreign"],
+        handleInput: () => done(true),
+        invalidate() {},
+      }),
+      {
+        overlay: true,
+        overlayOptions: { nonCapturing: kind === "nonCapturing" },
+        onHandle: (handle) => {
+          focusForeign = () => handle.focus();
+        },
+      },
+    );
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== aFocus).toBe(kind === "capturing"));
+    await vi.waitFor(() => expect(focusForeign).toBeDefined());
+    const bFocus = tui.getFocusedComponent();
+    await host.session.prompt(`/approvals deny ${request.requestId}`);
+    await aDenied;
+    if (kind === "capturing") expect(tui.getFocusedComponent() === bFocus).toBe(true);
+    else expect(tui.getFocusedComponent() === aFocus).toBe(false);
+    expect(host.events.filter((event) => event.phase === "resolved")).toHaveLength(1);
+    if (kind === "nonCapturing") {
+      expect(tui.hasOverlay()).toBe(true);
+      focusForeign?.();
+      tui.getFocusedComponent()?.handleInput?.("\r");
+    } else bFocus?.handleInput?.("\r");
+    expect(await foreign).toBe(true);
+    await review;
+    expect(tui.hasOverlay()).toBe(false);
+    await host.session.prompt(`/approvals deny ${other.requestId}`);
+    await bDenied;
+  },
+);
+
+it.each(["rpc", "print"] as const)(
+  "read-only SDK base never admits a late canonical registration (%s)",
+  async (mode) => {
+    const host = await fixture(undefined, mode, true, undefined, undefined, { readOnlyBase: true });
+    expect(host.api.getAllTools().map((tool) => tool.name)).toEqual(["read"]);
+    const active = host.session.getActiveToolNames();
+    host.api.registerTool(createWriteToolDefinition(host.cwd));
+    host.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("write", { path: "late-canonical", content: "unreviewed" }), {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage("done"),
+    ]);
+    await host.session.prompt("late write");
+    expect(host.events).toEqual([]);
+    expect(host.confirm).not.toHaveBeenCalled();
+    await expect(readFile(join(host.cwd, "late-canonical"))).rejects.toThrow();
+    expect(host.session.getActiveToolNames().filter((name) => name !== "write")).toEqual(active);
+  },
+);
+
+it.each(["approve", "abort", "deny"])(
+  "review %s removes only its identity behind a foreign nonCapturing overlay",
+  async (action) => {
+    const { host, tui, ui, ctx } = await nativeHost();
+    ui.setEditorText("untouched draft");
+    const focus = tui.getFocusedComponent();
+    const abort = new AbortController();
+    const review = confirmOperation(ctx, operation(host.cwd), abort.signal);
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== focus).toBe(true));
+    const owned = tui.getFocusedComponent();
+    const foreign = new Text("foreign passive", 0, 0);
+    const foreignHandle = tui.showOverlay(foreign, { nonCapturing: true });
+    expect(tui.getFocusedComponent() === owned).toBe(true);
+    if (action === "abort") abort.abort();
+    else owned?.handleInput?.(action === "approve" ? "\x01" : "\x1b");
+    expect(await review).toBe(action === "approve");
+    expect(tui.hasOverlay()).toBe(true);
+    // Its identity handle must still address the surviving foreign overlay.
+    foreignHandle.focus();
+    expect(tui.getFocusedComponent() === foreign).toBe(true);
+    foreignHandle.hide();
+    expect(tui.hasOverlay()).toBe(false);
+    expect(tui.getFocusedComponent() === focus).toBe(true);
+    expect(ui.getEditorText()).toBe("untouched draft");
+  },
+);
+
+it("root optional command schema cannot acquire unreviewed arguments in a later normalizer", async () => {
+  const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }], details: undefined }));
+  const host = await fixture((pi) => {
+    pi.registerTool({
+      name: "normalizing_alias",
+      label: "alias",
+      description: "alias",
+      parameters: Type.Object({ command: Type.Optional(Type.String()) }),
+      execute,
+    });
+    pi.on("tool_call", (event) => {
+      if (event.toolName === "normalizing_alias") event.input.command = "late command";
+    });
+  });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("normalizing_alias", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  await host.session.prompt("normalize");
+  expect(execute).not.toHaveBeenCalled();
 });
+
+it.each(["shutdown", "binding", "branch"])(
+  "post-approval launch guard discovers sticky broker unavailability after %s without a new request",
+  async (loss) => {
+    let foreign: ExtensionAPI | undefined;
+    const host = await fixture(undefined, "rpc", true, undefined, (pi) => {
+      foreign = pi;
+    });
+    const target = host.manager.appendCustomEntry("earlier", {});
+    host.manager.appendCustomEntry("later", {});
+    const captured = captureApprovalService(host.api.events);
+    if (!captured) throw new Error("Missing captured service");
+    const approved = captured.service.request(operation(host.cwd), { isCurrent: () => true });
+    const [request] = await pending(host);
+    await host.session.prompt(`/approvals review ${request.requestId}`);
+    await approved;
+    expect(host.events.filter((event) => event.phase === "resolved").map((event) => event.outcome)).toEqual([
+      "approved",
+    ]);
+    host.session.setSessionName("ordinary rename after approval");
+    host.api.appendEntry("ordinary append after approval", {});
+    expect(() => captured.assertCurrent()).not.toThrow();
+    const leaf = host.manager.getLeafId();
+    if (!leaf) throw new Error("Missing native leaf");
+    if (loss === "shutdown") await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    else if (loss === "binding") {
+      if (!foreign) throw new Error("Missing foreign runtime");
+      foreign.registerTool({ ...createBashToolDefinition(host.cwd), description: "foreign replacement" });
+      expect(host.api.getAllTools().find((tool) => tool.name === "bash")?.description).toBe("foreign replacement");
+    } else host.manager.branch(target);
+
+    // No pending-request monitor remains: discovery itself must observe the loss.
+    expect(() => captured.assertCurrent()).toThrow();
+    const unavailable = queryApprovalService(host.api.events);
+    expect(unavailable).toBeDefined();
+    expect(unavailable?.id).not.toBe(captured.service.id);
+    await expect(unavailable?.request(operation(host.cwd), { isCurrent: () => true })).rejects.toThrow("unavailable");
+    if (loss === "branch") host.manager.branch(leaf);
+    expect(queryApprovalService(host.api.events)?.id).toBe(unavailable?.id);
+    expect(() => captured.assertCurrent()).toThrow("retired");
+    await expect(captured.service.request(operation(host.cwd), { isCurrent: () => true })).rejects.toThrow("retired");
+    expect(host.events.filter((event) => event.phase === "waiting")).toHaveLength(1);
+  },
+);
+
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((tuiMode) =>
+    ["overlay", "confirm"].flatMap((kind) =>
+      ["cancelled", "denied", "expired", "retired"].map((outcome) => ({ tuiMode, kind, outcome })),
+    ),
+  ),
+)(
+  "broker $outcome review settles and releases its lock behind foreign $kind ($tuiMode)",
+  async ({ tuiMode, kind, outcome }) => {
+    const { host, tui, ui, ctx } = await nativeHost(tuiMode);
+    ui.setEditorText("untouched broker draft");
+    const initialFocus = tui.getFocusedComponent();
+    const broker = new ApprovalBroker(
+      host.api.events,
+      () => ctx,
+      () => true,
+      outcome === "expired" ? 500 : 5000,
+    );
+    const abort = new AbortController();
+    const request = broker.request(operation(host.cwd, "first"), { signal: abort.signal, isCurrent: () => true });
+    const result = request.then(
+      () => "approved",
+      (error: unknown) => String(error),
+    );
+    const id = [...broker.pending.keys()][0];
+    let settled = false;
+    const review = broker
+      .review(id, ctx, (op, signal) => confirmOperation(ctx, op, signal))
+      .finally(() => {
+        settled = true;
+      });
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== initialFocus).toBe(true));
+    const owned = tui.getFocusedComponent();
+    const foreign =
+      kind === "overlay"
+        ? ui.custom<boolean>(
+            (_tui, _theme, _keys, done) => ({
+              render: () => ["FOREIGN"],
+              handleInput: () => done(true),
+              invalidate() {},
+            }),
+            { overlay: true },
+          )
+        : ui.confirm("FOREIGN", "Still respondable");
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== owned).toBe(true));
+    const foreignFocus = tui.getFocusedComponent();
+    try {
+      if (outcome === "cancelled") abort.abort();
+      else if (outcome === "denied") await broker.review(id, ctx, async () => true, true);
+      else if (outcome === "retired") broker.retire();
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 1000 });
+      await review;
+      expect(await result).toContain(outcome);
+      expect(tui.getFocusedComponent() === foreignFocus).toBe(true);
+      expect(ui.getEditorText()).toBe("untouched broker draft");
+      if (outcome !== "retired") {
+        const next = broker.request(operation(host.cwd, "next"), { isCurrent: () => true });
+        const nextResult = next.then(
+          () => "approved",
+          () => "rejected",
+        );
+        // This fails if the invocation-global reviewing lock outlives cancellation.
+        await broker.review([...broker.pending.keys()][0], ctx, async () => true);
+        expect(await nextResult).toBe("approved");
+        expect(tui.getFocusedComponent() === foreignFocus).toBe(true);
+      }
+    } finally {
+      broker.retire();
+      foreignFocus?.handleInput?.("\r");
+      expect(await foreign).toBe(true);
+      await review;
+      await result;
+    }
+    expect(tui.hasOverlay()).toBe(false);
+    expect(tui.getFocusedComponent() === initialFocus).toBe(true);
+    expect(ui.getEditorText()).toBe("untouched broker draft");
+  },
+);
+
+it.each(["regular", "fullscreen"] as const)(
+  "abort during overlay admission removes the late admitted review (%s)",
+  async (tuiMode) => {
+    const { host, tui, ui, ctx } = await nativeHost(tuiMode);
+    ui.setEditorText("admission draft");
+    const initialFocus = tui.getFocusedComponent();
+    const abort = new AbortController();
+    let admitted: ReturnType<typeof tui.showOverlay> | undefined;
+    let owned: Component | undefined;
+    const admission = vi.fn((...args: Parameters<typeof tui.showOverlay>) => {
+      owned = args[0];
+      abort.abort();
+      admitted = tui.showOverlay(...args);
+      return admitted;
+    });
+    const custom: ExtensionUIContext["custom"] = (factory, options) =>
+      ui.custom(
+        (native, theme, keys, done) =>
+          factory(
+            new Proxy(native, {
+              get(target, key) {
+                return key === "showOverlay" ? admission : Reflect.get(target, key);
+              },
+            }),
+            theme,
+            keys,
+            done,
+          ),
+        options,
+      );
+    let settled = false;
+    const review = confirmOperation({ ...ctx, ui: { ...ui, custom } }, operation(host.cwd), abort.signal).then(
+      (value) => {
+        settled = true;
+        return value;
+      },
+    );
+    try {
+      await vi.waitFor(() => expect(admission).toHaveBeenCalledOnce(), { timeout: 300 });
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 300 });
+      expect(await review).toBe(false);
+      expect(tui.hasOverlay()).toBe(false);
+      expect(tui.getFocusedComponent() === initialFocus).toBe(true);
+      expect(ui.getEditorText()).toBe("admission draft");
+    } finally {
+      // Bound the regression probe even if admission or completion regresses.
+      admitted?.focus();
+      owned?.handleInput?.("\x1b");
+      await new Promise((resolve) => setImmediate(resolve));
+      admitted?.hide();
+    }
+  },
+);

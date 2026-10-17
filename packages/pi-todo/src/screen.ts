@@ -1,5 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, matchesKey, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { commandCharacter, DraftInput } from "./draft-input.js";
 import type { Snapshot } from "./state.js";
 import { columns, display, SourceViewport } from "./ui.js";
 
@@ -29,6 +30,10 @@ export class TodoScreen implements Component {
   private confirmation?: "remove" | "clear";
   private closed = false;
   private capacity = 1;
+  private readonly commands = new DraftInput(display, (data, paste) => {
+    // Consume complete AND split bracketed pastes without invoking commands.
+    if (!paste) this.handleKey(data);
+  });
   constructor(
     private readonly tui: TUI,
     private readonly theme: Theme,
@@ -40,15 +45,20 @@ export class TodoScreen implements Component {
   }
   close(action?: ViewAction) {
     if (this.closed) return;
-    this.closed = true;
+    this.dispose();
     this.done(action);
   }
   dispose() {
     this.closed = true;
+    this.commands.dispose();
   }
   invalidate() {}
   handleInput(data: string) {
+    this.commands.handleInput(data);
+  }
+  private handleKey(data: string) {
     if (this.closed) return;
+    const char = commandCharacter(data);
     if (matchesKey(data, "ctrl+c")) this.close();
     else if (matchesKey(data, "escape")) {
       if (this.confirmation) this.confirmation = undefined;
@@ -60,21 +70,21 @@ export class TodoScreen implements Component {
         // Repeating d/D never confirms. A distinct y is required.
         const action = this.confirmation;
         this.confirmation = undefined;
-        if (data === "y") this.close({ action, id: this.selectedId });
+        if (char === "y") this.close({ action, id: this.selectedId });
       }
-    } else if (data === "?") {
+    } else if (char === "?") {
       this.help = !this.help;
       this.helpView.reset();
     } else if (this.help) this.helpView.navigate(data);
-    else if (data === "d" && this.selectedId) {
+    else if (char === "d" && this.selectedId) {
       this.confirmation = "remove";
       this.confirmView.reset();
-    } else if (data === "D") {
+    } else if (char === "D") {
       this.confirmation = "clear";
       this.confirmView.reset();
-    } else if (data === "a") this.close({ action: "add" });
-    else if (data === "e" && this.selectedId) this.close({ action: "edit", id: this.selectedId });
-    else if (data === "s" && this.selectedId) this.close({ action: "status", id: this.selectedId });
+    } else if (char === "a") this.close({ action: "add" });
+    else if (char === "e" && this.selectedId) this.close({ action: "edit", id: this.selectedId });
+    else if (char === "s" && this.selectedId) this.close({ action: "status", id: this.selectedId });
     else if (matchesKey(data, "return")) {
       this.detail = !this.detail;
       this.details.reset();

@@ -14,10 +14,11 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { expect, test, vi } from "vitest";
+import { HANDOFF_TYPE, readHandoff } from "../src/handoff.js";
 import { Owner } from "../src/ownership.js";
 import { messageText, plain, recentText, SHARE_BYTES, SUMMARY_BYTES, validSummary } from "../src/text.js";
 import { HumanUI, Picker, rowsFrom, type SessionRow, safeLines } from "../src/ui.js";
-import { deferred, fixture, response } from "./support.js";
+import { deferred, fixture, model, response } from "./support.js";
 
 initTheme("dark", false);
 const terminal: Terminal = {
@@ -160,6 +161,125 @@ for (const mode of ["regular", "fullscreen"] as const) {
       ui.tui.stop();
     }
   });
+
+  test.each([false, true])(
+    `${mode} async loading failure=%s cannot continue over a foreign focused overlay`,
+    async (failure) => {
+      const ui = nativeUi(mode);
+      const f = await fixture({ mode: "tui", ui: { custom: ui.custom, getEditorText: () => ui.draft } });
+      const owner = new Owner(f.source.extensionRunner.createCommandContext(), true);
+      const work = deferred<string>();
+      const human = new HumanUI(owner);
+      try {
+        const continued = vi.fn();
+        const pending = (async () => {
+          let value: string | undefined;
+          try {
+            value = await human.loading("Generating", () => work.promise);
+          } catch {
+            // Match handoff's manual fallback: only a still-current owner may
+            // offer another dialog after a provider error.
+            if (owner.current()) {
+              continued();
+              void human.confirm("Must not open", "Manual fallback?").catch(() => {});
+            }
+            return;
+          }
+          if (value !== undefined) {
+            continued();
+            // A real handoff would open its review here, stealing foreign focus.
+            void human.editor("Must not open", value).catch(() => {});
+          }
+        })();
+        void pending.catch(() => {});
+        await vi.waitFor(() => expect(ui.tui.hasOverlay()).toBe(true));
+        const foreign: Component = { render: () => ["Foreign review"], invalidate() {} };
+        const foreignHandle = ui.tui.showOverlay(foreign);
+        if (failure) work.reject(new Error("provider unavailable"));
+        else work.resolve("completed generation");
+        await pending.catch(() => {});
+        expect(continued).not.toHaveBeenCalled();
+        expect(ui.tui.getFocusedComponent()).toBe(foreign);
+        expect(foreignHandle.isFocused()).toBe(true);
+        expect(ui.draft).toBe("original unsent draft");
+        expect(ui.editorWrites).toBe(0);
+        foreignHandle.hide();
+      } finally {
+        owner.finish();
+        work.resolve("late");
+        await f.cleanup();
+        ui.tui.stop();
+      }
+    },
+  );
+
+  test.each(["branch", "model"] as const)(
+    `${mode} source %s revocation during native preflight cannot authorize TUI prefill`,
+    async (boundary) => {
+      const ui = nativeUi(mode);
+      const entered = deferred<void>();
+      const permit = deferred<void>();
+      const f = await fixture({
+        mode: "tui",
+        memory: true,
+        ui: { custom: ui.custom, getEditorText: () => ui.draft, setEditorText: (text) => ui.editor.setText(text) },
+        extra: (pi) =>
+          pi.on("session_before_switch", async (_event, ctx) => {
+            if (ctx.sessionManager === f.manager) {
+              entered.resolve();
+              await permit.promise;
+            }
+          }),
+      });
+      let running: Promise<void> | undefined;
+      try {
+        running = f.command("handoff", "continue");
+        let previous: Component | null = null;
+        for (const keys of [
+          ["\r"],
+          ["\x1b[B", "\r"],
+          ["approved recovery summary", "\r"],
+          ["\x1b[B", "\r"],
+          ["\x1b[B", "\r"],
+        ]) {
+          await vi.waitFor(() => {
+            expect(ui.tui.getFocusedComponent()).not.toBeNull();
+            expect(ui.tui.getFocusedComponent()).not.toBe(previous);
+          });
+          previous = ui.tui.getFocusedComponent();
+          previous?.render(80);
+          for (const key of keys) previous?.handleInput?.(key);
+        }
+        await entered.promise;
+        if (boundary === "branch") {
+          f.manager.appendCustomEntry("new source branch state");
+          await new Promise((resolve) => setTimeout(resolve, 120));
+        } else {
+          vi.spyOn(f.runtime.services.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+          await f.source.setModel({ ...model, id: "changed" });
+          expect(f.source.model?.id).toBe("changed");
+        }
+        permit.resolve();
+        await running;
+        expect(f.runtime.session).not.toBe(f.source);
+        const entry = f.runtime.session.sessionManager
+          .getBranch()
+          .find((item) => item.type === "custom" && item.customType === HANDOFF_TYPE);
+        const saved = entry?.type === "custom" ? readHandoff(entry.data) : undefined;
+        expect(saved?.summary).toBe("approved recovery summary");
+        expect(saved?.prefill).toBeUndefined();
+        expect(ui.draft).toBe("original unsent draft");
+        expect(ui.editorWrites).toBe(0);
+        expect(f.destinationTurns).toBe(0);
+      } finally {
+        permit.resolve();
+        await running;
+        vi.restoreAllMocks();
+        await f.cleanup();
+        ui.tui.stop();
+      }
+    },
+  );
 }
 
 test.each(["regular", "fullscreen"] as const)(

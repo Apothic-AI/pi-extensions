@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   APPROVAL_ADAPTER_QUERY_CHANNEL,
+  captureApprovalService,
   escapeDisplay,
   hashBytes,
-  queryApprovalService,
   validateAdapterQuery,
   validateOperation,
 } from "@signalridge/pi-approval-core";
@@ -54,10 +54,14 @@ export function commandApproval(
   manager: JobManager,
   options: StartOptions,
   signal?: AbortSignal,
-): Promise<void> | undefined {
+): { readonly pending: Promise<void>; readonly guard: () => void } | undefined {
   assertLaunchCurrent(manager, signal);
-  const service = pi.events ? queryApprovalService(pi.events) : undefined;
-  if (!service) return undefined;
+  const captured = pi.events ? captureApprovalService(pi.events) : undefined;
+  if (!captured) return undefined;
+  const guard = () => {
+    assertLaunchCurrent(manager, signal);
+    captured.assertCurrent();
+  };
   // Explicit null represents monitor's unlimited deadline, not bash's default.
   const normalized = JSON.stringify({ ...options, timeoutMs: options.timeoutMs ?? null });
   const operation = validateOperation({
@@ -71,16 +75,17 @@ export function commandApproval(
     preview: `${toolName} normalized launch inputs (timeoutMs null means no deadline):\n${escapeDisplay(normalized)}`,
   });
   assertLaunchCurrent(manager, signal);
-  return service.request(
+  const pending = captured.service.request(
     operation,
     Object.freeze({
       signal,
       isCurrent: () => {
-        assertLaunchCurrent(manager, signal);
+        guard();
         return true;
       },
     }),
   );
+  return Object.freeze({ pending, guard });
 }
 
 /** Extension-owned synchronous capability; no process/UI resources in the factory. */

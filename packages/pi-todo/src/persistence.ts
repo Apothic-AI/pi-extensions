@@ -88,7 +88,7 @@ export class Persistence {
       const chunk = Buffer.alloc(CHUNK_BYTES);
       const finish = () => {
         const hash = digest.digest("hex");
-        if (conversations.has(hash)) conversation = true;
+        if (lineBytes > LINE_LIMIT && conversations.has(hash)) conversation = true;
         if (lineBytes <= LINE_LIMIT) {
           const line = Buffer.concat(pieces).toString("utf8");
           let entry: unknown;
@@ -97,6 +97,9 @@ export class Persistence {
           } catch {
             /* Incomplete/malformed records confer no authority. */
           }
+          // Native JSONL accepts CRLF and legal JSON whitespace. Compare parsed
+          // bounded records as we do headers/state; never parse huge messages.
+          if (entry && conversations.has(fingerprint(entry))) conversation = true;
           if (!headerSeen) {
             if (fingerprint(entry ?? null) !== headerKey)
               throw new Error("Todo unavailable: persisted session header mismatch.");

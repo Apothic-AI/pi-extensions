@@ -1,7 +1,15 @@
-import { decodeKittyPrintable } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, isKeyRelease, parseKey } from "@earendil-works/pi-tui";
 
 const BEGIN = "\x1b[200~";
 const END = "\x1b[201~";
+
+/** Decode character commands without collapsing Ctrl/Alt/Super or Shift case. */
+export function commandCharacter(data: string): string | undefined {
+  if (isKeyRelease(data)) return undefined;
+  const printable = decodeKittyPrintable(data) ?? (data.length === 1 ? data : undefined);
+  // CSI-u may omit the shifted alternate codepoint (e.g. Shift+d => 100;2u).
+  return parseKey(data)?.startsWith("shift+") ? printable?.toUpperCase() : printable;
+}
 
 /** Task-form input boundary. Keep native key semantics and atomic paste Undo,
  * but never insert untrusted paste controls into a native Input/Editor. */
@@ -24,8 +32,14 @@ export class DraftInput {
     if (this.disposed) return;
     clearTimeout(this.timer);
     this.timer = undefined;
-    let remaining = this.prefix + data;
+    const prefix = this.prefix;
+    let remaining = prefix + data;
     this.prefix = "";
+    // A following complete key disambiguates Escape from a partial paste marker.
+    if (prefix && !BEGIN.startsWith(remaining) && !remaining.startsWith(BEGIN)) {
+      this.key(prefix);
+      remaining = data;
+    }
     while (remaining && !this.disposed) {
       if (this.paste !== undefined) {
         this.paste += remaining;

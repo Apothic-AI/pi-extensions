@@ -56,6 +56,12 @@ export function createApprovalBashOperations(options: {
   const delegate = createLocalBashOperations({ shellPath: options.shellPath });
   return {
     exec: async (command, cwd, execution) => {
+      // Own backend options as well as tool input: callers may retain and mutate
+      // the options/env while human review is pending. Keep signal identity.
+      execution = Object.freeze({
+        ...execution,
+        ...(execution.env === undefined ? {} : { env: Object.freeze({ ...execution.env }) }),
+      });
       // Gate the final command/cwd received by the native backend, not tool_call input.
       const owner = { signal: execution.signal, isCurrent: options.isCurrent };
       assertCurrent(owner);

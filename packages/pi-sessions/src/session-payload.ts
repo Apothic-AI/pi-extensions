@@ -57,6 +57,30 @@ function systemContent(value: unknown): boolean {
   );
 }
 
+function systemMessage(value: unknown): boolean {
+  return (
+    record(value) &&
+    value.role === "system" &&
+    numericFields(value, ["timestamp"]) &&
+    systemContent(value.content) &&
+    (value.sections === undefined ||
+      (record(value.sections) &&
+        Object.values(value.sections).every((section) => section === null || typeof section === "string"))) &&
+    (value.toolsAdded === undefined ||
+      (Array.isArray(value.toolsAdded) &&
+        value.toolsAdded.every(
+          (tool: unknown) =>
+            record(tool) &&
+            typeof tool.name === "string" &&
+            typeof tool.description === "string" &&
+            record(tool.parameters),
+        ))) &&
+    (value.toolsRemoved === undefined ||
+      (Array.isArray(value.toolsRemoved) &&
+        value.toolsRemoved.every((tool: unknown) => record(tool) && typeof tool.name === "string")))
+  );
+}
+
 /** Validate fields consumed by native restoration before disposing the source.
  * Arbitrary custom data/details remain opaque; this is not a provider schema. */
 export function validateEntryPayload(value: Record<string, unknown>, byId: ReadonlyMap<string, SessionEntry>): void {
@@ -77,7 +101,7 @@ export function validateEntryPayload(value: Record<string, unknown>, byId: Reado
           valid = typeof message.content === "string" || arrayContent(message.content, ["text", "image"]);
           break;
         case "system":
-          valid = systemContent(message.content);
+          valid = systemMessage(message);
           break;
         case "custom":
           valid =
@@ -137,10 +161,7 @@ export function validateEntryPayload(value: Record<string, unknown>, byId: Reado
         Number.isFinite(value.tokensBefore) &&
         value.tokensBefore >= 0 &&
         (value.usage === undefined || usage(value.usage)) &&
-        (value.systemMessage === undefined ||
-          (record(value.systemMessage) &&
-            value.systemMessage.role === "system" &&
-            systemContent(value.systemMessage.content)));
+        (value.systemMessage === undefined || systemMessage(value.systemMessage));
       break;
     case "branch_summary":
       valid =

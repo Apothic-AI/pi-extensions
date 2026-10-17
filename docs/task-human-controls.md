@@ -1,71 +1,78 @@
 # Task and human-control implementation
 
-Status: implementation in progress. This document is an acceptance ledger, not a claim that the features below have shipped.
+Status: implemented on the feature branch. Run the integrated verification commands below against the exact source before merging. This acceptance ledger does not claim npm publication.
 
 ## Scope
 
 1. Independent, opt-in session/branch Todo, distinct from an execution scheduler or project/shared backlog.
-2. A visible background-task shortcut entry opening the existing task selector without consuming the subagent foreground handoff key.
-3. Per-operation reviewed write/edit approval, not a session-wide permission for subsequent writes.
-4. Human-owned, structured command approval across root, managed child and background launch paths.
-5. Generic editable-summary linked-session handoff and cross-workspace session preview/navigation, distinct from the existing approved-plan implementation handoff.
+2. `Ctrl+Alt+B` opens the existing guarded background-task selector without consuming the subagent foreground handoff key.
+3. Per-operation reviewed write/edit approval, not session-wide permission for subsequent writes.
+4. Human-owned command approval across root, managed child and background launch paths.
+5. Editable-summary linked-session handoff and cross-workspace preview/navigation, distinct from approved-plan implementation handoff.
 
-No global installation or settings changes, default activation of experimental packages, automatic conversion of builtin bash to background work, PTY attachment, SSH backend, memory subsystem or project backlog is included.
+No global installation/settings changes, default experimental activation, automatic conversion of builtin bash to background work, PTY attachment, SSH backend, memory subsystem or shared project backlog is included.
 
-## Non-negotiable boundaries
+## Boundaries
 
-- Use public Pi APIs and validated `pi.events` payloads. Extract only intentional, side-effect-free shared contracts; extensions do not import each other's source.
-- Preserve managed protocol v4 and workflow journal schema v4. An optional approval capability must not silently grant permissions or change ordinary parent clarification into an approver.
-- Human approval binds to the specific operation, owner, effective cwd, input and reviewed file state. Changed input/file state, missing approver, cancellation and retired ownership invalidate it.
-- Permission controls are not an OS sandbox. Existing stricter tool admission, project trust and Plan-mode policy remain authoritative. Coverage for noncanonical external execution tools must be explicit rather than inferred from a canonical bash gate.
-- Status text is not itself an interactive component. A shortcut plus task selector must be described accurately and preserve existing dialog focus, editor drafts and footer ownership.
-- Todo completion is a checklist assertion, not proof of workflow execution or successful verification. No automatic completion from prose, settlement, stops or partial results.
-- Native command-only session replacement and navigation must remain command-owned. Previewing a session does not grant permission to execute instructions in it or copy credentials.
+- Use public Pi APIs and validated `pi.events` payloads. Extensions do not import each other's source; the intentionally shared approval contract lives in a side-effect-free library.
+- Managed protocol v4 and workflow journal schema v4 remain unchanged. Ordinary parent clarification cannot approve execution.
+- Approval binds to the exact owner, operation, effective cwd, final input and reviewed file state. Changed input/file state, missing approver, cancellation and retired ownership invalidate it. Review limits reject rather than clip changes.
+- Permission controls are not an OS sandbox. Stricter tool admission, project trust and Plan policy remain authoritative. Noncanonical execution tools need explicit cooperative adapters; arbitrary extension-side I/O is outside this boundary.
+- Reviewed edit operations use the native SDK mutation queue's computed output. Write mkdir is deferred until approval. This serializes cooperating same-process operations, not arbitrary external writers or independently loaded runtimes.
+- Background approval belongs to the normalized launch and must remain valid through asynchronous startup, not merely when a human answers. Inspection alone starts neither a command nor a model turn.
+- Todo completion is a checklist assertion, not proof of workflow execution or successful verification. Never infer completion from prose, stops or partial results. Native incomplete ancestry must not silently become an empty checklist.
+- Session preview does not authorize instructions in stored history. A handoff saves a human-approved summary outside model context and only prefills a draft; it never automatically submits a model turn. Retired source approval cannot grant a fresh destination prefill.
+
+### Host-observation limits
+
+Pi 1.0.4 dispatches cancellable lifecycle handlers in extension order and stops at the first veto. An extension cannot observe an attempt already vetoed by an earlier extension. Session ownership fences therefore cover **delivered lifecycle events and observable state changes**, not every possible navigation attempt.
+
+RPC does not expose client-local draft contents, draft versions or conditional editor writes. A client must preserve newer local drafts and reject stale confirmations; an explicit Yes authorizes replacement of its current draft. Neither a branch fingerprint nor destination-owned consent supplies a missing client draft epoch. A universal stale-consent guarantee requires public host/client support, not private runtime patches.
 
 ## Acceptance matrix
 
 | Area | Required evidence |
 | --- | --- |
-| Todo state | Stable IDs; meaningful revision increments; validated full graph; immutable snapshots; append failure keeps old state; valid empty snapshots; bounded input/output |
-| Todo recovery | Current-branch tree/fork/reload; compaction and precise model awareness; nested tool calls without standalone toolResult; stale revision and retired owner rejection |
-| Todo UI | Explicit manual editing/status/reopen; distinct-key destructive confirmation; CJK/ANSI safety; narrow-width resize; root editor draft preservation |
-| Background entry | Real host shortcut in fullscreen and regular modes; empty/running/finished list; other-dialog focus; no Ctrl+B collision; no process/model turn from inspection |
-| Reviewed writes | Exact edit semantics; reviewed diff; original/new file binding; concurrent mutations; external editing; cancellation; append/write/queue failures; no unreviewed write fallback |
-| Commands | Per-command decisions; root and managed child correlation; background launch; parallel requests; waiting/respond/resolved lifecycle; human-only responses; absent peer and non-UI fail closed |
-| Session navigation | Bounded discovery/preview; malformed files; stable ID/path selection; cross-workspace cwd semantics; cancelled navigation; owner retirement |
-| Handoff | Editable human-confirmed bounded summary; linked parent; in-memory source preservation; destination draft only; recovery and model mismatch; no automatic sending |
-| Composition | Plan-mode tool policy; existing ask_tools restrictions; workflow checkpoint distinction; extension load order; exact-owned session/branch cleanup |
-| Release | Independent manifests and changesets; complete root gate; packed loader smoke; actual offline CLI PTY/RPC/print tests; honest untested platform/provider limits |
+| Todo state/recovery | Stable IDs/revisions; complete dependency validation; immutable snapshots; append failure and orphan ancestry; branch/fork/reload/compaction; bounded context and storage reads |
+| Todo UI | Manual edit/status/reopen; distinct destructive confirmation; configured keys and encoded printable keys; paste/Undo/CJK safety; resize and draft/focus preservation |
+| Background | Shortcut in fullscreen/regular modes; empty/running/finished selector; no Ctrl+B conflict; captured launch owner/service through filesystem and supervisor awaits |
+| Reviewed mutations | Exact edit semantics and complete bounded diff; final arguments/file bytes; concurrent mutations; cancellation, retirement and no unreviewed fallback |
+| Commands | Root/managed/background paths; partial and late canonical registration; final alias normalization; parallel human requests; absent/non-UI approver fails closed |
+| Session storage | Bounded discovery/preview; malformed metadata and native payloads; real v2 migration; growing-file bounds; custom directories and explicit workspace consent |
+| Handoff/UI | Editable exact summary; durable parent/intent; destination ownership; revoked preflight authorization; explicit recovery; paste Undo, remapped controls and asynchronous foreign focus |
+| Composition/release | Plan/trust/ask-tools restrictions; exact-owned cleanup; independent manifests/Changesets; complete root gate, packed loaders and explicit external publication prerequisites |
 
-## Approval integration design
+## Reproducible verification
 
-Use a side-effect-free `pi-approval-core` library for reviewed tool definitions and a version-1 local event-bus service contract; the opt-in `pi-approvals` extension owns human decisions and their lifecycle. This is separate from managed protocol v4. A caller captures one validated service before awaiting work; a retired or ambiguous service must not become an unapproved fallback.
+Run from the repository root with the lockfile's existing development dependencies. These commands use the checked-in harnesses rather than unavailable development-session scratch files:
 
-Reviewed edit operations use the public SDK factory's computed output inside its existing file-mutation queue. Reviewed write operations defer directory creation until approval. Neither wraps a factory in another same-file queue acquisition, which would deadlock the non-reentrant SDK queue. The final executed arguments must be validated and copied after tool-call handlers, not approved solely in an earlier mutable event hook. File state and ownership are rechecked after the decision. This serializes cooperating same-process operations, not arbitrary external writers or independently loaded runtimes.
+```sh
+bun run --cwd packages/pi-todo check
+bun run --cwd packages/pi-approval-core check
+bun run --cwd packages/pi-approvals check
+bun run --cwd packages/pi-background check
+bun run --cwd packages/pi-sessions check
+bun run --cwd packages/pi-subagents check
+bun run --cwd packages/pi-workflows check
 
-Managed child integration captures the root service through the parent-owned public event bus and installs only reviewed tools already admitted by child policy. It does not forward every child UI method, widen extension admission, or turn ordinary parent clarification into permission. Background launch approval belongs immediately before the owned normalized start/watch operation. Existing stronger admission and trust rules remain in force.
+# Actual offline Pi CLI/PTY UI checks; macOS/Linux and Python 3 stdlib required.
+python3 packages/pi-background/test/shortcut-cli.py
+python3 packages/pi-sessions/test/ui-cli.py "$(mktemp -d)"
 
-## Verification status
+# Final integrated gate; includes package, integration, packing/loading and secret checks.
+bun run check
+bun run --cwd packages/pi-subagents build
+git diff --check
+```
 
-The first integrated background-entry delta passed its package lint/typecheck and **114 tests**, including the existing 108. Its repeatable actual Pi 1.0.4 CLI/PT Y script passed **72 checks** across fullscreen/regular and 100×30/40×12. The complete repository gate also passed for that integrated tree. Independent review and approval composition are still pending.
+Package checks include unit and native SDK tests; the approvals suite also runs the actual RPC CLI transport. The two Python commands exercise actual CLI terminal input and UI fixtures. Session UI frames are public post-composition assertions with raw terminal output retained separately, not an independent physical-terminal or universal third-party-renderer certification. The sessions UI fixture does not constitute complete `/sessions` and `/handoff` command-level CLI acceptance. Managed-child SDK coverage is not separately exercised child CLI/TUI coverage.
 
-Todo, approvals and generic sessions/handoff remain under implementation. Unit tests, fake-provider SDK tests and physical/live-provider acceptance will be reported separately. No publication is implied by this ledger.
+Earlier development sessions recorded additional Todo CLI, session-command RPC/TUI/discovery and root/background approval-composition counts. Their external scratch harnesses are **not included in this checkout** and their continued availability is not asserted. Treat those counts as historical reports, not presently rerunnable acceptance or substitutes for the commands above. Current verification must identify its source revision, commands, exits, deadlines and retained results; do not replace a failed full gate with a passing diagnostic subset.
 
+No live-provider, paid-inference, physical-terminal or universal third-party-renderer qualification is claimed. Native new/reload cursor reset and native fork draft-prefill behavior are host-owned; ordinary overlay preservation is tested separately without private cursor patches.
 
-### Integrated package checkpoint
+## Publication is a separate gate
 
-The integrated Todo package now passes lint/typecheck and 86 tests, including native-keyboard host scenarios after the durability, tool-exposure and UI fixes. Current approval core, approvals and background package checks pass with 20, 41 and 146 tests. The managed-child approval SDK suite was rerun separately. These are package/SDK checks, not live-provider or physical-terminal acceptance.
+The new package names `@signalridge/pi-approval-core`, `@signalridge/pi-approvals`, `@signalridge/pi-sessions` and `@signalridge/pi-todo` require registry verification, maintainer-owned first-name bootstrap when absent, and package-specific npm Trusted Publisher configuration. Public registry availability does not establish Trusted Publisher settings.
 
-The lockfile now includes the new workspace packages and approval adapters. JSON/manifests, package boundaries, shared dependency ranges, test inventory, changeset coverage and generated capability gates pass. The full current-tree repository gate and packed-loader acceptance remain pending.
-
-### Current verification checkpoint
-
-The four initial session/handoff findings were reproduced and repaired. Follow-up review identified additional pre-insertion cursor/Undo, exact whitespace approval and picker-offset defects, plus usage/content restoration and growing-file read bounds. The current tree includes those fixes; its session package passes lint/typecheck and **202 tests**, including the final native-role, custom-directory discovery and remapped-key regressions. Parent reruns confirm the destination's interaction lock and vetoed-navigation fencing prevent a late Yes from overwriting a newer client draft, without a model turn. The repeatable session UI CLI script passes **112 public post-composition assertions** across regular/fullscreen and resizing; raw ANSI is retained separately, not claimed independently reconstructed by that script. Actual full command acceptance also passes **16 RPC checks** and **27 TUI checks** for native creation, exact whitespace/CJK draft, explicit recovery and no automatic model turn. A custom-directory discovery regression is repaired and its actual CLI discovery/switch check passes **11 checks**, including separate consent, foreign tool/resource workspace rebinding and unchanged process cwd. Final focused independent recheck and full repository gates remain pending.
-
-The repaired Todo source passes an actual offline CLI subset of **176 checks**, including normal manual editing, both terminal modes/sizes, revisions/dependencies, persisted recovery, nested calls, and JSON/RPC/plain paths. Separate lifecycle checks pass typed commands and compaction/context recovery. No-Todo native controls confirm new/reload cursor reset and fork draft-prefill behavior are host-owned; these do not reduce the package's ordinary overlay preservation assertions. Prompt retirement on an external authoritative Todo-state change is now repaired using lightweight lease checks rather than repeated persistence reads: the Todo package passes **139 tests**, and the authority-only actual CLI case passes **9 checks**. The complete ordinary CLI subset passed again at the terminal-input hardening epoch; its final unchanged-title preservation follow-up is included in the native package suite.
-
-Actual root/background approval composition passes **39 RPC checks** and **60 TUI checks**: specific write denial, exact approved write/edit CRLF bytes, canonical bash/background/monitor launch gates, transport nonce separation, explicit review and no extra model turn. Managed-child approval has **36 focused native SDK tests**; the complete Subagents package also passes **1996 tests, 4 skipped**. The background selector shortcut passes **80 actual CLI checks** after approval integration. These are offline/faux-provider or SDK results, not live-provider or physical-terminal qualification.
-
-The complete root gate passed once, including 34 manifests, independent packed loaders, versions/Changesets and secret scanning; Subagents build passed too. Final small input-boundary/lifecycle follow-ups are being rechecked against the final source epoch before submission. Todo's edit prefill/paste safety has native regression coverage, including raw Backspace and unchanged-state preservation. Scope-specific reviews closed the session restoration, custom-directory enumeration and remapped-submit findings; the last Todo input recheck is tracked separately.
-
-Publication is a separate gate: npm currently has no packages named `@signalridge/pi-approval-core`, `@signalridge/pi-approvals`, `@signalridge/pi-sessions` or `@signalridge/pi-todo`. Per the repository release policy, each requires maintainer-owned first-name bootstrap and its package-specific Trusted Publisher binding before normal OIDC Changesets publication. No local publish, manual version bump or global configuration change is part of this implementation. Do not merge a version-release PR until those prerequisites are satisfied. No publication is claimed.
+Coordinate these prerequisites before merging/releasing because existing adapters depend on the new core. Follow [the normal Changesets/OIDC release process](releasing.md). No local publish, token fallback, manual version bump, release-PR merge or global activation is implied by implementation or green code CI.

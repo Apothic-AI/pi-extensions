@@ -66,6 +66,21 @@ export function requiresApprovalAdapter(input: unknown): boolean {
   );
 }
 
+/** Known schema properties also require admission when optional inputs are
+ * filled by downstream normalizers. This is not arbitrary semantic detection.
+ * Only root properties and a single input-envelope are inspected, like inputs.
+ */
+export function schemaRequiresApprovalAdapter(parameters: TSchema): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(parameters, "properties");
+  const properties: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
+  if (requiresApprovalAdapter(properties)) return true;
+  const envelope = Object.getOwnPropertyDescriptor(properties, "input");
+  if (!envelope || !("value" in envelope) || !envelope.value || typeof envelope.value !== "object") return false;
+  const nested = Object.getOwnPropertyDescriptor(envelope.value, "properties");
+  return !!nested && "value" in nested && requiresApprovalAdapter(nested.value);
+}
+
 /** Trusted cooperative gate attestation, not authorization or an OS sandbox. */
 export function queryApprovalAdapter(events: ApprovalEvents, name: string, parameters: TSchema): ApprovalAdapter {
   toolName(name);

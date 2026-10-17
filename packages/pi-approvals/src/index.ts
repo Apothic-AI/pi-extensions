@@ -9,6 +9,7 @@ import {
   queryApprovalAdapter,
   queryApprovalService,
   requiresApprovalAdapter,
+  schemaRequiresApprovalAdapter,
   validateQuery,
 } from "@signalridge/pi-approval-core";
 import type { TSchema } from "typebox";
@@ -52,10 +53,11 @@ export default function approvals(pi: ExtensionAPI): void {
     if (!context) throw new Error("Approval session is not bound");
     return context;
   };
-  const isBound = () => {
+  const isBound = (name?: string) => {
     const all = pi.getAllTools();
     return (
       !bindingFailed &&
+      (name === undefined || bindings.some((captured) => captured.name === name)) &&
       bindings.every((captured) =>
         sameTool(
           captured,
@@ -64,7 +66,11 @@ export default function approvals(pi: ExtensionAPI): void {
       )
     );
   };
-  pi.events.on(APPROVAL_QUERY_CHANNEL, (value) => validateQuery(value).respond(advertised));
+  pi.events.on(APPROVAL_QUERY_CHANNEL, (value) => {
+    const query = validateQuery(value);
+    if (broker && advertised === broker.service && !broker.isLive) advertised = unavailable();
+    query.respond(advertised);
+  });
   const bind = (ctx: ExtensionContext) => {
     broker?.retire();
     context = ctx;
@@ -139,21 +145,25 @@ export default function approvals(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => broker?.retire());
   pi.on("tool_call", (event) => {
     if (CANONICAL.some((name) => name === event.toolName)) {
-      if (!broker || rootReason || !isBound()) {
+      if (!broker || rootReason || !isBound(event.toolName)) {
         if (!isBound()) broker?.retire();
         return { block: true, reason: rootReason || "Approvals unavailable or canonical binding replaced" };
       }
-    } else if (requiresApprovalAdapter(event.input)) {
-      try {
-        const effective = pi.getAllTools().find((tool) => tool.name === event.toolName);
-        if (!effective) throw new Error("No effective tool binding");
-        queryApprovalAdapter(pi.events, event.toolName, effective.parameters);
-      } catch {
-        return {
-          block: true,
-          reason:
-            "Command/mutation-shaped tool requires exactly one live cooperative approval adapter; unreviewed fallback is blocked",
-        };
+    } else {
+      const effective = pi.getAllTools().find((tool) => tool.name === event.toolName);
+      // Root public hooks have no post-handler boundary. Require the adapter
+      // before later normalizers can populate known optional schema properties.
+      if (requiresApprovalAdapter(event.input) || (effective && schemaRequiresApprovalAdapter(effective.parameters))) {
+        try {
+          if (!effective) throw new Error("No effective tool binding");
+          queryApprovalAdapter(pi.events, event.toolName, effective.parameters);
+        } catch {
+          return {
+            block: true,
+            reason:
+              "Command/mutation-shaped tool requires exactly one live cooperative approval adapter; unreviewed fallback is blocked",
+          };
+        }
       }
     }
   });

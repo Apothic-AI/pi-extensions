@@ -80,3 +80,11 @@ test("standalone Escape flushes, while complete native keys and safe Kitty print
     vi.useRealTimers();
   }
 });
+
+test("CSI-u pasted newline/tab/CR decode before sanitization; malicious controls stay inert", () => {
+  const dispatch = vi.fn();
+  const safe = new SafeInput(dispatch);
+  for (const unit of `${start}one\x1b[106;5utwo\x1b[73;5uthree\x1b[109;5ufour\x1b[99;5u\x1b[31m\x1b]52;c;secret\x07\u202e${end}`)
+    safe.handleInput(unit);
+  expect(dispatch).toHaveBeenCalledExactlyOnceWith({ kind: "paste", data: `${start}one\ntwo    three\nfour${end}` });
+});

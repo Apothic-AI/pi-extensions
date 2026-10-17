@@ -9,7 +9,13 @@ import { HumanUI } from "../src/ui.js";
 export default function fixture(pi: ExtensionAPI): void {
   const path = process.env.SESSIONS_UI_PROBE;
   if (!path) throw new Error("Missing UI acceptance probe destination");
-  const record = (data: object) => appendFileSync(path, `${JSON.stringify(data)}\n`);
+  let previous = "";
+  const record = (data: object) => {
+    const serialized = JSON.stringify(data);
+    if (serialized === previous) return;
+    previous = serialized;
+    appendFileSync(path, `${serialized}\n`);
+  };
   let active: TuiMainScreen | TuiAltScreen | undefined;
   let stage = "idle";
   const timer = setInterval(() => {

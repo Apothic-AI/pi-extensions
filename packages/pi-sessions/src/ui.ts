@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import type { ExtensionContext, KeybindingsManager, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import {
@@ -22,9 +23,36 @@ import { label, plain, ROW_LIMIT, redact } from "./text.js";
 
 type Surface = { tui: TUI; theme: Theme; keys: KeybindingsManager };
 export type SessionRow = Pick<SessionInfo, "id" | "path" | "cwd" | "name" | "messageCount"> & { modified: string };
-export function rowsFrom(sessions: readonly SessionInfo[]): SessionRow[] {
+/** Discovery metadata is untrusted even when returned by the native SDK. */
+export function isSessionInfo(value: unknown): value is SessionInfo {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const info = value as Record<string, unknown>;
+  return (
+    typeof info.id === "string" &&
+    info.id.length > 0 &&
+    info.id.length <= 4096 &&
+    typeof info.path === "string" &&
+    info.path.length <= 8192 &&
+    isAbsolute(info.path) &&
+    typeof info.cwd === "string" &&
+    info.cwd.length <= 8192 &&
+    (info.cwd === "" || isAbsolute(info.cwd)) &&
+    (info.name === undefined || typeof info.name === "string") &&
+    (info.parentSessionPath === undefined || typeof info.parentSessionPath === "string") &&
+    typeof info.firstMessage === "string" &&
+    typeof info.allMessagesText === "string" &&
+    typeof info.messageCount === "number" &&
+    Number.isSafeInteger(info.messageCount) &&
+    info.messageCount >= 0 &&
+    info.created instanceof Date &&
+    Number.isFinite(info.created.getTime()) &&
+    info.modified instanceof Date &&
+    Number.isFinite(info.modified.getTime())
+  );
+}
+export function rowsFrom(sessions: readonly unknown[]): SessionRow[] {
   return sessions
-    .filter((s) => s.id.length <= 4096 && s.path.length <= 8192 && s.cwd.length <= 8192)
+    .filter(isSessionInfo)
     .slice(0, ROW_LIMIT)
     .map((s) => ({
       id: s.id,
@@ -76,7 +104,13 @@ function help(text: string, width: number): string[] {
 }
 
 function resizeNotice(width: number, rows: number): string[] {
-  return safeLines(["Resize to review; Enter disabled", "Esc cancel"].slice(0, Math.max(1, rows)), width);
+  return safeLines(
+    ["Resize to review; approval disabled", `${getKeybindings().getKeys("tui.select.cancel").join("/")} cancel`].slice(
+      0,
+      Math.max(1, rows),
+    ),
+    width,
+  );
 }
 
 class SafeComponent implements Component, Focusable {
@@ -121,7 +155,11 @@ async function surface(owner: Owner<ExtensionContext>): Promise<Surface> {
 
 async function modal<T>(
   owner: Owner<ExtensionContext>,
-  build: (s: Surface, done: (result: T | undefined) => void) => Component & Partial<Focusable>,
+  build: (
+    s: Surface,
+    done: (result: T | undefined) => void,
+    isFocused: () => boolean,
+  ) => Component & Partial<Focusable>,
 ): Promise<T | undefined> {
   const s = await surface(owner);
   owner.check();
@@ -138,7 +176,7 @@ async function modal<T>(
     };
     abort = () => close(undefined);
     owner.signal.addEventListener("abort", abort, { once: true });
-    const component = new SafeComponent(build(s, close));
+    const component = new SafeComponent(build(s, close, () => !closed && handle?.isFocused() === true));
     // Full-terminal bounds make terminal.rows the actual overlay row budget.
     // Each component reserves its own controls before laying out content.
     if (!closed) handle = s.tui.showOverlay(component, { width: "100%", maxHeight: "100%", anchor: "top-left" });
@@ -162,7 +200,11 @@ class Choice implements Component, Focusable {
   ) {}
   invalidate(): void {}
   render(width: number): string[] {
-    const controls = help("Enter accept · Esc cancel\n↑↓ choose · PgUp/PgDn scroll", width);
+    const keys = getKeybindings();
+    const controls = help(
+      `${keys.getKeys("tui.select.confirm").join("/")} accept · ${keys.getKeys("tui.select.cancel").join("/")} cancel\n${keys.getKeys("tui.select.up").join("/")}/${keys.getKeys("tui.select.down").join("/")} choose · ${keys.getKeys("tui.select.pageUp").join("/")}/${keys.getKeys("tui.select.pageDown").join("/")} scroll`,
+      width,
+    );
     const rows = Math.max(1, this.terminalRows());
     const available = rows - this.options.length - controls.length;
     this.pageSize = Math.max(1, available);
@@ -181,15 +223,16 @@ class Choice implements Component, Focusable {
     );
   }
   handleInput(data: string): void {
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) this.done(undefined);
-    else if (matchesKey(data, Key.enter)) {
+    const keys = getKeybindings();
+    if (keys.matches(data, "tui.select.cancel")) this.done(undefined);
+    else if (keys.matches(data, "tui.select.confirm")) {
       this.render(this.terminalColumns()); // resize may precede the scheduled host render
       if (this.ready) this.done(this.options[this.selected]);
-    } else if (matchesKey(data, Key.up))
+    } else if (keys.matches(data, "tui.select.up"))
       this.selected = (this.selected + this.options.length - 1) % this.options.length;
-    else if (matchesKey(data, Key.down)) this.selected = (this.selected + 1) % this.options.length;
-    else if (matchesKey(data, Key.pageUp)) this.scroll = Math.max(0, this.scroll - this.pageSize);
-    else if (matchesKey(data, Key.pageDown))
+    else if (keys.matches(data, "tui.select.down")) this.selected = (this.selected + 1) % this.options.length;
+    else if (keys.matches(data, "tui.select.pageUp")) this.scroll = Math.max(0, this.scroll - this.pageSize);
+    else if (keys.matches(data, "tui.select.pageDown"))
       this.scroll = Math.min(Math.max(0, this.lastLineCount - this.pageSize), this.scroll + this.pageSize);
     this.renderAgain();
   }
@@ -200,9 +243,10 @@ export class Picker implements Component, Focusable {
   private readonly safeInput = new SafeInput(({ kind, data }) => this.handleSafeInput(data, kind === "paste"));
   private ready = true;
   private lastWidth = 80;
+  private pageSize = 8;
   private rows: SessionRow[] = [];
   private selectedKey: string | undefined;
-  private progress = "Loading sessions… Escape cancels";
+  private progress = "Loading sessions…";
   private _focused = false;
   get focused(): boolean {
     return this._focused;
@@ -238,9 +282,14 @@ export class Picker implements Component, Focusable {
       0,
       filtered.findIndex((r) => rowKey(r) === this.selectedKey),
     );
-    const controls = help("Enter preview · Esc cancel\nType filter · ↑↓ select", width);
+    const keys = getKeybindings();
+    const controls = help(
+      `${keys.getKeys("tui.select.confirm").join("/")} preview · ${keys.getKeys("tui.select.cancel").join("/")} cancel\nType filter · ${keys.getKeys("tui.select.up").join("/")}/${keys.getKeys("tui.select.down").join("/")} select · ${keys.getKeys("tui.select.pageUp").join("/")}/${keys.getKeys("tui.select.pageDown").join("/")} page`,
+      width,
+    );
     const rows = Math.max(1, this.terminalRows());
     const pageSize = rows - 3 - controls.length;
+    this.pageSize = Math.max(1, pageSize);
     this.ready = width >= 12 && pageSize >= 1;
     if (!this.ready) return resizeNotice(width, rows);
     const start = Math.max(0, Math.min(index - Math.floor(pageSize / 2), filtered.length - pageSize));
@@ -266,7 +315,8 @@ export class Picker implements Component, Focusable {
     this.safeInput.handleInput(data);
   }
   private handleSafeInput(data: string, paste: boolean): void {
-    if (!paste && (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")))) {
+    const keys = getKeybindings();
+    if (!paste && keys.matches(data, "tui.select.cancel")) {
       this.done(undefined);
       return;
     }
@@ -275,13 +325,18 @@ export class Picker implements Component, Focusable {
       0,
       filtered.findIndex((r) => rowKey(r) === this.selectedKey),
     );
-    if (!paste && matchesKey(data, Key.enter)) {
+    if (!paste && keys.matches(data, "tui.select.confirm")) {
       this.render(this.terminalColumns());
       if (this.ready) this.done(filtered.find((r) => rowKey(r) === this.selectedKey));
       return;
     }
-    if (!paste && (matchesKey(data, Key.up) || matchesKey(data, Key.down))) {
-      const next = filtered[Math.max(0, Math.min(filtered.length - 1, index + (matchesKey(data, Key.up) ? -1 : 1)))];
+    const up = !paste && keys.matches(data, "tui.select.up");
+    const down = !paste && keys.matches(data, "tui.select.down");
+    const pageUp = !paste && keys.matches(data, "tui.select.pageUp");
+    const pageDown = !paste && keys.matches(data, "tui.select.pageDown");
+    if (up || down || pageUp || pageDown) {
+      const offset = up ? -1 : down ? 1 : pageUp ? -this.pageSize : this.pageSize;
+      const next = filtered[Math.max(0, Math.min(filtered.length - 1, index + offset))];
       this.selectedKey = next && rowKey(next);
     } else {
       this.input.handleInput(data);
@@ -298,7 +353,6 @@ export class Picker implements Component, Focusable {
 class ReviewEditor implements Component, Focusable {
   private readonly editor: Editor;
   private ready = true;
-  private collapsed = false;
   private beforeInput: string | undefined;
   private inputChanges: string[] | undefined;
   private readonly safeInput = new SafeInput(({ kind, data }) => this.handleSafeInput(data, kind === "paste"));
@@ -328,13 +382,7 @@ class ReviewEditor implements Component, Focusable {
       const changes = this.inputChanges;
       const text = changes && changes.length > 1 ? changes[changes.length - 2] : this.beforeInput;
       if (text === undefined) return;
-      if (this.collapsed) {
-        // Large native pastes are atomic markers. First Enter expands into a
-        // reviewable document, never approves text hidden behind that marker.
-        this.editor.setText(text);
-        this.collapsed = false;
-        surface.tui.requestRender();
-      } else if (this.ready) this.done(text);
+      if (this.ready) this.done(text);
     };
   }
   invalidate(): void {
@@ -343,7 +391,7 @@ class ReviewEditor implements Component, Focusable {
   render(width: number): string[] {
     const keys = getKeybindings();
     const controls = help(
-      `${keys.getKeys("tui.input.submit").join("/")} ${this.collapsed ? "expand paste" : "accept"} · ${keys.getKeys("tui.select.cancel").join("/")} cancel\n${keys.getKeys("tui.input.newLine").join("/")} newline · ↑↓/PgUp/PgDn move`,
+      `${keys.getKeys("tui.input.submit").join("/")} accept · ${keys.getKeys("tui.select.cancel").join("/")} cancel\n${keys.getKeys("tui.input.newLine").join("/")} newline · ↑↓/PgUp/PgDn move`,
       width,
     );
     const rows = Math.max(1, this.surface.tui.terminal.rows);
@@ -364,22 +412,27 @@ class ReviewEditor implements Component, Focusable {
       this.done(undefined);
       return;
     }
+    if (paste) {
+      // SafeInput has decoded/normalized/sanitized this complete inert paste.
+      // Insert expanded text atomically through the public API: native paste
+      // markers would require submitValue(), which destroys all Undo history.
+      this.editor.insertTextAtCursor(data.slice("\x1b[200~".length, -"\x1b[201~".length));
+      this.surface.tui.requestRender();
+      return;
+    }
     // Keep the review inside its owned overlay; never launch an external editor.
-    if (!paste && this.surface.keys.matches(data, "app.editor.external")) return;
+    if (this.surface.keys.matches(data, "app.editor.external")) return;
     this.render(this.surface.tui.terminal.columns);
-    // Let the native editor resolve newline-vs-submit precedence, including
-    // backslash+Enter and remapped keys, but never clear hidden/unreviewed text.
+    // Native newline-vs-submit precedence includes backslash+Enter/remaps.
     this.editor.disableSubmit = !this.ready;
     this.beforeInput = this.editor.getExpandedText();
     this.inputChanges = [];
-    this.collapsed = this.editor.getText() !== this.beforeInput;
     try {
       this.editor.handleInput(data);
     } finally {
       this.beforeInput = undefined;
       this.inputChanges = undefined;
     }
-    this.collapsed = this.editor.getText() !== this.editor.getExpandedText();
     this.surface.tui.requestRender();
   }
 }
@@ -426,7 +479,7 @@ export class HumanUI {
     if (ctx.mode === "rpc") return this.owner.wait(run(this.owner.signal));
     let result: T | undefined;
     let failure: unknown;
-    await modal<boolean>(this.owner, (_s, done) => {
+    await modal<boolean>(this.owner, (_s, done, isFocused) => {
       const controller = new AbortController();
       const abort = () => controller.abort();
       this.owner.signal.addEventListener("abort", abort, { once: true });
@@ -434,10 +487,20 @@ export class HumanUI {
         .wait(run(controller.signal))
         .then(
           (value) => {
+            if (!isFocused()) {
+              // A foreign interaction took focus while generation was pending.
+              // Retire rather than opening the next review over its draft/UI.
+              this.owner.retire();
+              return;
+            }
             result = value;
             done(true);
           },
           (error: unknown) => {
+            if (!isFocused()) {
+              this.owner.retire(); // A manual fallback must not steal foreign focus either.
+              return;
+            }
             failure = error;
             done(false);
           },

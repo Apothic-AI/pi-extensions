@@ -1,7 +1,9 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
   createEventBus,
@@ -19,11 +21,14 @@ import {
   APPROVAL_QUERY_CHANNEL,
   type ApprovalOperation,
   approvalToolCallId,
+  captureApprovalService,
+  createApprovalBashOperations,
   createApprovalToolDefinitions,
   escapeDisplay,
   hashBytes,
   queryApprovalAdapter,
   queryApprovalService,
+  schemaRequiresApprovalAdapter,
   snapshot,
   validateAdapterQuery,
   validateLifecycle,
@@ -467,4 +472,148 @@ it("adapter discovery validates exact field/version/name/schema identity and one
   expect(() => queryApprovalAdapter(events, adapter.toolName, parameters)).toThrow();
   await Promise.resolve();
   off();
+});
+
+it("rejects 50k disjoint lines before synchronous diff work or approval", async () => {
+  // A Vitest testTimeout cannot interrupt synchronous JS. Own a separate
+  // process with a thread pool so SIGKILL also reclaims its blocked worker.
+  if (process.env.PI_APPROVAL_DIFF_CHILD !== "1") {
+    const probe = await mkdtemp(join(tmpdir(), "approval-diff-deadline-"));
+    cleanup.push(() => rm(probe, { recursive: true, force: true }));
+    const cwd = fileURLToPath(new URL("../", import.meta.url));
+    const cli = fileURLToPath(new URL("./vitest.mjs", import.meta.resolve("vitest/package.json")));
+    const child = spawn(
+      process.execPath,
+      [cli, "run", "test/core.test.ts", "-t", "rejects 50k disjoint", "--pool=threads", "--maxWorkers=1"],
+      {
+        cwd,
+        env: { ...process.env, TMPDIR: probe, TMP: probe, TEMP: probe, PI_APPROVAL_DIFF_CHILD: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let output = "";
+    const collect = (chunk: Buffer) => {
+      output = (output + chunk.toString()).slice(-4096);
+    };
+    child.stdout.on("data", collect);
+    child.stderr.on("data", collect);
+    const closed = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 5000);
+    try {
+      expect(await closed, output).toEqual({ code: 0, signal: null });
+    } finally {
+      clearTimeout(deadline);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+    }
+    return;
+  }
+  const request = vi.fn(async () => {});
+  const host = await fixture(request);
+  const path = join(host.cwd, "many-lines");
+  const before = "a\n".repeat(50_000);
+  await writeFile(path, before);
+  await expect(
+    host.write.execute("disjoint", { path, content: "b\n".repeat(50_000) }, undefined, undefined, host.ctx),
+  ).rejects.toThrow("review computational limit");
+  expect(request).not.toHaveBeenCalled();
+  expect(await readFile(path, "utf8")).toBe(before);
+}, 8000);
+
+it.each(["options", "env-only", "captured-abort"])(
+  "captures bash execution options and env before awaiting review (%s)",
+  async (mode) => {
+    const gate = deferred();
+    const host = await fixture(async () => {});
+    const controller = new AbortController();
+    const replacement = new AbortController();
+    const env = { ...process.env, APPROVAL_CAPTURE: "reviewed" };
+    let output = "";
+    const execution = {
+      signal: controller.signal,
+      timeout: 2,
+      env,
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+    };
+    const ops = createApprovalBashOperations({
+      source: "test",
+      toolCallId: "capture",
+      inputHash: hashBytes("input"),
+      request: async () => gate.promise,
+      isCurrent: () => true,
+    });
+    const running = ops.exec("printf '%s' \"$APPROVAL_CAPTURE\"", host.cwd, execution);
+    if (mode !== "env-only") execution.signal = replacement.signal;
+    if (mode !== "env-only") execution.timeout = 0.00001;
+    execution.env = { ...env, APPROVAL_CAPTURE: "replaced" };
+    env.APPROVAL_CAPTURE = "mutated";
+    if (mode !== "env-only")
+      execution.onData = () => {
+        throw new Error("mutated callback");
+      };
+    if (mode === "captured-abort") controller.abort();
+    else replacement.abort();
+    const result = running.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    gate.resolve();
+    if (mode === "captured-abort") expect(await result).toBeInstanceOf(Error);
+    else {
+      expect(await result).toBeUndefined();
+      expect(output).toBe("reviewed");
+    }
+  },
+);
+
+it("keeps useful large files below the line-work budget and reviews complete changes", async () => {
+  const request = vi.fn(async () => {});
+  const host = await fixture(request);
+  const path = join(host.cwd, "large-normal");
+  const before = Array.from({ length: 200 }, (_, i) => `${i} ${"x".repeat(1000)}`).join("\n");
+  const after = before.replace("100 ", "changed ");
+  await writeFile(path, before);
+  await host.write.execute("normal", { path, content: after }, undefined, undefined, host.ctx);
+  expect(request).toHaveBeenCalledOnce();
+  expect(await readFile(path, "utf8")).toBe(after);
+});
+
+it("exposes a sticky same-peer guard without making a second human request", async () => {
+  const events = createEventBus();
+  const request = vi.fn(async () => {});
+  const peer = { version: 1, id: "service", request };
+  let current = peer;
+  events.on(APPROVAL_QUERY_CHANNEL, (value) => validateQuery(value).respond(current));
+  const captured = captureApprovalService(events);
+  if (!captured) throw new Error("Missing service");
+  await captured.service.request(command, { isCurrent: () => true });
+  captured.assertCurrent();
+  expect(request).toHaveBeenCalledOnce();
+  current = { ...peer };
+  expect(() => captured.assertCurrent()).toThrow("replaced");
+  current = peer;
+  expect(() => captured.assertCurrent()).toThrow("retired");
+  expect(request).toHaveBeenCalledOnce();
+});
+
+it("classifies known optional root/enveloped schema properties without evaluating accessors", () => {
+  for (const schema of [
+    Type.Object({ command: Type.Optional(Type.String()) }),
+    Type.Object({ path: Type.String(), content: Type.Optional(Type.String()) }),
+    Type.Object({ input: Type.Object({ command: Type.Optional(Type.String()) }) }),
+  ])
+    expect(schemaRequiresApprovalAdapter(schema)).toBe(true);
+  expect(schemaRequiresApprovalAdapter(Type.Object({ title: Type.String() }))).toBe(false);
+  const getter = vi.fn();
+  const schema = Type.Object({ title: Type.String() });
+  Object.defineProperty(schema, "properties", { get: getter });
+  expect(schemaRequiresApprovalAdapter(schema)).toBe(false);
+  expect(getter).not.toHaveBeenCalled();
 });

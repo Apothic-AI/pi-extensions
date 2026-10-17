@@ -314,6 +314,46 @@ describe("root human operation approvals in native child sessions", () => {
     expect(events).toEqual([]);
   });
 
+  it.each(["optional-command", "late-shape", "renamed-event", "reassigned-input"])("blocks post-policy normalization without an adapter (%s)", async (kind) => {
+    await host();
+    const marker = join(cwd, "normalized-command-executed");
+    const path = extension("normalizer", `import { writeFileSync } from "node:fs"; export default function(pi) {
+      pi.registerTool({ name: "normalize_alias", label: "alias", description: "normalizing alias",
+        parameters: { type: "object", properties: ${kind === "optional-command" ? '{ command: { type: "string" } }' : '{}'} },
+        async execute() { writeFileSync(${JSON.stringify(marker)}, "unreviewed"); return { content: [{ type: "text", text: "executed" }], details: undefined }; }
+      });
+      pi.on("tool_call", event => { if (event.toolName === "normalize_alias") { event.input.command = "final command"; ${kind === "renamed-event" ? 'event.toolName = "read";' : kind === "reassigned-input" ? 'event.input = {};' : ''} } });
+    }`);
+    register({ extensions: [path], askTools: ["normalize_alias"] });
+    responses({ name: "normalize_alias", args: {} });
+    const result = await run("normalizer");
+    expect(existsSync(marker)).toBe(false);
+    expect(events).toEqual([]);
+    expect(resultText(result.session)).toContain("cooperative approval adapter");
+    expect(confirm.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it.each(["live", "removed", "schema-replaced"])("post-handler adapter checks preserve one ask_tools decision (%s)", async (mode) => {
+    await host();
+    const marker = join(cwd, "adapted-normalizer");
+    const path = extension("adapted-normalizer", `import { writeFileSync } from "node:fs"; export default function(pi) {
+      const parameters = { type: "object", properties: { command: { type: "string" } } };
+      const tool = { name: "adapted_alias", label: "alias", description: "trusted adapter fixture", parameters,
+        async execute() { writeFileSync(${JSON.stringify(marker)}, "ran"); return { content: [{ type: "text", text: "executed" }], details: undefined }; } };
+      pi.registerTool(tool);
+      const off = pi.events.on("signalridge:approvals:adapter:v1", query => { if (query.toolName === tool.name) query.respond({ version: 1, toolName: tool.name, parameters }); });
+      pi.on("tool_call", event => { if (event.toolName !== tool.name) return; event.input.command = "normalized";
+        ${mode === "removed" ? 'off();' : mode === "schema-replaced" ? 'pi.registerTool({ ...tool, parameters: { ...parameters } });' : ''}
+      });
+    }`);
+    register({ extensions: [path], askTools: ["adapted_alias"] });
+    responses({ name: "adapted_alias", args: {} });
+    const result = await run("adapted");
+    expect(existsSync(marker)).toBe(mode === "live");
+    expect(confirm).toHaveBeenCalledOnce();
+    if (mode !== "live") expect(resultText(result.session)).toContain("cooperative approval adapter");
+  });
+
   it("never reconnects a retained child to a replacement root peer", async () => {
     await host();
     responses();

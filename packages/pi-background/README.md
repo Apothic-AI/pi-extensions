@@ -302,6 +302,10 @@ handles only `bash` must explicitly cover `bash_background` and `monitor` too.
 Plan-mode users must not opt these mutating tools into a read-only loadout.
 There is no automatic change to any other extension's tool selection or settings.
 
+### Optional operation approvals
+
+`@signalridge/pi-approval-core` is a runtime dependency, but no approval extension is enabled automatically. When a human approval service is present at invocation entry, `bash_background` and command-starting `monitor` capture exactly that service before any await and review frozen normalized launch inputs. Denial, cancellation or stale ownership prevents command execution. The invocation-local launch guard checks the live branch owner and **the same captured service** after filesystem startup validation and immediately before sending the supervisor its run command. Service disappearance, replacement, malformed or ambiguous discovery retires that capture and fails closed: no switching peers, second approval prompt or ungated fallback. A supervisor already awaiting dispatch is cleaned up without executing the command. Absence at invocation entry alone preserves ordinary ungated behavior. Existing-job monitor attachment and inspection/control tools do not request launch approval. This cooperative same-process integration is not an OS sandbox.
+
 This package does not resume or mutate a paused `pi-goal`. A background event can
 start a normal agent turn; that is distinct from granting Goal ownership or
 resuming an explicit Goal wait. No undocumented cross-extension protocol is used.
@@ -323,8 +327,8 @@ This is an independent implementation, not a bundled fork. References:
 - [Pi extension API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md): public tools, lifecycle and custom messages.
 
 PTY, SSH, shell-provider protocols and cross-application persistence are not copied
-into this package. There are no runtime dependencies beyond Pi's host-provided
-modules and Node builtins.
+into this package. The runtime library dependency is `@signalridge/pi-approval-core`;
+Pi modules remain host-provided, and process supervision uses Node builtins.
 
 ## Development
 
@@ -334,18 +338,21 @@ bun run --cwd packages/pi-background check
 python3 packages/pi-background/test/shortcut-cli.py
 ```
 
-Task-viewer acceptance includes 108 passing package tests and the complete
-repository gate. Actual Pi 1.0.4 CLI runs through isolated fullscreen/regular PTYs
-passed 161 recorded checks, covering model tool exposure, asynchronous real shell
+Historical task-viewer acceptance reported 108 passing package tests and the
+complete repository gate. Historical Pi 1.0.4 CLI runs through isolated
+fullscreen/regular PTYs reported 161 checks, covering model tool exposure, asynchronous real shell
 execution alongside independent work, live logs, paging, CJK resize, distinct-key
 stop/clear, editor draft restoration and process-group cleanup. Fixtures use an
 offline faux provider and harmless local processes, not live provider credentials
-or physical-terminal qualification. Shortcut acceptance adds 72 recorded checks
+or physical-terminal qualification. The committed `test/shortcut-cli.py` harness separately recorded 72 shortcut checks
 across 100×30 and 40×12 fullscreen/regular CLI PTYs: empty entry, repeated keys,
 CJK draft/cursor restoration, native dialog/foreign overlay focus, stable task
 selection, log/stop navigation without model turns, and committed session
 retirement. Its instrumentation observes public component renders and editor text;
 Pi still owns actual terminal input, global shortcut routing, focus, and rendering.
+Historical counts are reports from those runs, not evidence that uncommitted
+CLI instrumentation can be rerun from this package. Use committed tests and the
+explicitly named shortcut harness for reproducible checks.
 
 ## License
 

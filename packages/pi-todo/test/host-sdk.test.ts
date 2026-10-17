@@ -203,6 +203,59 @@ for (const mode of ["print", "rpc"] as const)
   });
 
 describe("real host ownership and context", () => {
+  it("quarantines orphaned native ancestry after prompt-driven EIO and automatic tool-result persistence on reopen", async () => {
+    const f = await fixture({ fileBacked: true });
+    f.faux.setResponses([fauxAssistantMessage("Started.")]);
+    await f.session.prompt("Ordinary persisted conversation.");
+    const first = await f.call({ action: "add", baseRevision: 0, title: "Keep durable state" });
+    const ancestor = f.session.sessionManager.getLeafId();
+    const file = f.session.sessionManager.getSessionFile();
+    if (!file || !ancestor) throw new Error("Missing native checkpoint");
+    const nativeAppend = fs.appendFileSync;
+    const fault = vi.spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof fs.appendFileSync>) => {
+      if (args[0] === file && String(args[1]).includes(`"customType":"${STATE_TYPE}"`))
+        throw Object.assign(new Error("native EIO"), { code: "EIO" });
+      nativeAppend(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("todo", { action: "clear", baseRevision: 1 }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("Write failed."),
+      ]);
+      await f.session.prompt("Clear the checklist.");
+      expect(f.session.messages.find((m) => m.role === "toolResult" && m.toolName === "todo")).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: expect.stringContaining("native EIO") }],
+      });
+    } finally {
+      fault.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const diskBeforeReopen = fs.readFileSync(file, "utf8");
+    expect(diskBeforeReopen).not.toContain('"revision":2');
+    expect(diskBeforeReopen).toContain('"role":"toolResult"');
+    expect(await f.host.switchSession(file)).toMatchObject({ cancelled: false });
+    const diskAfterReopen = fs.readFileSync(file, "utf8");
+    expect(diskAfterReopen.startsWith(diskBeforeReopen)).toBe(true); // SDK may append native settings on open.
+    const branch = f.session.sessionManager.getBranch();
+    const missing = branch[0]?.parentId;
+    expect(missing).toBeTypeOf("string");
+    expect(f.session.sessionManager.getEntries().some((entry) => entry.id === missing)).toBe(false);
+    expect(branch.some((entry) => entry.type === "custom" && entry.customType === STATE_TYPE)).toBe(false);
+    // Previously list silently succeeded with revision 0 and no tasks here.
+    await expect(f.call({ action: "list" })).rejects.toThrow(/unavailable/i);
+    await expect(f.call({ action: "add", baseRevision: 0, title: "Must not replace lost ancestry" })).rejects.toThrow(
+      /unavailable/i,
+    );
+    const context = await f.session.extensionRunner.emitContext([]);
+    expect(JSON.stringify(context)).toContain("no authoritative checklist supplied");
+    expect(JSON.stringify(context)).not.toContain('"revision"');
+    expect(fs.readFileSync(file, "utf8")).toBe(diskAfterReopen); // Todo never repairs native persistence.
+    await f.session.navigateTree(ancestor); // Explicit public navigation, not recovery from an unrelated branch.
+    expect((await f.call({ action: "list" })).details).toEqual(first.details);
+    expect((await f.call({ action: "clear", baseRevision: 1 })).details).toMatchObject({ revision: 2, tasks: [] });
+  });
   it("injects full current context once for compact mutations, never for an exact list result, and never persists context", async () => {
     const f = await fixture();
     const changed = await f.call({ action: "add", baseRevision: 0, title: "Current full task" });

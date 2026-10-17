@@ -3,9 +3,12 @@ import { constants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type FileHandle, open, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
   CURRENT_SESSION_VERSION,
+  estimateTokens,
+  migrateSessionEntries,
   type SessionEntry,
   type SessionHeader,
   type SessionManager,
@@ -116,29 +119,39 @@ export async function vetSession(path: string, expectedId: string, signal: Abort
           !Number.isFinite(Date.parse(value.timestamp))
         )
           throw new Error("Malformed session tree");
-        validateEntryPayload(value as Record<string, unknown>, byId);
-        const entry = value as SessionEntry;
-        entries.push(entry);
-        byId.set(entry.id, entry);
+        entries.push(value as SessionEntry);
         ids.add(value.id);
-        const text = messageText(value);
-        if (text) {
-          recent.push(text);
-          if (recent.length > 6) recent.shift();
-        }
       }
     }
-    // Pure public projection uses the parsed copy, never opens/repairs the file.
-    // Catch restoration failures while the source runtime is still usable.
-    buildSessionProjection(entries, undefined, byId);
-    if (!header || !(await stat(header.cwd)).isDirectory()) throw new Error("Session workspace unavailable");
+    if (!header) throw new Error("Missing session header");
+    // Migrations mutate their argument. Keep raw header/bytes for identity and
+    // digest, and normalize only a clone before native payload validation.
+    const normalized = structuredClone([header, ...entries]);
+    migrateSessionEntries(normalized);
+    const migrated = normalized.slice(1) as SessionEntry[];
+    for (const entry of migrated) {
+      validateEntryPayload(entry as unknown as Record<string, unknown>, byId);
+      byId.set(entry.id, entry);
+      const text = messageText(entry);
+      if (text) {
+        recent.push(text);
+        if (recent.length > 6) recent.shift();
+      }
+    }
+    // Public pure replay and estimation exercise the footer's consumed shape,
+    // not just projection. Never open/repair a manager during preflight.
+    const projection = buildSessionProjection(migrated, undefined, byId);
+    const system = getCurrentSystemMessage(projection.messages);
+    if (system) estimateTokens(system);
+    for (const message of projection.messages) if (message.role !== "system") estimateTokens(message);
+    if (!(await stat(header.cwd)).isDirectory()) throw new Error("Session workspace unavailable");
     signal.throwIfAborted();
     return {
       path: resolve(path),
       header,
       digest: createHash("sha256").update(body).digest("hex"),
       preview: bounded(recent.join("\n\n"), PREVIEW_BYTES),
-      entries,
+      entries: migrated,
     };
   } finally {
     await handle.close();

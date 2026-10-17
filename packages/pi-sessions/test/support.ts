@@ -69,6 +69,7 @@ export async function fixture(
     memory?: boolean;
     initialSessionFile?: string;
     extra?: (pi: ExtensionAPI) => void;
+    before?: (pi: ExtensionAPI) => void;
     mode?: ExtensionCommandContext["mode"];
     ui?: Partial<ExtensionUIContext>;
     destinationModel?: Model<Api>;
@@ -133,6 +134,7 @@ export async function fixture(
       settingsManager: settings,
       resourceLoaderOptions: {
         extensionFactories: [
+          ...(options.before ? [{ name: "earlier-extension", factory: options.before }] : []),
           {
             name: "sessions-test",
             factory: (pi) => {

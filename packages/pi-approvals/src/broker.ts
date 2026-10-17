@@ -85,6 +85,15 @@ export class ApprovalBroker {
     this.retired = true;
     for (const item of this.pending.values()) item.finish("retired");
   }
+  /** Discovery must observe retirement even after the last request has resolved. */
+  get isLive(): boolean {
+    try {
+      this.assertLive();
+      return true;
+    } catch {
+      return false;
+    }
+  }
   private assertLive(): ExtensionContext {
     if (this.retired) throw new Error("Approval service retired");
     try {

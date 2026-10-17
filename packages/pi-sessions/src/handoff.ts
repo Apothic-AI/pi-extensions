@@ -283,7 +283,12 @@ async function commit(owner: Owner, goal: string, summary: string): Promise<void
       setup: async (manager) => {
         owner.replacementStarted = true;
         try {
-          manager.appendCustomEntry(HANDOFF_TYPE, record);
+          // Native teardown can follow a later async handler after the source
+          // already retired. Preserve recovery, never resurrect its approval.
+          manager.appendCustomEntry(
+            HANDOFF_TYPE,
+            owner.replacementApproved ? record : { ...record, prefill: undefined },
+          );
         } catch {
           setupFailed = true;
         }

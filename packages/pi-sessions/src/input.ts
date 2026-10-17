@@ -26,9 +26,17 @@ export class SafeInput {
         this.paste += pending;
         const end = this.paste.indexOf(END);
         if (end < 0) return;
-        // Normalize like the native Editor before stripping controls. Input
-        // still applies its own single-line normalization to this safe paste.
-        const text = plain(this.paste.slice(0, end).replace(/\r\n?/gu, "\n").replace(/\t/gu, "    "));
+        // Decode the native Editor's supported CSI-u pasted Ctrl+letters
+        // BEFORE normalization and sanitization. Other encoded controls remain
+        // inert paste data and are stripped, never routed as key actions.
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: native pasted-control protocol
+        const decoded = this.paste.slice(0, end).replace(/\x1b\[(\d+);5u/gu, (match, code: string) => {
+          const cp = Number(code);
+          if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
+          if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
+          return match;
+        });
+        const text = plain(decoded.replace(/\r\n?/gu, "\n").replace(/\t/gu, "    "));
         pending = this.paste.slice(end + END.length);
         this.paste = undefined;
         if (text) this.dispatch({ kind: "paste", data: `${START}${text}${END}` });

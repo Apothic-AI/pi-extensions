@@ -6,6 +6,105 @@ import { nativeTerminal } from "./native-terminal.js";
 
 for (const fullscreen of [true, false])
   describe(`SDK 1.0.4 native ${fullscreen ? "fullscreen" : "regular"} UI`, () => {
+    it("runs Kitty encoded character commands, confirmation and p/n scrolling without accepting modified keys or paste", async () => {
+      const f = await nativeTerminal(fullscreen);
+      let running: Promise<void> | undefined;
+      const kitty = (char: string) => `\x1b[${char.codePointAt(0)}u`;
+      try {
+        running = f.command.run(f.ctx);
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+        f.key(kitty("a"));
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+        f.key("Encoded task");
+        f.key("\x13");
+        await vi.waitFor(() => expect(f.store.read(f.ctx).revision).toBe(1));
+        for (const data of [
+          "\x1b[97;2u",
+          "\x1b[97;3u",
+          "\x1b[97;5u",
+          "\x1b[97;9u",
+          "\x1b[65;2u",
+          "\x1b[200~a\x1b[201~",
+        ])
+          f.key(data);
+        for (const chunk of ["\x1b[20", "0~", "a", "\x1b[20", "1~"]) f.key(chunk);
+        expect(f.lines().join("\n")).toContain("Session Todo");
+        f.key(kitty("e"));
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+        f.key(" edited");
+        f.key("\x13");
+        await vi.waitFor(() => expect(f.store.read(f.ctx).revision).toBe(2));
+        expect(f.store.read(f.ctx).tasks[0].title).toBe("Encoded task edited");
+        f.key(kitty("s"));
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task status"));
+        f.resize(1, 12);
+        const statusTop = f.lines();
+        f.key(kitty("n"));
+        expect(f.lines()).not.toEqual(statusTop);
+        f.key(kitty("p"));
+        expect(f.lines()).toEqual(statusTop);
+        for (const chunk of ["\x1b[200~", "n", "\r", "\x1b[201~"]) f.key(chunk);
+        expect(f.lines()).toEqual(statusTop);
+        expect(f.store.read(f.ctx).revision).toBe(2);
+        f.resize(80, 24);
+        f.key("\x1b[B");
+        f.key("\r");
+        await vi.waitFor(() => expect(f.store.read(f.ctx).tasks[0].status).toBe("in_progress"));
+        f.key("\x1b[47:63;2u"); // Shift+/ reports '?' through the public decoder.
+        expect(f.lines().join("\n")).toContain("Session Todo help");
+        f.resize(1, 12);
+        const top = f.lines();
+        f.key(kitty("n"));
+        expect(f.lines()).not.toEqual(top);
+        f.key(kitty("p"));
+        expect(f.lines()).toEqual(top);
+        for (const data of ["\x1b[110;2u", "\x1b[110;3u", "\x1b[110;5u", "\x1b[110;9u", "\x1b[200~n\x1b[201~"])
+          f.key(data);
+        for (const chunk of ["\x1b[200~", "n", "\x1b[201~"]) f.key(chunk);
+        expect(f.lines()).toEqual(top);
+        f.key(kitty("?"));
+        f.resize(80, 24);
+        f.key(kitty("d"));
+        expect(f.lines().join("\n")).toContain("y: confirm");
+        f.key("\x1b[121;5u"); // Modified y cancels but never confirms.
+        f.key(kitty("y"));
+        expect(f.store.read(f.ctx).revision).toBe(3);
+        f.key(kitty("d"));
+        f.key(kitty("y"));
+        await vi.waitFor(() => expect(f.store.read(f.ctx)).toMatchObject({ revision: 4, tasks: [] }));
+        f.key(kitty("a"));
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+        f.key("Clear target");
+        f.key("\x13");
+        await vi.waitFor(() => expect(f.store.read(f.ctx).revision).toBe(5));
+        f.key(fullscreen ? "\x1b[100:68;2u" : "\x1b[100;2u"); // Preserve Shift+d as D with/without shifted keycode.
+        expect(
+          f
+            .lines()
+            .map((line) => stripTerminalSequences(line).trimEnd())
+            .join("\n"),
+        ).toContain("clear\ny: confirm");
+        f.resize(1, 12);
+        const confirmation = f.lines();
+        f.key(kitty("n"));
+        expect(f.lines()).not.toEqual(confirmation);
+        f.key(kitty("p"));
+        expect(f.lines()).toEqual(confirmation);
+        f.key("\x1b[200~y\x1b[201~");
+        for (const chunk of ["\x1b[200~", "y", "\x1b[201~"]) f.key(chunk);
+        expect(f.store.read(f.ctx).revision).toBe(5);
+        f.key(kitty("y"));
+        await vi.waitFor(() => expect(f.store.read(f.ctx)).toMatchObject({ revision: 6, tasks: [] }));
+        f.key("\x1b");
+        await running;
+        expect(f.session.messages).toEqual([]);
+        expect(f.session.getActiveToolNames()).toEqual([]);
+      } finally {
+        f.command.retire();
+        await running;
+        await f.dispose();
+      }
+    });
     it("preserves actual edit values on three unchanged Enters, not mocked placeholder responses", async () => {
       const f = await nativeTerminal(fullscreen);
       try {

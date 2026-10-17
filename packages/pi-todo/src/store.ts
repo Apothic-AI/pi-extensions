@@ -61,6 +61,14 @@ export class TodoStore {
       const storage = this.persistence.inspect(ctx.sessionManager);
       if (!this.matches(origin, ctx, false)) throw new Error("Native session changed during reconciliation");
       const branch = ctx.sessionManager.getBranch();
+      // getBranch stops at an absent native parent (e.g. a failed append followed
+      // by a persisted tool result). A truncated path is not an empty checklist.
+      if (branch.length && branch[0].parentId !== null) {
+        this.quarantine(
+          "Todo unavailable: unresolved native session ancestry; navigate to a verified ancestor or repair storage, then reconcile.",
+        );
+        return 0;
+      }
       const recovered = recover(branch.filter((entry) => !isState(entry) || this.persistence.includes(storage, entry)));
       this.snapshot = recovered.snapshot;
       this.snapshotRecord = recovered.record;

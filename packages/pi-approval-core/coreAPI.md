@@ -29,6 +29,8 @@ Kinds are finite; there is no model-callable response/approve tool. Service func
 
 `APPROVAL_QUERY_CHANNEL` is `signalridge:approvals:query:v1`. Query payload: frozen `{ version: 1, respond(service: unknown): void }`. Trusted peers must respond **synchronously**, with exactly `{ version: 1, id, request }`. No peer => undefined. Any malformed peer or more than one response => error, including duplicate responses from the same peer. Captures check object/function/id identity before and after requests and through the ownership callback while pending. Extensions own subscription registration and cleanup.
 
+`captureApprovalService(events)` returns `undefined` on absence, otherwise frozen `{ service, assertCurrent(): void }`. `service` has exactly the existing v1 shape. The synchronous guard checks the same original peer object, ID and request function with the same sticky retirement as requests, without requesting another human decision. An adapter with asynchronous startup after approval must carry this invocation-local guard to its irreversible dispatch boundary; missing, replaced, duplicate or malformed peers deny without reconnecting.
+
 `APPROVAL_LIFECYCLE_CHANNEL` is `signalridge:approvals:lifecycle:v1`. Payload:
 
 ```ts
@@ -53,6 +55,10 @@ Waiting has no outcome; respond/resolved require one. Lifecycle events contain b
 `queryApprovalAdapter(events, toolName, effectiveToolInfo.parameters)` requires exactly one **synchronous** valid response with the requested tool name and the **same schema object** as the current effective `ToolInfo.parameters`. None, duplicate, malformed, wrong-name, copied-schema, and asynchronous replies deny. Validators reject extra fields, prototypes, accessors, and unsupported versions. Tool names are strict ASCII tool identifiers, at most 256 UTF-8 bytes.
 
 A cooperating extension registers its own listener **after** registering its command tools. It responds only for schemas it owns while its context and effective binding remain live. Advertising this capability attests that the tool gates its final native command/CWD through the human service; it is not an authorization grant. The library registers no listeners. Source labels or names alone never establish capability. This is a trusted-extension integration boundary, not an OS sandbox. Older adapters without this protocol are blocked by the approvals extension for command-shaped calls.
+
+`requiresApprovalAdapter(input)` recognizes an own `command`, or `path` plus `content`/`edits`/known old/new-text properties, at the root or one `input` envelope. `schemaRequiresApprovalAdapter(parameters)` also recognizes those known own properties in the schema's root `properties` or one `input.properties`, even when optional. Neither evaluates arbitrary semantics or expands schema references/compositions. This conservative pre-invocation classification prevents known optional normalizer inputs bypassing a root policy without a public post-handler boundary. Managed hosts should additionally recheck actual mutable native arguments after downstream handlers using the originally captured execution name and effective schema.
+
+File factory review generation requires at most 2,048 combined `beforeText.split("\n").length + afterText.split("\n").length` tokens before synchronous diffing; missing before text is empty. Files/inputs remain 256 KiB and completed reviews 64 KiB. No partial review is approved.
 
 The service/request/factory/lifecycle API remains v1, with no added required fields. Root native-backend certification is a separate human CLI policy, not a model-callable permission and not required by factories constructed by a host that knows their backend.
 

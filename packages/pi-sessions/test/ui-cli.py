@@ -20,8 +20,9 @@ import time
 ROOT = Path(__file__).resolve().parents[3]
 CLI = ROOT / "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
 FIXTURE = Path(__file__).with_name("ui-cli-fixture.ts")
-OUT = Path(sys.argv[1])
-OUT.mkdir(parents=True, exist_ok=True)
+OUT = Path(sys.argv[1]) if __name__ == "__main__" else Path(tempfile.gettempdir())
+if __name__ == "__main__":
+    OUT.mkdir(parents=True, exist_ok=True)
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 checks = 0
 
@@ -34,24 +35,36 @@ def check(value, message):
 
 class Host:
     def __init__(self, mode):
-        self.temp = tempfile.TemporaryDirectory(prefix="sessions-ui-cli-")
-        self.probe = OUT / f"{mode}.jsonl"
-        self.probe.write_text("")
+        self.temp = None
+        self.pid = self.fd = None
+        self.closed = False
+        self.ready = False
         self.raw = bytearray()
         self.mode = mode
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.chdir(self.temp.name)
-            env = {**os.environ, "PI_CODING_AGENT_DIR": self.temp.name + "/agent",
-                   "PI_CODING_AGENT_SESSION_DIR": self.temp.name + "/sessions",
-                   "SESSIONS_UI_PROBE": str(self.probe), "TERM": "xterm-256color",
-                   "PI_OFFLINE": "1", "PI_TELEMETRY": "0"}
-            os.execvpe("node", ["node", str(CLI), "--offline", "--no-session", "-ne", "-ns", "-np",
-                              "--no-themes", "-nc", "--no-mcp", "-e", str(FIXTURE),
-                              "--model", "sessions-ui-faux/acceptance", "--tui-mode", mode], env)
-        self.resize(40, 12)
-        self.wait(lambda: any(e["event"] == "ready" for e in self.events()))
-        self.pump(0.2)
+        try:
+            self.temp = tempfile.TemporaryDirectory(prefix="sessions-ui-cli-")
+            self.probe = OUT / f"{mode}.jsonl"
+            self.probe.write_text("")
+            self.pid, self.fd = pty.fork()
+            if self.pid == 0:
+                try:
+                    os.chdir(self.temp.name)
+                    env = {**os.environ, "PI_CODING_AGENT_DIR": self.temp.name + "/agent",
+                           "PI_CODING_AGENT_SESSION_DIR": self.temp.name + "/sessions",
+                           "SESSIONS_UI_PROBE": str(self.probe), "TERM": "xterm-256color",
+                           "PI_OFFLINE": "1", "PI_TELEMETRY": "0"}
+                    os.execvpe("node", ["node", str(CLI), "--offline", "--no-session", "-ne", "-ns", "-np",
+                                      "--no-themes", "-nc", "--no-mcp", "-e", str(FIXTURE),
+                                      "--model", "sessions-ui-faux/acceptance", "--tui-mode", mode], env)
+                finally:
+                    os._exit(127)  # Never run parent cleanup in the forked child.
+            self.resize(40, 12)
+            self.wait(lambda: any(e["event"] == "ready" for e in self.events()))
+            self.ready = True
+            self.pump(0.2)
+        except BaseException:
+            self.close()
+            raise
 
     def events(self):
         return [json.loads(line) for line in self.probe.read_text().splitlines() if line.endswith("}")]
@@ -68,6 +81,7 @@ class Host:
                 if not data:
                     break
                 self.raw.extend(data)
+                del self.raw[:-65536]  # Bounded diagnostic tail, not an unbounded transcript.
                 if b"\x1b[?u" in data:
                     os.write(self.fd, b"\x1b[?1u")
                 if b"\x1b[6n" in data:
@@ -109,26 +123,45 @@ class Host:
         return frame, "\n".join(ANSI.sub("", line) for line in frame["lines"])
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         try:
-            for key in [b"\x1b", b"\x03", b"\x03", b"\x04"]:
-                self.key(key)
-        except OSError:
-            pass
-        for attempt in range(30):
-            self.pump(0.1)
-            if os.waitpid(self.pid, os.WNOHANG)[0]:
-                break
-            if attempt == 15:
-                os.kill(self.pid, signal.SIGTERM)
-        else:
-            os.kill(self.pid, signal.SIGKILL)
-            os.waitpid(self.pid, 0)
-        (OUT / f"{self.mode}.ansi").write_bytes(self.raw)
-        os.close(self.fd)
-        self.temp.cleanup()
+            if self.pid is not None:
+                try:
+                    if self.ready:
+                        for key in [b"\x1b", b"\x03", b"\x03", b"\x04"]:
+                            self.key(key)
+                    else:
+                        os.kill(self.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                for attempt in range(20):
+                    try:
+                        if os.waitpid(self.pid, os.WNOHANG)[0]:
+                            break
+                        if attempt == 10:
+                            os.kill(self.pid, signal.SIGTERM)
+                    except (ProcessLookupError, ChildProcessError):
+                        break
+                    self.pump(0.1)
+                else:
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                        os.waitpid(self.pid, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
+        finally:
+            try:
+                if self.fd is not None:
+                    os.close(self.fd)
+            finally:
+                if self.temp is not None:
+                    self.temp.cleanup()
+            (OUT / f"{self.mode}.ansi").write_bytes(self.raw)
 
 
-for mode in ["regular", "fullscreen"]:
+for mode in (["regular", "fullscreen"] if __name__ == "__main__" else []):
     host = Host(mode)
     try:
         host.command("editor")
@@ -205,4 +238,5 @@ for mode in ["regular", "fullscreen"]:
         check(host.results("picker-cursor")[-1]["value"]["id"] == "cursor-0", "picker selects correct safe filter")
     finally:
         host.close()
-print(f"PASS: {checks} real CLI/PTY assertions; artifacts: {OUT}")
+if __name__ == "__main__":
+    print(f"PASS: {checks} real CLI/PTY assertions; artifacts: {OUT}")

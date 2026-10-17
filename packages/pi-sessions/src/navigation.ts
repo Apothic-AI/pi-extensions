@@ -2,7 +2,7 @@ import { type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agen
 import type { Owner } from "./ownership.js";
 import { vetSession } from "./storage.js";
 import { label, PREVIEW_BYTES } from "./text.js";
-import { HumanUI, rowKey, rowsFrom, type SessionRow } from "./ui.js";
+import { HumanUI, isSessionInfo, rowKey, rowsFrom, type SessionRow } from "./ui.js";
 
 type SessionListProgress = NonNullable<Parameters<typeof SessionManager.list>[2]>;
 
@@ -18,7 +18,8 @@ export async function navigate(owner: Owner, argument: string): Promise<void> {
   const chosen = await ui.pick(async (publish, signal) => {
     const progress: SessionListProgress = (loaded, total, partial) => {
       if (partial && owner.current() && !signal.aborted) {
-        publish(rowsFrom(all ? partial : partial.filter((s) => s.cwd === ctx.cwd)), loaded, total, false);
+        const valid = partial.filter(isSessionInfo);
+        publish(rowsFrom(all ? valid : valid.filter((s) => s.cwd === ctx.cwd)), loaded, total, false);
       }
     };
     // The SDK loads full SessionInfo values. Only our retained/presented rows are
@@ -30,11 +31,12 @@ export async function navigate(owner: Owner, argument: string): Promise<void> {
         SessionManager.listAll(ctx.sessionManager.getSessionDir(), undefined, signal),
       ]);
       const unique = new Map<string, SessionInfo>();
-      for (const info of [...global, ...local]) unique.set(rowKey(info), info);
+      for (const info of [...global, ...local].filter(isSessionInfo)) unique.set(rowKey(info), info);
       sessions = [...unique.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
     } else sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir(), progress, signal);
     signal.throwIfAborted();
     owner.check();
+    sessions = sessions.filter(isSessionInfo);
     const rows = rowsFrom(all ? sessions : sessions.filter((s) => s.cwd === ctx.cwd));
     publish(rows, sessions.length, sessions.length, true);
     return rows;

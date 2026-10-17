@@ -164,9 +164,9 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
           attention: input.notify ?? "turn",
         });
         const approval = commandApproval(pi, "bash_background", call, manager, options, signal);
-        if (approval) await approval;
+        if (approval) await approval.pending;
         assertLaunchCurrent(manager, signal);
-        const job = await manager.start(options, signal);
+        const job = await manager.start(options, signal, approval?.guard);
         return result(
           { jobs: [job], ...runtime.pending() },
           "Background job started; do useful independent work while it runs.",
@@ -219,9 +219,9 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
             watch,
           });
           const approval = commandApproval(pi, "monitor", call, manager, options, signal);
-          if (approval) await approval;
+          if (approval) await approval.pending;
           assertLaunchCurrent(manager, signal);
-          job = await manager.start(options, signal);
+          job = await manager.start(options, signal, approval?.guard);
         }
         return result(
           { jobs: [job], ...runtime.pending() },

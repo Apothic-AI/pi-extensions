@@ -5,6 +5,7 @@ import {
   type OverlayHandle,
   Text,
   type TUI,
+  type TuiMainScreen,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -104,7 +105,8 @@ export function createReviewComponent(
     },
   };
 }
-/** Human command only. Native custom UI owns disposal; never hide its overlay directly. */
+/** Human command only. Borrow the public TUI synchronously, then own an
+ * identity-addressed overlay, never a long-lived native pop-last callback. */
 export async function confirmOperation(
   ctx: ExtensionContext,
   operation: ApprovalOperation,
@@ -114,21 +116,37 @@ export async function confirmOperation(
   if (ctx.mode === "rpc")
     return ctx.ui.confirm("Approve exactly this operation?", operation.preview, { signal, timeout: 60_000 });
   if (ctx.mode !== "tui") return false;
-  let handle: OverlayHandle | undefined;
-  let component: ReviewComponent | undefined;
-  return ctx.ui.custom<boolean>(
-    (tui, _theme, _keys, done) => {
-      component = createReviewComponent(tui, operation, signal, done, () => handle?.isFocused() === true);
-      return component;
-    },
-    {
-      overlay: true,
-      overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 },
-      onHandle: (value) => {
-        handle = value;
-        // Also handles cancellation between factory creation and native overlay admission.
-        queueMicrotask(() => component?.reconcile());
+  const tui = await ctx.ui.custom<TUI | undefined>((host, _theme, _keys, done) => {
+    // Public concrete TUI classes expose this getter; TUI omits it.
+    const focusHost: TUI & Partial<Pick<TuiMainScreen, "getFocusedComponent">> = host;
+    const focus = focusHost.getFocusedComponent?.();
+    // Close synchronously, before the native host admits a component. The
+    // non-overlay bridge restores its editor; retain the actual foreign focus.
+    done(host);
+    if (focus !== undefined) host.setFocus(focus);
+    return { render: () => [], invalidate() {} };
+  });
+  if (!tui || signal.aborted) return false;
+  return new Promise<boolean>((resolve, reject) => {
+    let handle: OverlayHandle | undefined;
+    const component = createReviewComponent(
+      tui,
+      operation,
+      signal,
+      (approved) => {
+        handle?.hide();
+        component.dispose();
+        resolve(approved);
       },
-    },
-  );
+      () => handle !== undefined && (signal.aborted || handle.isFocused()),
+    );
+    try {
+      handle = tui.showOverlay(component, { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 });
+      component.reconcile();
+    } catch (error) {
+      handle?.hide();
+      component.dispose();
+      reject(error);
+    }
+  });
 }

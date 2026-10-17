@@ -106,6 +106,13 @@ export interface FileInvocation {
 function review(invocation: FileInvocation, path: string, before: Buffer | null, after: Buffer): ApprovalOperation {
   const prior = before ? snapshot(before) : null;
   const next = snapshot(after);
+  // Myers line diff is quadratic for disjoint inputs. Bound tokens BEFORE
+  // entering the synchronous SDK diff; byte/payload limits alone cannot do so.
+  // split includes a terminal empty token, deliberately a conservative count.
+  if ((prior?.text ?? "").split("\n").length + next.text.split("\n").length > 2048)
+    throw new Error(
+      "File exceeds approval review computational limit (2048 combined line tokens); changes were not clipped",
+    );
   // Diff the escaped text so BOM, CRLF and invisible changes are explicit.
   const patch = generateUnifiedPatch(escapeDisplay(path), escapeDisplay(prior?.text ?? ""), escapeDisplay(next.text));
   const preview = `Source: ${invocation.source}\nCWD: ${escapeDisplay(invocation.cwd)}\nFile: ${escapeDisplay(path)}\nEscaped display (backslashes doubled; controls shown as \\u{hex})\nBefore: ${prior?.sha256 ?? "missing"}\nAfter: ${next.sha256}\n${patch}`;
