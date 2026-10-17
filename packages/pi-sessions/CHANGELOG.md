@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- 0ec64d1: Introduce an opt-in experimental package for human-controlled workspace/all-workspace session navigation and bounded, editable summary handoffs into linked sessions. Approval only prefills the editor; it never submits a model turn. Native custom entries support explicit recovery after reload.
+
+### Patch Changes
+
+- 74b65a5: Reject malformed assistant error text before restoration, snapshot stale in-memory handoff parents without rewriting history, revoke approval on subsequent delivered switch attempts, and cancel pending native character jumps before inserting reviewed paste.
+- 0925139: Validate native system replay and discovery metadata before switching, migrate historical v2 messages without writes, revoke prefill after source retirement, and preserve review Undo, configured selection controls and foreign overlay focus. Make CLI fixture startup cleanup exception-safe and document the host's RPC observation limits.
+
 ## 1.2.0
 
 - Initial experimental package: workspace-scoped session navigation and explicitly reviewed, linked summary handoffs. No automatic model turn or session-file deletion.
