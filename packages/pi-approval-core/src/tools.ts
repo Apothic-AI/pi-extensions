@@ -2,7 +2,6 @@ import {
   type BashOperations,
   createBashToolDefinition,
   createEditToolDefinition,
-  createLocalBashOperations,
   createWriteToolDefinition,
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
@@ -21,12 +20,16 @@ import {
   validateOperation,
 } from "./contract.js";
 import { createFileOperations } from "./files.js";
+import { createOwnedLocalBashOperations } from "./local-bash.js";
+import { assertOwnedBashRuntime } from "./local-runtime.js";
 
 export interface ApprovalToolOptions {
   readonly source: string;
   readonly request: (operation: ApprovalOperation, options: ApprovalRequestOptions) => Promise<void>;
   /** Called against this invocation's captured context, before and after every gate. Errors deny. */
   readonly isCurrent: (ctx: ExtensionToolContext) => boolean;
+  /** Optional live exact-name admission; rechecked through file IO and bash dispatch. */
+  readonly isToolCurrent?: (ctx: ExtensionToolContext, name: "edit" | "write" | "bash") => boolean;
   readonly shellPath?: string;
   readonly commandPrefix?: string;
 }
@@ -53,9 +56,10 @@ export function createApprovalBashOperations(options: {
   readonly shellPath?: string;
 }): BashOperations {
   options = Object.freeze({ ...options });
-  const delegate = createLocalBashOperations({ shellPath: options.shellPath });
+  const delegate = createOwnedLocalBashOperations(options.isCurrent, options.shellPath);
   return {
     exec: async (command, cwd, execution) => {
+      assertOwnedBashRuntime(); // Refuse compiled/unknown runtimes before asking a human or spawning.
       // Own backend options as well as tool input: callers may retain and mutate
       // the options/env while human review is pending. Keep signal identity.
       execution = Object.freeze({
@@ -92,6 +96,11 @@ export function createApprovalToolDefinitions(options: ApprovalToolOptions) {
   const bashBase = createBashToolDefinition("");
   const edit: typeof editBase = {
     ...editBase,
+    // No IO/diff on the render path; complete diffs belong to human review.
+    renderCall: () => ({
+      render: (width) => ["edit (human approval required)".slice(0, Math.max(0, Math.floor(width)))],
+      invalidate() {},
+    }),
     async execute(id, params, signal, update, ctx) {
       const input = frozenInput(params, editBase.parameters);
       if (
@@ -108,7 +117,12 @@ export function createApprovalToolDefinitions(options: ApprovalToolOptions) {
       )
         throw new Error("Invalid final edit input");
       const cwd = boundedText(ctx.cwd, 4096);
-      const owner = { signal, isCurrent: () => options.isCurrent(ctx) };
+      const owner = {
+        signal,
+        isCurrent: () =>
+          options.isCurrent(ctx) &&
+          (options.isToolCurrent === undefined || options.isToolCurrent(ctx, "edit") === true),
+      };
       assertCurrent(owner);
       const operations = createFileOperations({
         kind: "edit",
@@ -133,7 +147,12 @@ export function createApprovalToolDefinitions(options: ApprovalToolOptions) {
       )
         throw new Error("Invalid final write input");
       const cwd = boundedText(ctx.cwd, 4096);
-      const owner = { signal, isCurrent: () => options.isCurrent(ctx) };
+      const owner = {
+        signal,
+        isCurrent: () =>
+          options.isCurrent(ctx) &&
+          (options.isToolCurrent === undefined || options.isToolCurrent(ctx, "write") === true),
+      };
       assertCurrent(owner);
       const operations = createFileOperations({
         kind: "write",
@@ -164,7 +183,9 @@ export function createApprovalToolDefinitions(options: ApprovalToolOptions) {
         toolCallId: approvalToolCallId(id),
         inputHash: hashBytes(JSON.stringify(input)),
         request: options.request,
-        isCurrent: () => options.isCurrent(ctx),
+        isCurrent: () =>
+          options.isCurrent(ctx) &&
+          (options.isToolCurrent === undefined || options.isToolCurrent(ctx, "bash") === true),
         shellPath: options.shellPath,
       });
       return createBashToolDefinition(cwd, {

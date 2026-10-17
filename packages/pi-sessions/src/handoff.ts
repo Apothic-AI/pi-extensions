@@ -251,14 +251,22 @@ async function commit(owner: Owner, goal: string, summary: string): Promise<void
   let snapshot: Snapshot | undefined;
   const branch = structuredClone(ctx.sessionManager.getBranch());
   if (parentPath && existsSync(parentPath)) {
-    await owner.wait(vetSession(parentPath, sourceId, owner.signal));
-  } else {
-    parentPath = undefined;
-    if (branch.length) {
-      snapshot = snapshotBranch(cwd, branch);
-      parentPath = snapshot.path;
-      parentId = snapshot.id;
-    }
+    const saved = await owner.wait(vetSession(parentPath, sourceId, owner.signal));
+    // A recovery filename does not enable native in-memory persistence. Reuse
+    // only when exact records AND the file's reopening leaf match our branch.
+    // Native tree navigation can select an earlier/sibling leaf without writing.
+    // Malformed/unreadable storage must still fail preflight, never fall back.
+    const records = new Map(saved.entries.map((entry) => [entry.id, JSON.stringify(entry)]));
+    if (
+      saved.entries.at(-1)?.id !== branch.at(-1)?.id ||
+      !branch.every((entry) => records.get(entry.id) === JSON.stringify(entry))
+    )
+      parentPath = undefined;
+  } else parentPath = undefined;
+  if (!parentPath && branch.length) {
+    snapshot = snapshotBranch(cwd, branch, ctx.sessionManager.getHeader()?.parentSession);
+    parentPath = snapshot.path;
+    parentId = snapshot.id;
   }
   const record: HandoffRecord = {
     version: 1,
@@ -278,6 +286,7 @@ async function commit(owner: Owner, goal: string, summary: string): Promise<void
     if (!readHandoff(record)) throw new Error("Invalid handoff intent");
     owner.check();
     owner.committing = "new";
+    owner.expectedSwitch = true;
     const result = await ctx.newSession({
       ...(parentPath ? { parentSession: parentPath } : {}),
       setup: async (manager) => {

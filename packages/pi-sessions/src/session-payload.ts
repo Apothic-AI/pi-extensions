@@ -91,7 +91,10 @@ export function validateEntryPayload(value: Record<string, unknown>, byId: Reado
       if (!record(message) || !numericFields(message, ["timestamp"])) break;
       switch (message.role) {
         case "assistant":
-          valid = arrayContent(message.content, ["text", "thinking", "toolCall"]) && usage(message.usage);
+          valid =
+            arrayContent(message.content, ["text", "thinking", "toolCall"]) &&
+            usage(message.usage) &&
+            optionalString(message.errorMessage);
           break;
         case "toolResult":
           valid =

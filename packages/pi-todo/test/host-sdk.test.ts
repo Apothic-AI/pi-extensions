@@ -287,6 +287,64 @@ describe("real host ownership and context", () => {
       f.session.sessionManager.getBranch().some((e) => e.type === "custom_message" && e.customType === CONTEXT_TYPE),
     ).toBe(false);
   });
+  it("rejects a fresh Todo mutation before append after ordinary-message EIO and reload retaining the manager", async () => {
+    const f = await fixture({ fileBacked: true });
+    f.faux.setResponses([fauxAssistantMessage("Started.")]);
+    await f.session.prompt("Ordinary persisted conversation.");
+    const first = await f.call({ action: "add", baseRevision: 0, title: "Keep durable state" });
+    const manager = f.session.sessionManager;
+    const file = manager.getSessionFile();
+    if (!file) throw new Error("Missing native file");
+    const before = fs.readFileSync(file, "utf8");
+    const fault = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {
+      throw Object.assign(new Error("ordinary message EIO"), { code: "EIO" });
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(() => manager.appendMessage({ role: "user", content: "Failed ordinary append", timestamp: 2 })).toThrow(
+        "EIO",
+      );
+    } finally {
+      fault.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const ghost = manager.getBranch().at(-1);
+    expect(ghost).toMatchObject({ type: "message", message: { content: "Failed ordinary append" } });
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    await f.session.reload();
+    expect(f.session.sessionManager).toBe(manager);
+    expect(manager.getBranch().at(-1)).toBe(ghost);
+    expect((await f.call({ action: "list" })).details).toEqual(first.details);
+    const append = vi.spyOn(manager, "appendCustomEntry");
+    const mutation = await f.call({ action: "clear", baseRevision: 1 }).then(
+      (result) => ({ result: result.details, error: "" }),
+      (error: unknown) => ({ result: undefined, error: String(error) }),
+    );
+    const appendCount = append.mock.calls.length;
+    const leafAfterMutation = manager.getBranch().at(-1);
+    const retained = (await f.call({ action: "list" })).details;
+    const diskAfterMutation = fs.readFileSync(file, "utf8");
+    append.mockRestore();
+    expect(await f.host.switchSession(file)).toMatchObject({ cancelled: false });
+    const reopen = await f.call({ action: "list" }).then(
+      (result) => ({ result: result.details, error: "" }),
+      (error: unknown) => ({ result: undefined, error: String(error) }),
+    );
+    // Collect the actual reopen outcome even when running this regression against the broken implementation.
+    if (process.env.PI_TODO_DURABILITY_EVIDENCE)
+      fs.appendFileSync(
+        process.env.PI_TODO_DURABILITY_EVIDENCE,
+        `${JSON.stringify({ mutation, appendCount, retained, diskUnchanged: diskAfterMutation === before, reopen })}\n`,
+      );
+    expect(mutation.error).toMatch(/uncommitted.*native|uncommitted.*ancestor/i);
+    expect(appendCount).toBe(0);
+    expect(leafAfterMutation).toBe(ghost);
+    expect(retained).toEqual(first.details);
+    expect(diskAfterMutation).toBe(before); // No orphan Todo record was written.
+    expect(reopen).toEqual({ result: first.details, error: "" });
+    expect((await f.call({ action: "clear", baseRevision: 1 })).details).toMatchObject({ revision: 2, tasks: [] });
+    expect(f.errors).toEqual([]);
+  });
   it("native EIO ghosts stay out of authoritative context and reload recovery until actual file reopen", async () => {
     const f = await fixture({ fileBacked: true });
     f.faux.setResponses([fauxAssistantMessage("Started.")]);

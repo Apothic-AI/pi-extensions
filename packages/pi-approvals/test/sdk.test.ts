@@ -1,6 +1,8 @@
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import fs, { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import {
   AgentSession,
@@ -28,9 +30,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
+  stripTerminalSequences,
   type Terminal,
   Text,
-  type TuiAltScreen,
+  TuiAltScreen,
   TuiMainScreen,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -55,6 +58,8 @@ import { confirmOperation, createReviewComponent } from "../src/review.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   for (const dispose of cleanups.splice(0).reverse()) await dispose();
 });
 async function fixture(
@@ -63,7 +68,7 @@ async function fixture(
   extension = true,
   uiOverride?: Partial<ExtensionUIContext>,
   earlier?: (pi: ExtensionAPI) => void,
-  config: { native?: boolean; tools?: string[]; override?: boolean; readOnlyBase?: boolean } = {},
+  config: { native?: boolean; tools?: string[]; override?: boolean; readOnlyBase?: boolean; paths?: string[] } = {},
 ) {
   expect(VERSION).toBe("1.0.4");
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "approvals-sdk-")));
@@ -87,6 +92,7 @@ async function fixture(
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    additionalExtensionPaths: config.paths,
     extensionFactories: [
       ...(earlier ? [earlier] : []),
       ...(extension ? [approvals] : []),
@@ -535,6 +541,7 @@ it("command-only TUI reviews preserve native focus/draft; arrivals never grab fo
   });
   const done = vi.fn();
   const component = createReviewComponent(tui, operation, new AbortController().signal, done);
+  component.focused = true;
   expect(component.render(100).join("\n")).toContain("\\u{202e}");
   component.handleInput?.("\r");
   expect(done).not.toHaveBeenCalled();
@@ -691,7 +698,7 @@ function terminalFixture(columns = 40, rows = 12) {
     start() {},
     stop() {},
     drainInput: async () => {},
-    write() {},
+    write(_data: string) {},
     moveBy() {},
     hideCursor() {},
     showCursor() {},
@@ -708,7 +715,10 @@ async function nativeHost(tuiMode: "regular" | "fullscreen" = "regular") {
   const runtime = new AgentSessionRuntime(host.session, host.services, async () => {
     throw new Error("Unexpected replacement");
   });
-  const mode = new InteractiveMode(runtime, { terminal: terminalFixture(), tuiMode });
+  const terminal = terminalFixture();
+  const mode = new InteractiveMode(runtime, { terminal, tuiMode });
+  await mode.init();
+  cleanups.push(async () => mode.stop());
   // Inspect the actual host's existing UI context; do not replace its stack or close callback.
   const access = mode as unknown as {
     ui: TuiMainScreen | TuiAltScreen;
@@ -717,8 +727,7 @@ async function nativeHost(tuiMode: "regular" | "fullscreen" = "regular") {
   };
   const ui = access.createExtensionUIContext();
   access.ui.setFocus(access.editor);
-  access.ui.stop();
-  return { host, tui: access.ui, ui, ctx: { ...host.context, mode: "tui" as const, ui, hasUI: true } };
+  return { host, tui: access.ui, terminal, ui, ctx: { ...host.context, mode: "tui" as const, ui, hasUI: true } };
 }
 it.each(
   (["regular", "fullscreen"] as const).flatMap((tuiMode) => ["overlay", "confirm"].map((kind) => ({ tuiMode, kind }))),
@@ -773,6 +782,7 @@ it("review controls/body remain reachable at 40x12 and one-column fallback", () 
   const tui = new TuiMainScreen(terminal);
   const op = { ...operation("/test"), preview: `${Array.from({ length: 50 }, (_, i) => `Line ${i}`).join("\n")}\n界` };
   const component = createReviewComponent(tui, op, new AbortController().signal, () => {});
+  component.focused = true;
   const seen = new Set<string>();
   for (let i = 0; i < 50; i++) {
     const lines = component.render(40);
@@ -793,7 +803,7 @@ it("review controls/body remain reachable at 40x12 and one-column fallback", () 
     component.handleInput?.("\x1b[B");
   }
   expect(all).toContain("Ctrl+A");
-  expect(all).toContain("Line49");
+  expect(all).toContain("Line\\u{20}49"); // Compact preview exposes the space instead of discarding it.
   expect(all).toContain("\\u{754c}");
   component.dispose();
 });
@@ -1285,6 +1295,323 @@ it.each(["regular", "fullscreen"] as const)(
       owned?.handleInput?.("\x1b");
       await new Promise((resolve) => setImmediate(resolve));
       admitted?.hide();
+    }
+  },
+);
+
+function hold() {
+  let resolve = () => {};
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+it.each(["shutdown", "replacement", "branch"])("C: root held post-approval file recheck denies %s", async (loss) => {
+  const host = await fixture();
+  const entered = hold(),
+    release = hold();
+  let approved = false;
+  host.api.events.on(APPROVAL_LIFECYCLE_CHANNEL, (value) => {
+    const event = validateLifecycle(value);
+    if (event.phase === "resolved" && event.outcome === "approved") approved = true;
+  });
+  const lstat = fs.lstat;
+  vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) => {
+    if (approved) {
+      entered.resolve();
+      await release.promise;
+    }
+    return lstat(...args);
+  });
+  syncBuiltinESMExports();
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "held/new/file", content: "never" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  await host.session.prompt(`/approvals approve ${request.requestId}`, { streamingBehavior: "steer" });
+  await entered.promise;
+  if (loss === "shutdown") await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+  else if (loss === "replacement")
+    host.api.events.on(APPROVAL_QUERY_CHANNEL, (v) =>
+      validateQuery(v).respond({ version: 1, id: "replacement", request: async () => {} }),
+    );
+  else host.manager.resetLeaf();
+  release.resolve();
+  await turn;
+  await expect(fs.stat(join(host.cwd, "held"))).rejects.toThrow();
+  expect(host.events.filter((e) => e.phase === "waiting")).toHaveLength(1);
+});
+it("D: actual Plan start withdraws a pending ordinary root write", async () => {
+  const host = await fixture(undefined, "rpc", true, undefined, undefined, {
+    paths: [fileURLToPath(new URL("../../pi-plan-mode", import.meta.url))],
+  });
+  host.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "ordinary/file", content: "never" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("done"),
+  ]);
+  const turn = host.session.prompt("write");
+  const [request] = await pending(host);
+  await host.session.prompt("/plan start", { streamingBehavior: "steer" });
+  expect(host.session.getActiveToolNames()).not.toContain("write");
+  await host.session.prompt(`/approvals approve ${request.requestId}`, { streamingBehavior: "steer" });
+  await turn;
+  await expect(fs.stat(join(host.cwd, "ordinary"))).rejects.toThrow();
+  expect(host.events.filter((e) => e.phase === "waiting")).toHaveLength(1);
+});
+it.each(["regular", "fullscreen"] as const)(
+  "F: native large paste, cursor and Undo survive review (%s)",
+  async (mode) => {
+    const { host, tui, ui } = await nativeHost(mode);
+    await host.session.bindExtensions({ mode: "tui", uiContext: ui });
+    const editor = tui.getFocusedComponent();
+    if (!editor) throw new Error("No editor");
+    editor.handleInput?.("prefix ");
+    const pasted = "large payload ".repeat(2000);
+    editor.handleInput?.(`\x1b[200~${pasted}\x1b[201~`);
+    editor.handleInput?.("\x1b[D");
+    const draft = ui.getEditorText();
+    const rows = editor.render(40);
+    const service = queryApprovalService(host.api.events);
+    if (!service) throw new Error("Missing peer");
+    const approved = service.request(operation(host.cwd), { isCurrent: () => true });
+    const denied = expect(approved).rejects.toThrow("denied");
+    const [request] = await pending(host);
+    const review = host.session.prompt(`/approvals review ${request.requestId}`);
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== editor).toBe(true));
+    tui.getFocusedComponent()?.handleInput?.("\x1b");
+    await review;
+    await denied;
+    expect(ui.getEditorText()).toBe(draft);
+    expect(editor.render(40)).toEqual(rows);
+    editor.handleInput?.("X");
+    // Native large-paste placeholders move atomically: Left crosses the paste.
+    expect(ui.getEditorText()).toBe(`prefix X${pasted}`);
+    editor.handleInput?.("\x1f");
+    expect(ui.getEditorText()).toBe(draft);
+    editor.handleInput?.("\x1f");
+    expect(ui.getEditorText()).toBe("prefix ");
+  },
+);
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((mode) =>
+    [
+      [40, 12],
+      [80, 24],
+    ].flatMap(([columns, rows]) => ["confirm", "select", "input"].map((kind) => ({ mode, columns, rows, kind }))),
+  ),
+)(
+  "G: composed foreign $kind visible before review cancellation ($mode $columns x $rows)",
+  async ({ mode, columns, rows, kind }) => {
+    const { host, tui, ui, ctx, terminal } = await nativeHost(mode);
+    terminal.columns = columns;
+    terminal.rows = rows;
+    const initial = tui.getFocusedComponent();
+    const abort = new AbortController();
+    const review = confirmOperation(
+      ctx,
+      { ...operation(host.cwd), preview: "OWNED REVIEW ROW\n".repeat(80) },
+      abort.signal,
+    );
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== initial).toBe(true));
+    const owned = tui.getFocusedComponent();
+    const question =
+      kind === "confirm"
+        ? ui.confirm("FOREIGN QUESTION", "Answer this question")
+        : kind === "select"
+          ? ui.select("FOREIGN QUESTION", ["CHOICE ONE", "CHOICE TWO"])
+          : ui.input("FOREIGN QUESTION", "TYPE ANSWER");
+    await vi.waitFor(() => expect(tui.getFocusedComponent() !== owned).toBe(true));
+    const foreign = tui.getFocusedComponent();
+    try {
+      tui.renderNow();
+      const frame =
+        tui instanceof TuiAltScreen
+          ? tui.getScreenLines()
+          : (() => {
+              const state = tui.captureRenderState();
+              return state.previousLines.slice(state.previousViewportTop, state.previousViewportTop + rows);
+            })();
+      const text = frame.map(stripTerminalSequences).join("\n");
+      const evidence = process.env.PI_APPROVAL_UI_EVIDENCE;
+      if (evidence)
+        await fs.appendFile(
+          evidence,
+          `${JSON.stringify({ mode, columns, rows, kind, phase: "foreign-pending", lines: frame.map(stripTerminalSequences) })}\n`,
+        );
+      expect(text).toContain("FOREIGN QUESTION");
+      expect(text).not.toContain("OWNED REVIEW ROW");
+      if (kind === "input") foreign?.handleInput?.("typed answer");
+      foreign?.handleInput?.("\r");
+      expect(await question).toBe(kind === "confirm" ? true : kind === "select" ? "CHOICE ONE" : "typed answer");
+      await new Promise((r) => setImmediate(r));
+      expect(tui.getFocusedComponent()).toBe(owned);
+      tui.renderNow();
+      expect(owned?.render(columns).join("\n")).toContain("OWNED REVIEW ROW");
+      const resumed =
+        tui instanceof TuiAltScreen
+          ? tui.getScreenLines()
+          : (() => {
+              const state = tui.captureRenderState();
+              return state.previousLines.slice(state.previousViewportTop, state.previousViewportTop + rows);
+            })();
+      expect(resumed.map(stripTerminalSequences).join("\n")).toContain("OWNED REVIEW ROW");
+      if (evidence)
+        await fs.appendFile(
+          evidence,
+          `${JSON.stringify({ mode, columns, rows, kind, phase: "review-resumed", lines: resumed.map(stripTerminalSequences) })}\n`,
+        );
+    } finally {
+      abort.abort();
+      foreign?.handleInput?.("\x1b");
+      await question;
+      await review;
+    }
+    expect(tui.hasOverlay()).toBe(false);
+  },
+);
+
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((mode) =>
+    [
+      { columns: 1, preview: "का", codes: ["915", "93e"] },
+      { columns: 2, preview: "काि", codes: ["915", "93e", "93f"] },
+    ].map((sample) => ({ mode, ...sample })),
+  ),
+)(
+  "oversized grapheme remains inspectable in composed $columns-column review ($mode)",
+  async ({ mode, columns, preview, codes }) => {
+    const { host, tui, terminal } = await nativeHost(mode);
+    terminal.columns = columns;
+    terminal.rows = 12;
+    expect(visibleWidth(preview)).toBeGreaterThan(columns);
+    const component = createReviewComponent(
+      tui,
+      { ...operation(host.cwd), preview },
+      new AbortController().signal,
+      () => {},
+    );
+    const handle = tui.showOverlay(component, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
+    try {
+      tui.renderNow();
+      component.handleInput?.("\x1b[F");
+      tui.renderNow();
+      const frame =
+        tui instanceof TuiAltScreen
+          ? tui.getScreenLines()
+          : (() => {
+              const state = tui.captureRenderState();
+              return state.previousLines.slice(state.previousViewportTop, state.previousViewportTop + terminal.rows);
+            })();
+      const text = frame.map(stripTerminalSequences).join("");
+      expect(frame.every((line) => visibleWidth(line) <= columns)).toBe(true);
+      for (const code of codes) expect(text).toContain(code);
+      expect(preview).toBe(columns === 1 ? "का" : "काि");
+    } finally {
+      handle.hide();
+      component.dispose();
+      tui.stop();
+    }
+  },
+);
+
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((mode) =>
+    [1, 2].flatMap((columns) => [
+      { mode, columns, name: "space", first: "echo का का", second: "echo काका" },
+      { mode, columns, name: "newline", first: "echo का\nका", second: "echo काका" },
+      { mode, columns, name: "literal escape", first: "echo a b", second: "echo a\\u{20}b" },
+    ]),
+  ),
+)(
+  "compact composed review distinguishes $name across scrolling ($mode $columns columns)",
+  async ({ mode, columns, first, second }) => {
+    const { host, tui, terminal } = await nativeHost(mode);
+    terminal.columns = columns;
+    terminal.rows = 12;
+    const inspect = (command: string): string => {
+      const op = { ...operation(host.cwd), command, preview: command, inputHash: hashBytes(command) };
+      const component = createReviewComponent(tui, op, new AbortController().signal, () => {});
+      const handle = tui.showOverlay(component, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
+      const frames: string[][] = [];
+      try {
+        for (let i = 0; i < 256; i++) {
+          tui.renderNow();
+          const frame =
+            tui instanceof TuiAltScreen
+              ? tui.getScreenLines()
+              : (() => {
+                  const state = tui.captureRenderState();
+                  return state.previousLines.slice(
+                    state.previousViewportTop,
+                    state.previousViewportTop + terminal.rows,
+                  );
+                })();
+          frames.push(frame.map(stripTerminalSequences));
+          component.handleInput?.("\x1b[B");
+        }
+        expect(op.command).toBe(command);
+        expect(op.preview).toBe(command);
+        return JSON.stringify(frames);
+      } finally {
+        handle.hide();
+        component.dispose();
+      }
+    };
+    try {
+      expect(inspect(first) === inspect(second)).toBe(false);
+    } finally {
+      tui.stop();
+    }
+  },
+);
+
+it.each(
+  (["regular", "fullscreen"] as const).flatMap((mode) =>
+    [2, 80].flatMap((columns) => [
+      { mode, columns, name: "Thai", base: "\u0e01", composed: "\u0e33", decomposed: "\u0e4d\u0e32", code: "e33" },
+      { mode, columns, name: "Lao", base: "\u0e81", composed: "\u0eb3", decomposed: "\u0ecd\u0eb2", code: "eb3" },
+    ]),
+  ),
+)(
+  "native output distinguishes $name AM source representations ($mode $columns columns)",
+  async ({ mode, columns, base, composed, decomposed, code }) => {
+    const { host, tui, terminal } = await nativeHost(mode);
+    terminal.columns = columns;
+    terminal.rows = 12;
+    const writes: string[] = [];
+    vi.spyOn(terminal, "write").mockImplementation((data) => {
+      writes.push(data);
+    });
+    const inspect = (suffix: string): string => {
+      const command = `echo ${base}${suffix}`;
+      const op = { ...operation(host.cwd), command, preview: command, inputHash: hashBytes(command) };
+      const component = createReviewComponent(tui, op, new AbortController().signal, () => {});
+      const handle = tui.showOverlay(component, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
+      try {
+        tui.renderNow(true);
+        component.handleInput?.("\x1b[F");
+        writes.length = 0;
+        tui.renderNow(true);
+        expect(op.command).toBe(command);
+        expect(op.preview).toBe(command);
+        // Capture actual native terminal writes AFTER output normalization, not
+        // just pre-normalization getScreenLines/captureRenderState snapshots.
+        return stripTerminalSequences(writes.join("")).replace(/[\r\n]/gu, "");
+      } finally {
+        handle.hide();
+        component.dispose();
+      }
+    };
+    try {
+      const first = inspect(composed);
+      const second = inspect(decomposed);
+      expect(first === second).toBe(false);
+      expect(first).toContain(`\\u{${code}}`);
+      expect(first).not.toContain(composed);
+    } finally {
+      tui.stop();
     }
   },
 );

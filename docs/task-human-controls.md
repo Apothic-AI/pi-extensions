@@ -20,6 +20,7 @@ No global installation/settings changes, default experimental activation, automa
 - Permission controls are not an OS sandbox. Stricter tool admission, project trust and Plan policy remain authoritative. Noncanonical execution tools need explicit cooperative adapters; arbitrary extension-side I/O is outside this boundary.
 - Reviewed edit operations use the native SDK mutation queue's computed output. Write mkdir is deferred until approval. This serializes cooperating same-process operations, not arbitrary external writers or independently loaded runtimes.
 - Background approval belongs to the normalized launch and must remain valid through asynchronous startup, not merely when a human answers. Inspection alone starts neither a command nor a model turn.
+- Reviewed bash retains the SDK tool/output layer but uses an owned POSIX backend, checking owner/service/admission after CWD preparation and at command IPC dispatch. Standalone Node.js with public SEA detection is required; Bun/compiled Pi, Node SEA and unknown capabilities reject before approval or subprocess startup. Edit/write do not require that bash-only runtime capability.
 - Todo completion is a checklist assertion, not proof of workflow execution or successful verification. Never infer completion from prose, stops or partial results. Native incomplete ancestry must not silently become an empty checklist.
 - Session preview does not authorize instructions in stored history. A handoff saves a human-approved summary outside model context and only prefills a draft; it never automatically submits a model turn. Retired source approval cannot grant a fresh destination prefill.
 
@@ -28,6 +29,8 @@ No global installation/settings changes, default experimental activation, automa
 Pi 1.0.4 dispatches cancellable lifecycle handlers in extension order and stops at the first veto. An extension cannot observe an attempt already vetoed by an earlier extension. Session ownership fences therefore cover **delivered lifecycle events and observable state changes**, not every possible navigation attempt.
 
 RPC does not expose client-local draft contents, draft versions or conditional editor writes. A client must preserve newer local drafts and reject stale confirmations; an explicit Yes authorizes replacement of its current draft. Neither a branch fingerprint nor destination-owned consent supplies a missing client draft epoch. A universal stale-consent guarantee requires public host/client support, not private runtime patches.
+
+Parent record/leaf equality is checked at handoff preflight. A reused native parent remains live history, not an immutable snapshot: later native appends can advance it, including during replacement hooks. Observable preflight revocation strips automatic editor-prefill authorization, but native replacement and its live parent link may still proceed with recovery-only data. A private snapshot records the captured branch when an existing file cannot represent it.
 
 ## Acceptance matrix
 
@@ -57,6 +60,8 @@ bun run --cwd packages/pi-workflows check
 
 # Actual offline Pi CLI/PTY UI checks; macOS/Linux and Python 3 stdlib required.
 python3 packages/pi-background/test/shortcut-cli.py
+python3 packages/pi-todo/test/prefill-cli.py "$(mktemp -d)"
+python3 packages/pi-sessions/test/ui-cli-cleanup.py
 python3 packages/pi-sessions/test/ui-cli.py "$(mktemp -d)"
 
 # Final integrated gate; includes package, integration, packing/loading and secret checks.

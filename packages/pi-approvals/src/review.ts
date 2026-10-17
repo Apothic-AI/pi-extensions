@@ -3,13 +3,60 @@ import {
   type Component,
   matchesKey,
   type OverlayHandle,
-  Text,
   type TUI,
-  type TuiMainScreen,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ApprovalOperation } from "@signalridge/pi-approval-core";
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Hard-wrap without discarding a separator at a word boundary. Compact views
+ * encode preview whitespace/backslashes so data newlines cannot look like soft
+ * wrapping, and a literal escape cannot impersonate an encoded separator. */
+function wrapReview(source: string, width: number, exactWhitespace: boolean): string[] {
+  const lines: string[] = [];
+  let line = "";
+  let columns = 0;
+  const append = (value: string) => {
+    for (const { segment } of graphemes.segment(value)) {
+      const size = visibleWidth(segment);
+      if (columns + size > width && line) {
+        lines.push(line);
+        line = "";
+        columns = 0;
+      }
+      line += segment;
+      columns += size;
+    }
+  };
+  for (const { segment } of graphemes.segment(source)) {
+    if (segment === "\n") {
+      if (exactWhitespace) append("\\u{a}");
+      lines.push(line);
+      line = "";
+      columns = 0;
+      continue;
+    }
+    const size = visibleWidth(segment);
+    // Pi's output layer compatibility-decomposes Thai/Lao AM. Preserve the
+    // original source code points instead of approving a normalized lookalike.
+    const encodeCluster =
+      size === 0 ||
+      size > width ||
+      /[\u0e33\u0eb3]/u.test(segment) ||
+      (exactWhitespace && /\p{White_Space}/u.test(segment));
+    append(
+      encodeCluster
+        ? Array.from(segment, (char) => `\\u{${char.codePointAt(0)?.toString(16)}}`).join("")
+        : exactWhitespace
+          ? segment.replaceAll("\\", "\\\\")
+          : segment,
+    );
+  }
+  lines.push(line);
+  return lines;
+}
 
 interface ReviewComponent extends Component {
   focused: boolean;
@@ -32,6 +79,7 @@ export function createReviewComponent(
   const header = "APPROVAL REVIEW";
   const controls = "Ctrl+A approve | Esc deny";
   const scrolling = "Up/Down/PgUp/PgDn/Home/End scroll";
+  let layout: { width: number; compact: boolean; source: string; lines: string[] } | undefined;
   const reconcile = () => {
     if (finished || decision === undefined || !canComplete()) return;
     finished = true;
@@ -51,23 +99,33 @@ export function createReviewComponent(
       return focused;
     },
     set focused(value: boolean) {
+      if (focused === value) return;
       focused = value;
+      tui.requestRender();
       // Native hideOverlay restores focus before its close callback finishes.
       // Complete only afterward, never pop the foreign overlay in that stack operation.
       if (value) queueMicrotask(reconcile);
     },
     reconcile,
     render(width: number) {
+      // A native question can take focus without adding an overlay. Do not
+      // obscure it with a full-screen review that cannot receive its answer.
+      if (!focused || finished) return [];
       width = Math.max(1, width);
       const rows = Math.max(1, tui.terminal.rows);
       const compact = width < 40 || rows < 6;
-      let text = compact ? `${header}\n${controls}\n${scrolling}\n${operation.preview}` : operation.preview;
-      // A double-width glyph cannot occupy a one-column terminal. Escape, don't clip it.
-      if (width === 1)
-        text = Array.from(text, (char) =>
-          visibleWidth(char) > 1 ? `\\u{${char.codePointAt(0)?.toString(16)}}` : char,
-        ).join("");
-      const lines = new Text(text, 0, 0).render(width);
+      if (!layout || layout.width !== width || layout.compact !== compact || layout.source !== operation.preview) {
+        const prefix = compact
+          ? wrapReview(`${header}\n${controls}\n${scrolling}\nPreview whitespace/backslashes escaped`, width, false)
+          : [];
+        layout = {
+          width,
+          compact,
+          source: operation.preview,
+          lines: [...prefix, ...wrapReview(operation.preview, width, compact)],
+        };
+      }
+      const lines = layout.lines;
       height = compact ? rows : rows - 4;
       total = lines.length;
       offset = Math.min(offset, Math.max(0, total - height));
@@ -86,7 +144,7 @@ export function createReviewComponent(
     handleInput(data: string) {
       if (finished) return;
       if (signal.aborted) finish(false);
-      else if (matchesKey(data, "ctrl+a")) finish(true);
+      else if (focused && matchesKey(data, "ctrl+a")) finish(true);
       else if (matchesKey(data, "escape")) finish(false);
       else {
         if (matchesKey(data, "up")) offset = Math.max(0, offset - 1);
@@ -116,21 +174,25 @@ export async function confirmOperation(
   if (ctx.mode === "rpc")
     return ctx.ui.confirm("Approve exactly this operation?", operation.preview, { signal, timeout: 60_000 });
   if (ctx.mode !== "tui") return false;
-  const tui = await ctx.ui.custom<TUI | undefined>((host, _theme, _keys, done) => {
-    // Public concrete TUI classes expose this getter; TUI omits it.
-    const focusHost: TUI & Partial<Pick<TuiMainScreen, "getFocusedComponent">> = host;
-    const focus = focusHost.getFocusedComponent?.();
-    // Close synchronously, before the native host admits a component. The
-    // non-overlay bridge restores its editor; retain the actual foreign focus.
-    done(host);
-    if (focus !== undefined) host.setFocus(focus);
-    return { render: () => [], invalidate() {} };
-  });
+  let tui: TUI | undefined;
+  let finishBridge: (() => void) | undefined;
+  await ctx.ui.custom<void>(
+    (host, _theme, _keys, done) => {
+      tui = host;
+      finishBridge = done;
+      return { render: () => [], invalidate() {} };
+    },
+    // Native done pops the last overlay: complete synchronously only after
+    // admission, before any other interaction can interleave. Never touch the
+    // editor text, paste map, cursor or Undo history.
+    { overlay: true, overlayOptions: { nonCapturing: true }, onHandle: () => finishBridge?.() },
+  );
   if (!tui || signal.aborted) return false;
+  const host = tui;
   return new Promise<boolean>((resolve, reject) => {
     let handle: OverlayHandle | undefined;
     const component = createReviewComponent(
-      tui,
+      host,
       operation,
       signal,
       (approved) => {
@@ -141,7 +203,7 @@ export async function confirmOperation(
       () => handle !== undefined && (signal.aborted || handle.isFocused()),
     );
     try {
-      handle = tui.showOverlay(component, { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 });
+      handle = host.showOverlay(component, { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 });
       component.reconcile();
     } catch (error) {
       handle?.hide();

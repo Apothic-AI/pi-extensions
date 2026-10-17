@@ -11,9 +11,11 @@ export function registerSessions(pi: ExtensionAPI): void {
   pi.on("session_before_switch", (event) => {
     if (!active) return;
     if (
+      active.expectedSwitch &&
       active.committing === event.reason &&
       (event.reason !== "resume" || event.targetSessionFile === active.target)
     ) {
+      active.expectedSwitch = false;
       if (!active.current()) return { cancel: true };
     } else retire();
   });

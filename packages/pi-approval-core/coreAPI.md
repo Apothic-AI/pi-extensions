@@ -1,19 +1,26 @@
 # Local approval API v1
 
 ```ts
-const captured = queryApprovalService(rootPi.events); // capture before first await
+const captured = captureApprovalService(rootPi.events); // capture before first await
 // undefined means no approval extension is loaded. The host decides whether ungated
 // operation is admissible; do not convert a present-but-failing peer into absence.
 const definitions = createApprovalToolDefinitions({
   source: "child:owned-run-id",
   request: (operation, options) => {
     if (!captured) throw new Error("No human approval service");
-    return captured.request(operation, options);
+    return captured.service.request(operation, options);
   },
-  isCurrent: (invocationContext) => callerStillOwns(invocationContext),
+  isCurrent: (invocationContext) => {
+    if (!captured) return false;
+    captured.assertCurrent(); // SAME capture, including after post-approval IO
+    return callerStillOwns(invocationContext);
+  },
+  // Optional: isToolCurrent: (ctx, name) => exactBindingAndAdmissionStillCurrent(ctx, name),
 });
 // SDK: customTools: [...definitions]; do not copy/forward all child UI methods.
 ```
+
+Reviewed bash additionally requires a POSIX standalone Node.js host with public SEA detection. Bun/compiled Pi, Node SEA and missing/unknown probe capabilities reject before the approval callback or any child process. Imports and factory creation remain resource-free, and edit/write do not invoke this bash-only runtime check. The implementation never probes interpreter compatibility by launching `process.execPath`.
 
 `ApprovalService = { readonly version: 1; readonly id: string; request(operation, options): Promise<void> }`.
 

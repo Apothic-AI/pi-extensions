@@ -142,6 +142,7 @@ export class TodoStore {
     const next = transition(this.snapshot, input);
     if (next === this.snapshot) return this.read(ctx);
     // No native write occurs until a matching readable session has a persisted conversation.
+    const origin = this.lease(ctx);
     let before: Durability;
     try {
       before = this.persistence.inspect(ctx.sessionManager);
@@ -150,13 +151,18 @@ export class TodoStore {
       throw new Error(this.unavailable);
     }
     this.persistence.requireWritable(before);
-    if (ctx.sessionManager.getBranch().some((entry) => isState(entry) && !this.persistence.includes(before, entry)))
+    const ancestors = ctx.sessionManager.getBranch();
+    if (!this.matches(origin, ctx) || ancestors.length !== origin.prefix.length)
+      throw new Error("Todo ownership changed during preflight; retry on the current native branch.");
+    if (ancestors.length && ancestors[0].parentId !== null)
+      throw new Error("Todo unavailable: unresolved native session ancestry; reconcile/reload.");
+    const uncommitted = ancestors.find((entry) => !this.persistence.includes(before, entry));
+    if (uncommitted)
       throw new Error(
-        "Todo native branch contains an uncommitted state entry; reload the native session before editing.",
+        `Todo native branch contains an uncommitted ${isState(uncommitted) ? "state entry" : "native ancestor"}; reload the native session before editing.`,
       );
     this.storage = before;
     this.committing = true;
-    const origin = this.lease(ctx);
     try {
       let appendError: unknown;
       try {

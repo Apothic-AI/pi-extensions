@@ -163,7 +163,7 @@ export interface Snapshot {
   id: string;
   cleanup(): void;
 }
-export function snapshotBranch(cwd: string, branch: readonly SessionEntry[]): Snapshot {
+export function snapshotBranch(cwd: string, branch: readonly SessionEntry[], parentSession?: string): Snapshot {
   const directory = mkdtempSync(join(tmpdir(), "pi-sessions-parent-"));
   const cleanup = () => rmSync(directory, { recursive: true, force: true });
   try {
@@ -175,6 +175,7 @@ export function snapshotBranch(cwd: string, branch: readonly SessionEntry[]): Sn
       id,
       cwd,
       timestamp: new Date().toISOString(),
+      ...(parentSession ? { parentSession } : {}),
     };
     writeFileSync(path, `${[header, ...structuredClone(branch)].map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
       encoding: "utf8",

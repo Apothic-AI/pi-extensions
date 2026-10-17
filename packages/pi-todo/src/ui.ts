@@ -243,6 +243,29 @@ export interface TaskDraft {
   description?: string;
   dependencies: string[];
 }
+
+/** Establish data without an undoable edit, then position through the public
+ * pointer API. Neither remapped action keys nor a paste Undo entry are invoked.
+ * Rendering a full-width preview makes the final blank cell a safe end target;
+ * no terminal output or TUI focus change is performed here. */
+function initializeInput(input: Input, value: string): void {
+  input.setValue(value);
+  const width = Math.max(4, visibleWidth(value) + 4);
+  input.render(width);
+  input.handleMouse({
+    type: "press",
+    button: "left",
+    x: width - 1,
+    y: 0,
+    screenX: width - 1,
+    screenY: 0,
+    width,
+    height: 1,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  });
+}
 export class TaskForm implements Component, Focusable {
   private readonly title = new Input({ prompt: "" });
   private readonly description: Editor;
@@ -266,10 +289,8 @@ export class TaskForm implements Component, Focusable {
   ) {
     this.originalTitle = task?.title;
     this.normalizedTitle = display(task?.title ?? "").replace(/\n/gu, " ");
-    this.title.setValue(this.normalizedTitle);
-    this.title.handleInput("\x1b[F");
-    this.dependencies.setValue(task?.dependencies.join(",") ?? "");
-    this.dependencies.handleInput("\x1b[F");
+    initializeInput(this.title, this.normalizedTitle);
+    initializeInput(this.dependencies, display(task?.dependencies.join(",") ?? ""));
     this.originalDescription = task?.description;
     this.description = new Editor(
       tui,

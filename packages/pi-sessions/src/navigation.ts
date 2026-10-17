@@ -88,6 +88,7 @@ async function switchChosen(owner: Owner, ui: HumanUI, chosen: SessionRow): Prom
   owner.check();
   owner.committing = "resume";
   owner.target = chosen.path;
+  owner.expectedSwitch = true;
   const result = await ctx.switchSession(chosen.path, {
     withSession: async (destination) => {
       owner.replacementStarted = true;

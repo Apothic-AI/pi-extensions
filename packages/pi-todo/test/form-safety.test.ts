@@ -5,6 +5,105 @@ import { nativeTerminal } from "./native-terminal.js";
 const attack = "X\x1b[31m\x1b]52;c;test\x07\u202e\x1b[2J";
 for (const fullscreen of [false, true]) {
   const mode = fullscreen ? "fullscreen" : "regular";
+  for (const field of ["title", "dependencies"] as const) {
+    it.each([false, true])(
+      `${mode} ${field} prefill Undo stops at the initial baseline after edits=%s`,
+      async (edit) => {
+        const f = await nativeTerminal(fullscreen);
+        let running: Promise<void> | undefined;
+        try {
+          const prerequisite = f.store.mutate(f.ctx, {
+            action: "add",
+            baseRevision: 0,
+            title: "Prerequisite",
+            status: "completed",
+          });
+          const before = f.store.mutate(f.ctx, {
+            action: "add",
+            baseRevision: 1,
+            title: "Keep 中文 title",
+            dependencies: [prerequisite.tasks[0].id],
+          });
+          running = f.command.run(f.ctx);
+          await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+          f.key("\x1b[F");
+          f.key("e");
+          await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+          if (field === "dependencies") {
+            f.key("\t");
+            f.key("\t");
+          }
+          if (edit) {
+            f.key("X");
+            f.key("\x1f");
+          }
+          f.key("\x1f"); // No user edit remains to undo: initialization is not an edit.
+          f.key("\x13");
+          await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+          expect(f.store.read(f.ctx)).toEqual(before);
+          expect(f.session.messages).toEqual([]);
+        } finally {
+          f.command.retire();
+          await running;
+          await f.dispose();
+        }
+      },
+    );
+  }
+  it.each([false, true])(
+    `${mode} remapped End never edits prefill on three unchanged Enters (CJK/dependencies=%s)`,
+    async (dependencies) => {
+      const originalKeys = getKeybindings();
+      const originalBindings = { ...originalKeys.getUserBindings() };
+      const f = await nativeTerminal(fullscreen);
+      let running: Promise<void> | undefined;
+      try {
+        const keys = getKeybindings();
+        keys.setUserBindings({
+          ...keys.getUserBindings(),
+          "tui.editor.cursorLineEnd": "ctrl+e",
+          "tui.editor.deleteCharForward": "end",
+        });
+        const prerequisite = f.store.mutate(f.ctx, {
+          action: "add",
+          baseRevision: 0,
+          title: "Prerequisite",
+          status: "completed",
+        });
+        const before = f.store.mutate(f.ctx, {
+          action: "add",
+          baseRevision: 1,
+          title: dependencies ? "中文 abcd" : "abcd",
+          description: "Keep 中文 description",
+          dependencies: dependencies ? [prerequisite.tasks[0].id] : [],
+        });
+        running = f.command.run(f.ctx);
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+        f.key("\x1b[F");
+        f.key("e");
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Task title"));
+        f.record("remapped-End-prefill", f.lines());
+        f.key("\r");
+        f.key("\r");
+        f.key("\r");
+        await vi.waitFor(() => expect(f.lines().join("\n")).toContain("Session Todo"));
+        expect(f.store.read(f.ctx)).toEqual(before);
+        f.record("remapped-End-unchanged-snapshot", f.lines());
+        expect(getKeybindings()).toBe(keys);
+        expect(keys.getUserBindings()).toMatchObject({
+          "tui.editor.cursorLineEnd": "ctrl+e",
+          "tui.editor.deleteCharForward": "end",
+        });
+        expect(f.session.messages).toEqual([]);
+      } finally {
+        f.command.retire();
+        await running;
+        await f.dispose();
+        setKeybindings(originalKeys);
+        originalKeys.setUserBindings(originalBindings);
+      }
+    },
+  );
   it.each([false, true])(
     `${mode} remapped submit preserves description, native Undo and newline precedence (Enter newline=%s)`,
     async (enterNewline) => {

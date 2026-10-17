@@ -242,6 +242,65 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
     open.manager.appendMessage({ role: "user", content: "Continue normally", timestamp: 2 });
     expect(open.store.mutate(open.ctx, { action: "clear", baseRevision: 1 }).revision).toBe(2);
   });
+  it.each([false, true])("verifies a huge CRLF-only conversation without unbounded parsing (CR split=%s)", (split) => {
+    const f = fixture(false);
+    f.manager.appendMessage({ role: "user", content: "x".repeat(1024 * 1024), timestamp: 1 });
+    const [header, serialized] = readFileSync(f.file, "utf8").trimEnd().split("\n");
+    const message = JSON.parse(serialized) as { message: { content: string } };
+    if (split) {
+      const sizeThroughCR = Buffer.byteLength(`${header}\r\n${serialized}\r`);
+      message.message.content += "x".repeat((32768 - (sizeThroughCR % 32768)) % 32768);
+    }
+    const crlf = `${header}\r\n${JSON.stringify(message)}\r\n`;
+    if (split) expect((Buffer.byteLength(crlf) - 1) % 32768).toBe(0); // CR ends a chunk, LF starts the next.
+    writeFileSync(f.file, crlf);
+    const manager = SessionManager.open(f.file, f.dir); // The actual SDK parses the huge conversation.
+    const ctx = { sessionManager: manager } as unknown as ExtensionContext;
+    const append = vi.fn((type: string, data: unknown) => {
+      manager.appendCustomEntry(type, data);
+    });
+    const store = new TodoStore({ appendEntry: append });
+    const nativeParse = JSON.parse;
+    const parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MAX_BYTES * 2);
+      return nativeParse(text, reviver);
+    });
+    let first = empty();
+    try {
+      store.reconcile(ctx);
+      first = store.mutate(ctx, add);
+      expect(first).toMatchObject({ revision: 1, tasks: [{ title: "Durable task" }] });
+      expect(append).toHaveBeenCalledOnce();
+      expect(parse).toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+    const open = reopened(f);
+    expect(open.store.read(open.ctx)).toEqual(first);
+  });
+  it.each([16, 1024 * 1024])(
+    "rejects an ordinary ghost of %s bytes even with an unchanged cached file identity",
+    (bytes) => {
+      const f = fixture();
+      const first = f.store.mutate(f.ctx, add);
+      f.store.read(f.ctx); // Warm the durability cache before memory diverges.
+      const before = readFileSync(f.file, "utf8");
+      const spy = fault(f.file);
+      expect(() => f.manager.appendMessage({ role: "user", content: "x".repeat(bytes), timestamp: 2 })).toThrow("EIO");
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      const branch = f.manager.getBranch();
+      expect(() => f.store.mutate(f.ctx, { action: "clear", baseRevision: 1 })).toThrow(
+        /uncommitted.*native|uncommitted.*ancestor/i,
+      );
+      expect(f.append).toHaveBeenCalledOnce();
+      expect(f.manager.getBranch()).toEqual(branch);
+      expect(readFileSync(f.file, "utf8")).toBe(before);
+      expect(f.store.read(f.ctx)).toEqual(first);
+      const open = reopened(f);
+      expect(open.store.read(open.ctx)).toEqual(first);
+    },
+  );
   it("recovers durable empty snapshots across native fork/open without adopting an abandoned branch", () => {
     const f = fixture();
     f.store.mutate(f.ctx, add);

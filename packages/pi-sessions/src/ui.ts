@@ -416,6 +416,9 @@ class ReviewEditor implements Component, Focusable {
       // SafeInput has decoded/normalized/sanitized this complete inert paste.
       // Insert expanded text atomically through the public API: native paste
       // markers would require submitValue(), which destroys all Undo history.
+      // A complete EMPTY native paste cancels pending Ctrl+] character-jump
+      // input without inserting text, moving the cursor, or resetting Undo.
+      this.editor.handleInput("\x1b[200~\x1b[201~");
       this.editor.insertTextAtCursor(data.slice("\x1b[200~".length, -"\x1b[201~".length));
       this.surface.tui.requestRender();
       return;

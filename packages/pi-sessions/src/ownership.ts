@@ -34,6 +34,9 @@ export class Owner<Context extends ExtensionContext = ExtensionCommandContext> {
   readonly draft: string | undefined;
   readonly editorFactory;
   committing: "new" | "resume" | undefined;
+  // One delivered preflight belongs to our initiated replacement. Keep the
+  // committing marker separately: shutdown must retain recovery after revocation.
+  expectedSwitch = false;
   target: string | undefined;
   replacementStarted = false;
   replacementApproved = false;

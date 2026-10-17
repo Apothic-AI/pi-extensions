@@ -141,6 +141,36 @@ test("renderer sanitizer only retains inverse/reset and IME marker, keeping the 
 });
 
 for (const mode of ["regular", "fullscreen"] as const) {
+  test.each([false, true])(`${mode} paste cancels pending native character jump; undo=%s`, async (undo) => {
+    const s = await screen(mode, 40, 12);
+    try {
+      const pending = s.ui.editor("Review jump and paste", "abc");
+      void pending.catch(() => {});
+      await s.opened();
+      s.frame();
+      s.key("d"); // Earlier history must survive the paste and both Undo steps.
+      s.key("\x1d"); // Native Ctrl+] waits for one character to jump to.
+      s.key("\x1b[200~X\x1b[201~");
+      s.key("Y");
+      expect(plain(s.frame().join("\n"))).toContain("abcdXY");
+      if (undo) {
+        s.key("\x1f");
+        expect(plain(s.frame().join("\n"))).toContain("abcdX");
+        s.key("\x1f");
+        const restored = plain(s.frame().join("\n"));
+        expect(restored).toContain("abcd");
+        expect(restored).not.toContain("abcdX");
+        s.key("\x1f");
+        const earlier = plain(s.frame().join("\n"));
+        expect(earlier).toContain("abc");
+        expect(earlier).not.toContain("abcd");
+      }
+      s.key("\r");
+      expect(await pending).toBe(undo ? "abc" : "abcdXY");
+    } finally {
+      await s.cleanup();
+    }
+  });
   test(`${mode} approval preserves exact leading/trailing whitespace, including expanded large paste`, async () => {
     const s = await screen(mode, 40, 12);
     try {

@@ -15,6 +15,7 @@ export function isState(entry: SessionEntry): boolean {
 }
 export interface Durability {
   kind: "volatile" | "pending" | "file";
+  /** Complete native records of every type, not just Todo authority. */
   committed: ReadonlySet<string>;
   conversation: boolean;
   incomplete: boolean;
@@ -24,10 +25,21 @@ const CHUNK_BYTES = 32 * 1024;
 function identity(stat: BigIntStats): string {
   return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.mode].join(":");
 }
+function persistedConversation(manager: SessionReader, committed: ReadonlySet<string>): boolean {
+  return manager
+    .getEntries()
+    .some(
+      (entry) =>
+        entry.type === "message" &&
+        (entry.message.role === "user" || entry.message.role === "assistant") &&
+        committed.has(fingerprint(entry)),
+    );
+}
 
 /** Read-only verification of public JSONL records, never a transaction or native rollback.
- * Unchanged file identities reuse the parsed index. Changed files are scanned in bounded
- * chunks/lines; huge unrelated messages are hashed but never buffered or JSON-parsed.
+ * Unchanged file identities reuse only the disk index, never trust new native memory.
+ * Scans buffer bounded lines for parsed comparison. Huge records are stream-hashed
+ * as native canonical JSON with optional terminal CR, not arbitrary JSON whitespace.
  */
 export class Persistence {
   private cache?: {
@@ -71,24 +83,18 @@ export class Persistence {
       ) {
         if (identity(statSync(path, { bigint: true })) !== key)
           throw new Error("Todo unavailable: session file changed during verification.");
-        return cached.result;
+        return { ...cached.result, conversation: persistedConversation(manager, cached.result.committed) };
       }
-      const conversations = new Set(
-        manager
-          .getEntries()
-          .filter((e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"))
-          .map(fingerprint),
-      );
       const committed = new Set<string>();
-      let conversation = false;
       let headerSeen = false;
       let lineBytes = 0;
       let pieces: Buffer[] = [];
       let digest = createHash("sha256");
+      let trailing = Buffer.alloc(0); // Hold one byte across chunks so CRLF hashes exactly like LF.
       const chunk = Buffer.alloc(CHUNK_BYTES);
       const finish = () => {
+        if (trailing[0] !== 13) digest.update(trailing);
         const hash = digest.digest("hex");
-        if (lineBytes > LINE_LIMIT && conversations.has(hash)) conversation = true;
         if (lineBytes <= LINE_LIMIT) {
           const line = Buffer.concat(pieces).toString("utf8");
           let entry: unknown;
@@ -99,25 +105,21 @@ export class Persistence {
           }
           // Native JSONL accepts CRLF and legal JSON whitespace. Compare parsed
           // bounded records as we do headers/state; never parse huge messages.
-          if (entry && conversations.has(fingerprint(entry))) conversation = true;
           if (!headerSeen) {
             if (fingerprint(entry ?? null) !== headerKey)
               throw new Error("Todo unavailable: persisted session header mismatch.");
             headerSeen = true;
-          } else if (
-            entry &&
-            typeof entry === "object" &&
-            "type" in entry &&
-            entry.type === "custom" &&
-            "customType" in entry &&
-            entry.customType === STATE_TYPE
-          ) {
+          } else if (entry && typeof entry === "object") {
             committed.add(fingerprint(entry));
           }
-        } else if (!headerSeen) throw new Error("Todo unavailable: oversized session header.");
+        } else {
+          if (!headerSeen) throw new Error("Todo unavailable: oversized session header.");
+          committed.add(hash);
+        }
         lineBytes = 0;
         pieces = [];
         digest = createHash("sha256");
+        trailing = Buffer.alloc(0);
       };
       if (before.size > BigInt(Number.MAX_SAFE_INTEGER))
         throw new Error("Todo unavailable: session file is too large to verify safely.");
@@ -132,7 +134,11 @@ export class Persistence {
           const newline = chunk.indexOf(10, start);
           const end = newline >= 0 && newline < count ? newline : count;
           const piece = chunk.subarray(start, end);
-          digest.update(piece);
+          if (piece.length) {
+            digest.update(trailing);
+            digest.update(piece.subarray(0, -1));
+            trailing = Buffer.from(piece.subarray(-1));
+          }
           lineBytes += piece.length;
           if (lineBytes <= LINE_LIMIT) pieces.push(Buffer.from(piece));
           else pieces = [];
@@ -143,7 +149,12 @@ export class Persistence {
       if (!headerSeen) throw new Error("Todo unavailable: no complete matching session header.");
       if (identity(fstatSync(fd, { bigint: true })) !== key || identity(statSync(path, { bigint: true })) !== key)
         throw new Error("Todo unavailable: session file changed during verification.");
-      const result: Durability = { kind: "file", committed, conversation, incomplete: lineBytes > 0 };
+      const result: Durability = {
+        kind: "file",
+        committed,
+        conversation: persistedConversation(manager, committed),
+        incomplete: lineBytes > 0,
+      };
       this.cache = { manager, path, identity: key, header: headerKey, result };
       return result;
     } finally {

@@ -21,7 +21,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { type ApprovalEvents, queryApprovalAdapter, queryApprovalService, requiresApprovalAdapter, schemaRequiresApprovalAdapter } from "@signalridge/pi-approval-core";
+import { type ApprovalEvents, captureApprovalService, queryApprovalAdapter, requiresApprovalAdapter, schemaRequiresApprovalAdapter } from "@signalridge/pi-approval-core";
 import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
@@ -939,7 +939,8 @@ export async function runAgent(
   throwIfAborted(options.signal);
   // Capture the ROOT peer synchronously, before discovery or resource allocation.
   // Only absence is optional; malformed/duplicate peers must fail closed here.
-  const approvalService = options.pi.events ? queryApprovalService(options.pi.events) : undefined;
+  const approvalCapture = options.pi.events ? captureApprovalService(options.pi.events) : undefined;
+  const approvalService = approvalCapture?.service;
   const approvalRootOrigin = approvalService ? captureQuestionOrigin(ctx) : undefined;
   if (options.supervisorQuestions === "parent" && !options.parentQuestion) {
     throw new Error('Parent clarification requires a manager-issued background channel. Use Agent with run_in_background: true and supervisor_questions: "parent".');
@@ -1565,13 +1566,19 @@ export async function runAgent(
   // Reviewed replacements are SDK tools, not inherited extension permissions.
   // Admit only canonical names already allowed by the child policy.
   let approvalSession: AgentSession | undefined;
-  const reviewedTools = approvalService && approvalRootOrigin && toolNames.some(name => ["edit", "write", "bash"].includes(name) && !disallowedSet?.has(name))
+  // SDK winner metadata alone misses a losing late extension registration.
+  // Inspect live public maps at bind, admission and every execute guard.
+  const hasCanonicalConflict = (name: string): boolean =>
+    loader.getExtensions().extensions.some(extension => extension.tools.has(name));
+  const reviewedTools = approvalCapture && approvalService && approvalRootOrigin && toolNames.some(name => ["edit", "write", "bash"].includes(name) && !disallowedSet?.has(name))
     ? createChildApprovalTools({
         service: approvalService, root: ctx, rootOrigin: approvalRootOrigin, agentId: options.agentId, settings: settingsManager,
+        assertServiceCurrent: approvalCapture.assertCurrent,
+        isToolCurrent: (name) => approvalSession?.getActiveToolNames().includes(name) === true,
         waiting: (id) => approvalSession ? approvalTimers.get(approvalSession)?.pauseHuman(id) ?? (() => {}) : () => {},
         isBound: (): boolean => {
           const tools = approvalSession?.getAllTools();
-          return [...reviewedNames].every(name => tools?.find(tool => tool.name === name)?.sourceInfo.path === `<sdk:${name}>`);
+          return [...reviewedNames].every(name => !hasCanonicalConflict(name) && tools?.find(tool => tool.name === name)?.sourceInfo.path === `<sdk:${name}>`);
         },
       }).filter(tool => toolNames.includes(tool.name) && !disallowedSet?.has(tool.name))
     : [];
@@ -1720,7 +1727,12 @@ export async function runAgent(
     const captured = session.getAllTools().find(tool => tool.name === name);
     const requiresSchema = !!approvalService && !!captured && schemaRequiresApprovalAdapter(captured.parameters);
     return () => {
-      if (!approvalService || reviewedNames.has(name)) return undefined;
+      if (!approvalService) return undefined;
+      if (reviewedNames.has(name)) {
+        if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)
+          return { block: true, reason: `Approval-required tool "${name}" was shadowed; remove the conflicting child extension.` };
+        return undefined;
+      }
       const effective = session.getAllTools().find(tool => tool.name === name);
       if (requiresApprovalAdapter(input) || requiresSchema) {
         try {
@@ -1741,7 +1753,7 @@ export async function runAgent(
       if (inScope && !inScope().has(name)) {
         return { block: true, reason: `Tool "${name}" is not available to this subagent.` };
       }
-      if (reviewedNames.has(name) && session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`) {
+      if (reviewedNames.has(name) && (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)) {
         return { block: true, reason: `Approval-required tool "${name}" was shadowed; only its reviewed SDK binding may execute.` };
       }
       const denied = admission();
@@ -1777,7 +1789,7 @@ export async function runAgent(
   });
   throwIfAborted(options.signal);
   for (const name of reviewedNames) {
-    if (session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`) {
+    if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`) {
       throw new Error(`Approval-required tool "${name}" was shadowed; remove the conflicting child extension.`);
     }
   }

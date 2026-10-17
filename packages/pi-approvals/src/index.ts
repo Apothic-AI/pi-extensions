@@ -3,11 +3,11 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolInfo } from "@
 import {
   APPROVAL_QUERY_CHANNEL,
   type ApprovalService,
+  captureApprovalService,
   createApprovalBashOperations,
   createApprovalToolDefinitions,
   hashBytes,
   queryApprovalAdapter,
-  queryApprovalService,
   requiresApprovalAdapter,
   schemaRequiresApprovalAdapter,
   validateQuery,
@@ -104,20 +104,29 @@ export default function approvals(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     const settings = pi.getSettings();
     const marker = `[Approval binding ${next.service.id}]`;
+    // Discovery calls broker.isLive: capture only AFTER synchronous bindings
+    // are complete, or bindingFailed would permanently retire the new broker.
+    let captured: ReturnType<typeof captureApprovalService>;
     const [edit, write, bash] = createApprovalToolDefinitions({
       source: "root",
       request: (operation, options) => {
-        const service = queryApprovalService(pi.events);
-        if (!service || service.id !== next.service.id) throw new Error("Approval service unavailable");
-        return service.request(operation, options);
+        if (!captured || captured.service.id !== next.service.id) throw new Error("Approval service unavailable");
+        return captured.service.request(operation, options);
       },
-      isCurrent: (callCtx) =>
-        broker === next &&
-        callCtx.hasUI &&
-        (callCtx.mode === "tui" || callCtx.mode === "rpc") &&
-        callCtx.sessionManager === ctx.sessionManager &&
-        callCtx.sessionManager.getSessionId() === sessionId &&
-        isBound(),
+      isCurrent: (callCtx) => {
+        if (!captured) return false;
+        captured.assertCurrent();
+        return (
+          broker === next &&
+          next.isLive &&
+          callCtx.hasUI &&
+          (callCtx.mode === "tui" || callCtx.mode === "rpc") &&
+          callCtx.sessionManager === ctx.sessionManager &&
+          callCtx.sessionManager.getSessionId() === sessionId &&
+          isBound()
+        );
+      },
+      isToolCurrent: (_ctx, name) => isBound(name) && pi.getActiveTools().includes(name),
       shellPath: settings.shellPath,
       commandPrefix: settings.shellCommandPrefix,
     });
@@ -139,6 +148,7 @@ export default function approvals(pi: ExtensionAPI): void {
     bindings = pi.getAllTools().filter((tool) => admitted.some((name) => name === tool.name));
     bindingFailed = bindings.length !== admitted.length || !bindings.every((tool) => tool.description.includes(marker));
     rootReason = bindingFailed ? "Approvals lost canonical tool ownership (extension collision/load order)" : "";
+    if (!bindingFailed) captured = captureApprovalService(pi.events);
   };
   pi.on("session_start", (_event, ctx) => bind(ctx));
   pi.on("session_tree", (_event, ctx) => bind(ctx));
@@ -170,16 +180,26 @@ export default function approvals(pi: ExtensionAPI): void {
   pi.on("user_bash", (event, ctx) => {
     const owner = broker;
     if (rootReason || !owner || !isBound()) throw new Error(rootReason || "Approvals unavailable for user bash");
-    const captured = queryApprovalService(pi.events);
-    if (!captured || captured.id !== owner.service.id) throw new Error("Approval service unavailable for user bash");
+    const captured = captureApprovalService(pi.events);
+    if (!captured || captured.service.id !== owner.service.id)
+      throw new Error("Approval service unavailable for user bash");
     const settings = pi.getSettings();
     return {
       operations: createApprovalBashOperations({
         source: "user-bash",
         toolCallId: randomUUID(),
         inputHash: hashBytes(JSON.stringify({ command: event.command, cwd: event.cwd })),
-        request: (operation, options) => captured.request(operation, options),
-        isCurrent: () => broker === owner && ctx.sessionManager === getContext().sessionManager && isBound(),
+        request: (operation, options) => captured.service.request(operation, options),
+        isCurrent: () => {
+          captured.assertCurrent();
+          return (
+            broker === owner &&
+            owner.isLive &&
+            ctx.sessionManager === getContext().sessionManager &&
+            isBound("bash") &&
+            pi.getActiveTools().includes("bash")
+          );
+        },
         shellPath: settings.shellPath,
       }),
     };
