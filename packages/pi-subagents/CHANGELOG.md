@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.14.0
+### Minor Changes
+
+- 0ec64d1: Gate admitted child edit, write, and bash operations through a synchronously captured root human approval service. Preserve tool admission and legacy ask-tools policy, reject canonical shadowing and duplicate child approval resources, retain ownership across resume, and exclude human review time without resetting execution budgets. Managed protocol and journal formats remain v4.
+
+### Patch Changes
+
+- 74b65a5: Bound edit call rendering without IO or diff work; retain captured service liveness and exact-name admission through post-approval IO; reject live child canonical conflicts even when SDK metadata still wins. Replace delegated bash dispatch with an owned POSIX backend guarded after CWD preparation, preserving the SDK output layer while owning process-group/IPC cleanup. Preserve native editor paste/cursor/Undo state with an admitted non-capturing UI bridge, and hide unfocused reviews so foreign native questions remain visible and answerable.
+  
+  Refuse Bun/compiled application and unknown interpreter capabilities before approval or subprocess startup instead of executing the host application as a supervisor. Use lossless hard wrapping, whole-grapheme and native-normalized Thai/Lao escaping, and explicit compact-preview whitespace/backslashes so spacing marks and distinct commands remain inspectable through actual terminal output.
+- 0925139: Bound synchronous file-review diff work before generation, capture bash execution options and environments, require exact per-name canonical review bindings, and close owned review overlays by identity. Recheck cooperative adapter admission after child tool-call normalizers and carry the same captured approval-service and branch-owner guard through background startup to command dispatch. Preserve existing v1 approval and v4 managed contracts; document review limits and trusted-extension boundaries.
+- Updated dependencies [74b65a5]
+- Updated dependencies [0ec64d1]
+- Updated dependencies [0925139]
+  - @signalridge/pi-approval-core@1.3.0
+
 ## 1.13.0
 ### Minor Changes
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0
+### Minor Changes
+
+- 0ec64d1: Gate background shell and command-form monitor launches through a captured human approval service when present. Revalidate and freeze final execution inputs, retain exact session ownership across approval waits, and advertise schema-bound cooperative approval support. Existing-job monitors and inspection/control tools remain ungated.
+- 0ec64d1: Add a Ctrl+Alt+B native-editor shortcut to the existing owned background task selector, with a compact keyboard-entry hint in retained-job status. Commands and shortcuts share the same guarded task UI, stop/cancel behavior, and retirement cleanup; focused dialogs and existing viewers retain input ownership.
+
+### Patch Changes
+
+- 0925139: Bound synchronous file-review diff work before generation, capture bash execution options and environments, require exact per-name canonical review bindings, and close owned review overlays by identity. Recheck cooperative adapter admission after child tool-call normalizers and carry the same captured approval-service and branch-owner guard through background startup to command dispatch. Preserve existing v1 approval and v4 managed contracts; document review limits and trusted-extension boundaries.
+- Updated dependencies [74b65a5]
+- Updated dependencies [0ec64d1]
+- Updated dependencies [0925139]
+  - @signalridge/pi-approval-core@1.3.0
+
 ## 1.4.0
 ### Minor Changes
 

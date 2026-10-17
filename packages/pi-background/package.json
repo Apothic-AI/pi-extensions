@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-background",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Session-owned background shell jobs and low-noise, event-driven log monitors for Pi.",
   "type": "module",
   "license": "MIT",
@@ -34,7 +34,7 @@
     "test": "vitest run test --config vitest.config.ts"
   },
   "dependencies": {
-    "@signalridge/pi-approval-core": "^1.2.0"
+    "@signalridge/pi-approval-core": "^1.3.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
