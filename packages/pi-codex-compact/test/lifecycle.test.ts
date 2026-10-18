@@ -25,6 +25,7 @@ import {
   checkpointMarker,
   createCheckpointDetails,
   fallbackSummary,
+  fallbackSummaryVariants,
   fingerprintMessage,
   parseCheckpointDetails,
 } from "../src/checkpoint.js";
@@ -288,13 +289,78 @@ test("effective checkpoint selection recovers remote -> native -> remote and fai
       );
       assert.ok(projected, "new remote checkpoint replays after native fallback");
     } else {
-      assert.equal(result, undefined, scenario);
+      assert.deepEqual(result, { cancel: true }, scenario);
       assert.equal(requests, 0, scenario);
-      assert.match(notifications.at(-1)?.message ?? "", /using Pi compaction/);
+      assert.match(notifications.at(-1)?.message ?? "", /cancelled to preserve the existing opaque checkpoint/);
     }
     assert.equal(statuses.get("codex-compact"), undefined);
   }
 });
+
+for (const [label, summary, opaque] of [
+  [
+    "readable native prefix",
+    "OpenAI Codex Remote Compaction V2 checkpoint handling is implemented; keep the tests.",
+    false,
+  ],
+  ...fallbackSummaryVariants("checkpoint-missing-details").map(
+    (summary, index) => [`missing details scope ${index}`, summary, true] as const,
+  ),
+] as const) {
+  for (const fails of [false, true]) {
+    test(`compaction recognizes complete opaque markers: ${label}, remote failure ${fails}`, async () => {
+      const session = SessionManager.inMemory();
+      session.appendMessage({ role: "user", content: "Older context", timestamp: 1 });
+      const keptId = session.appendMessage({ role: "user", content: "Kept context", timestamp: 2 });
+      session.appendCompaction(summary, keptId, 123);
+      const afterId = session.appendMessage({ role: "user", content: "Continue", timestamp: 3 });
+      const originalBranch = session.getBranch();
+      const mock = createMockPi();
+      let requests = 0;
+      createCodexCompactExtension({
+        settingsRuntime: settingsRuntime({ notifyOnFallback: false }),
+        fetch: async () => {
+          requests++;
+          return sseResponse();
+        },
+      })(mock.pi);
+      const { ctx, notifications } = createMockContext({
+        model,
+        hasUI: true,
+        getSystemPrompt: () => "",
+        sessionManager: session,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => {
+            if (fails) throw new Error("secret-auth-canary");
+            return { ok: true, apiKey: "fake-test-key" };
+          },
+          getProvider: () => fakeProvider(),
+        },
+      });
+      const result = await mock.events.get("session_before_compact")?.[0](
+        {
+          ...event(),
+          branchEntries: originalBranch,
+          preparation: { ...event().preparation, firstKeptEntryId: afterId },
+        },
+        ctx,
+      );
+      if (opaque) {
+        assert.deepEqual(result, { cancel: true });
+        assert.equal(requests, 0);
+        assert.match(notifications.at(-1)?.message ?? "", /cancelled to preserve the existing opaque checkpoint/);
+      } else if (fails) {
+        assert.equal(result, undefined, "readable native summaries still permit authorized fallback");
+        assert.deepEqual(notifications, [], "notifyOnFallback remains authoritative for actual fallback");
+      } else {
+        assert.ok((result as { compaction?: unknown })?.compaction, "a shared prefix is not an opaque marker");
+        assert.equal(requests, 1);
+      }
+      assert.doesNotMatch(JSON.stringify(notifications), /secret-auth-canary/);
+      assert.deepEqual(session.getBranch(), originalBranch);
+    });
+  }
+}
 
 test("real Codex HTTP errors cannot echo credentials into fallback warnings or checkpoints", async () => {
   const session = SessionManager.inMemory();

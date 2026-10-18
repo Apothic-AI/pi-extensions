@@ -18,6 +18,7 @@ import {
 } from "./agent-types.js";
 import { INHERIT_CONTEXT_UNAVAILABLE } from "./context-boundary.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { INTERNAL_RESUME_BUDGET_POLICY, type ResumeBudgetPolicy } from "./internal-run.js";
 import { resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
@@ -92,7 +93,7 @@ export interface NestedAgentManager {
   ): Promise<{ id: string; record: AgentRecord }>;
   /** Internal live lookup used only by the scoped manager runtime. */
   getRecordMutable(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number; readonly [INTERNAL_RESUME_BUDGET_POLICY]?: ResumeBudgetPolicy }): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -194,7 +195,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (signal?.aborted) {
           return textResult("Resume aborted.", true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        const config = getAgentConfigIn(loadRegistry(), existing.type);
+        const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: params.max_turns,
+          [INTERNAL_RESUME_BUDGET_POLICY]: { maxTurns: config?.maxTurns },
+        });
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);

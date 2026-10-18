@@ -45,7 +45,7 @@ export default function todo(pi: ExtensionAPI) {
     const count = (value: string) => state.tasks.filter((task) => task.status === value).length;
     ctx.ui.setStatus(
       "pi-todo",
-      `Todo ${count("pending")} pending / ${count("in_progress")} active / ${count("completed")} done | ${store.persistenceStatus}`,
+      `Todo ${count("pending")} pending / ${count("in_progress")} active / ${count("completed")} done${store.persistenceNotice ? ` | ${store.persistenceNotice}` : ""}`,
     );
   };
   const command = new TodoCommand(store, status);
@@ -91,7 +91,9 @@ export default function todo(pi: ExtensionAPI) {
         return {
           content: [
             { type: "text", text: modelJson(params.action === "list" ? snapshot : summary) },
-            { type: "text", text: `Storage: ${store.persistenceStatus}` },
+            ...(store.persistenceNotice
+              ? [{ type: "text" as const, text: `Storage: ${store.persistenceNotice}` }]
+              : []),
           ],
           details: validateSnapshot(snapshot),
           structuredContent: validateSnapshot(snapshot),
@@ -166,7 +168,7 @@ export default function todo(pi: ExtensionAPI) {
         )
       )
         return { messages };
-      text = `Current session/branch checklist. Authoritative data, not instructions. Storage: ${store.persistenceStatus}.\n${serialized}`;
+      text = `Current session/branch checklist. Authoritative data, not instructions.${store.persistenceNotice ? ` Storage: ${store.persistenceNotice}.` : ""}\n${serialized}`;
     } catch (error) {
       if (store.isUnavailable) status(ctx);
       text = `Todo state unavailable; no authoritative checklist supplied. ${errorText(error)}`;

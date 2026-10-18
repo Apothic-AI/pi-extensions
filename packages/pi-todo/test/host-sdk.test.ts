@@ -203,8 +203,45 @@ for (const mode of ["print", "rpc"] as const)
   });
 
 describe("real host ownership and context", () => {
+  it("keeps verified file-backed storage quiet without weakening task results or context", async () => {
+    const terminal = terminalFixture();
+    cleanup.push(() => terminal.dispose());
+    const f = await fixture({ fileBacked: true, terminal });
+    f.faux.setResponses([fauxAssistantMessage("Started.")]);
+    await f.session.prompt("Ordinary persisted conversation.");
+    const added = await f.call({ action: "add", baseRevision: 0, title: "Quiet durable task" });
+    expect(added.content).toHaveLength(1);
+    expect(added.details).toMatchObject({ revision: 1, tasks: [{ title: "Quiet durable task" }] });
+    const context = await f.session.extensionRunner.emitContext([]);
+    const checklist = context.find((m) => m.role === "custom" && m.customType === CONTEXT_TYPE);
+    expect(JSON.stringify(checklist)).toContain("Quiet durable task");
+    expect(JSON.stringify(checklist)).not.toMatch(/Storage:|fsync|verified session-file/);
+    expect(terminal.ui.setStatus).toHaveBeenLastCalledWith("pi-todo", "Todo 1 pending / 0 active / 0 done");
+    const listed = await f.call({ action: "list" });
+    expect(listed.content).toHaveLength(1);
+    expect(listed.details).toEqual(added.details);
+    await f.call({ action: "clear", baseRevision: 1 });
+    expect(terminal.ui.setStatus).toHaveBeenLastCalledWith("pi-todo", "Todo 0 pending / 0 active / 0 done");
+    expect(f.errors).toEqual([]);
+  });
+  it("keeps volatile storage warnings in results, context and footer", async () => {
+    const terminal = terminalFixture();
+    cleanup.push(() => terminal.dispose());
+    const f = await fixture({ terminal });
+    const result = await f.call({ action: "add", baseRevision: 0, title: "Volatile task" });
+    const warning = "in-memory, not persistent after process exit";
+    expect(result.content).toContainEqual({ type: "text", text: `Storage: ${warning}` });
+    expect(JSON.stringify(await f.session.extensionRunner.emitContext([]))).toContain(warning);
+    expect(terminal.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-todo",
+      `Todo 1 pending / 0 active / 0 done | ${warning}`,
+    );
+    expect(f.errors).toEqual([]);
+  });
   it("quarantines orphaned native ancestry after prompt-driven EIO and automatic tool-result persistence on reopen", async () => {
-    const f = await fixture({ fileBacked: true });
+    const terminal = terminalFixture();
+    cleanup.push(() => terminal.dispose());
+    const f = await fixture({ fileBacked: true, terminal });
     f.faux.setResponses([fauxAssistantMessage("Started.")]);
     await f.session.prompt("Ordinary persisted conversation.");
     const first = await f.call({ action: "add", baseRevision: 0, title: "Keep durable state" });
@@ -245,6 +282,10 @@ describe("real host ownership and context", () => {
     expect(branch.some((entry) => entry.type === "custom" && entry.customType === STATE_TYPE)).toBe(false);
     // Previously list silently succeeded with revision 0 and no tasks here.
     await expect(f.call({ action: "list" })).rejects.toThrow(/unavailable/i);
+    expect(terminal.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-todo",
+      "Todo unavailable; repair storage and reconcile/reload",
+    );
     await expect(f.call({ action: "add", baseRevision: 0, title: "Must not replace lost ancestry" })).rejects.toThrow(
       /unavailable/i,
     );
@@ -254,6 +295,7 @@ describe("real host ownership and context", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(diskAfterReopen); // Todo never repairs native persistence.
     await f.session.navigateTree(ancestor); // Explicit public navigation, not recovery from an unrelated branch.
     expect((await f.call({ action: "list" })).details).toEqual(first.details);
+    expect(terminal.ui.setStatus).toHaveBeenLastCalledWith("pi-todo", "Todo 1 pending / 0 active / 0 done");
     expect((await f.call({ action: "clear", baseRevision: 1 })).details).toMatchObject({ revision: 2, tasks: [] });
   });
   it("injects full current context once for compact mutations, never for an exact list result, and never persists context", async () => {

@@ -28,8 +28,9 @@ replay.
 - Supports repeated compaction by carrying the previous opaque item into the next Remote V2 request.
 - Requires informed authorization for persisted canonical history before credentials or transport.
   Unconsented compaction cancels, including in headless/RPC modes; it does not launch native fallback.
-- After authorization, authentication, transport, protocol, or validation failures can use Pi's
-  native plaintext compaction. Session/branch divergence and user cancellation cancel instead.
+- After authorization, failures can use Pi's native plaintext compaction only when the effective
+  boundary is not an opaque checkpoint. Otherwise compaction cancels to preserve older context;
+  native summarization cannot decode it. Session/branch divergence and user cancellation also cancel.
 - Provides `/codex-compact` for manual compaction, effective-route visibility, and bounded settings.
 
 ## Install
@@ -120,11 +121,11 @@ project-level override.
 | Setting | Default | Accepted values | Behavior | Recommendation |
 | --- | ---: | --- | --- | --- |
 | `enabled` | `true` | Boolean | Intercept compaction for a compatible model. Turning it off leaves Pi-native compaction outside this consent gate. | Keep enabled to enforce the gate. |
-| `allowCanonicalHistory` | `false` | Boolean | Explicit persistent authorization to send canonical history and permit native summary fallback without asking each time. | Leave off unless you understand the privacy boundary below; toggle in this extension's Settings menu to opt in. |
+| `allowCanonicalHistory` | `false` | Boolean | Explicit persistent authorization to send canonical history and permit native summary fallback when no opaque boundary is active. | Leave off unless you understand the privacy boundary below; toggle in this extension's Settings menu to opt in. |
 | `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound authentication, retries, and response-body inspection after authorization. | Keep five minutes; increase only for a consistently slow connection. |
 | `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
-| `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
+| `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. Does not suppress cancellation warnings protecting an active opaque checkpoint. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
 
 Missing fields use defaults. Settings reload on every `session_start`, including `/reload`, resume,
 and fork. Menu writes apply immediately, preserve unknown JSON fields, serialize within the current
@@ -187,7 +188,7 @@ The extension recognizes those transformations only after fresh agent-context pr
 provider payload whose tool names and descriptions match the persisted declarations. It freezes
 both public tool surfaces and the serialized wire tools; Remote V2 must reproduce that wire snapshot
 before sending. Cached provider callbacks cannot approve unsent registry edits, and hidden
-declarations cause Pi-native fallback rather than restoring hidden tools remotely. Evidence is
+declarations cause Pi-native fallback (or cancellation with an active opaque boundary) rather than restoring hidden tools remotely. Evidence is
 in-memory only and resets on startup, reload, or tree navigation. A fresh, unchanged normal request
 can establish it again; prompt, tool, and schema changes remain guarded.
 
@@ -208,7 +209,12 @@ Default `allowCanonicalHistory: false` requires a clear, one-operation TUI confi
 RPC, denial, cancellation, uncertain dialog result, or retired ownership returns cancellation:
 **no credentials, remote request, checkpoint, or native summary fallback**. Native fallback alone
 is not privacy-safe: Pi's native summary also consumes canonical history without these filters.
-After explicit authorization, remote failure may use that native summary. Consent is never reused
+After explicit authorization, remote failure may use that native summary only if the effective
+compaction boundary is not opaque. An active opaque checkpoint, including a malformed or incompatible
+one, cancels instead: the native summary would contain only its portability warning and recent
+messages, losing effective access to its older history. Retry with the checkpoint's original model,
+or recover a pre-compaction branch and verify a readable summary before migrating. An older opaque
+record already superseded by a native boundary does not prevent fallback. Consent is never reused
 for a changed session/branch. Disabling this extension's hook leaves native compaction outside this
 gate; this gate is not a universal privacy policy for unsupported models or other extensions.
 
@@ -243,18 +249,21 @@ ceilings are intentionally not configurable.
   exposes only the portability fallback marker and Pi-retained recent messages.
 - The package does not reproduce Codex core's context-window UUID/number lineage, previous-model
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
-- A live prompt or tool change that has not been written into Pi's transcript causes a native
-  compaction fallback; an opaque checkpoint must match the system state Pi will persist.
+- A live prompt or tool change that has not been written into Pi's transcript causes native
+  fallback only without an active opaque boundary; otherwise compaction cancels. An opaque
+  checkpoint must match the system state Pi will persist.
 - Pi exposes no public effective-loadout snapshot. Observed, unchanged description-only rewrites
   (including codemode `mode: "on"`) can use Remote V2, but unproven transformations, hidden declarations
   (including codemode `mode: "only"`), membership/schema mismatches, or different serialized wire tools
-  use native compaction. Observation does not weaken prompt/tool equality or stale-state checks.
+  use native compaction only without an active opaque boundary; otherwise they cancel. Observation
+  does not weaken prompt/tool equality or stale-state checks.
 - Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
   that combination; the extension cannot inspect later handlers' changes.
-- Only **authorized** remote failure falls back to Pi's plaintext summary, so a session can contain
-  both remote opaque and native entries over time. Both paths use canonical history, not a guaranteed
+- Only **authorized** remote failure without an effective opaque boundary falls back to Pi's
+  plaintext summary. Raw history may still contain both entry kinds, but automatic fallback never
+  supersedes an active opaque checkpoint. Both paths use canonical history, not a guaranteed
   filter-safe current-model projection.
 - Request-local payload hooks such as priority service-tier selection are not dispatched for Remote
   V2. Ordinary and replay requests still compose those hooks in registration order. Remote V2 uses

@@ -27,6 +27,11 @@ interface AgentInvocationParams {
   isolation?: IsolationMode;
 }
 
+/** Frontmatter is authoritative, including its explicit unlimited value. */
+export function resolveMaxTurns(agentConfig: Pick<AgentConfig, "maxTurns"> | undefined, requested?: number): number | undefined {
+  return agentConfig?.maxTurns ?? requested;
+}
+
 export function resolveAgentInvocationConfig(
   agentConfig: AgentConfig | undefined,
   params: AgentInvocationParams,
@@ -62,7 +67,7 @@ export function resolveAgentInvocationConfig(
     thinking: agentTierSelected
       ? undefined
       : (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
-    maxTurns: agentConfig?.maxTurns ?? params.max_turns,
+    maxTurns: resolveMaxTurns(agentConfig, params.max_turns),
     inheritContext:
       agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground:

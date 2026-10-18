@@ -85,6 +85,7 @@ async function fixture(
   });
   const requests: Array<{ url: string; payload: JsonObject; headers: Headers }> = [];
   let remoteFailed = false;
+  let forceRemoteFailure = false;
   let menuClosed = false;
   const fetch: typeof globalThis.fetch = async (url, init) => {
     const body = init?.body;
@@ -94,7 +95,7 @@ async function fixture(
     ) as JsonObject;
     requests.push({ url: String(url), payload, headers: new Headers(init?.headers) });
     const compact = payload.input.some((item: JsonObject) => item.type === "compaction_trigger");
-    if (compact && (policy === "fallback" || policy === "manual-failure")) {
+    if (compact && (forceRemoteFailure || policy === "fallback" || policy === "manual-failure")) {
       if (policy === "manual-failure") assert.equal(menuClosed, true, "manual menu closes before remote dispatch");
       remoteFailed = true;
       return new Response('{"error":{"message":"Offline failure"}}', { status: 400 });
@@ -209,6 +210,9 @@ async function fixture(
       manager,
       requests,
       compactSettings,
+      failRemote: () => {
+        forceRemoteFailure = true;
+      },
       notifications: mock.notifications,
       menuClosed: () => menuClosed,
       filterCalls: () => filterCalls,
@@ -303,6 +307,32 @@ for (const policy of ["deny", "decline", "once", "native", "fallback"] as const)
         }
       }
       assert.equal(f.filterCalls(), calls, "native and remote compaction bypass ordinary filters");
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+for (const notifyOnFallback of [true, false]) {
+  test(`SDK remote failure preserves an effective opaque checkpoint (fallback notices ${notifyOnFallback})`, async () => {
+    const f = await fixture("context", false, "persistent");
+    try {
+      await f.session.prompt("Public task");
+      const first = await f.session.compact();
+      assert.ok(parseCheckpointDetails(first.details));
+      await f.session.prompt("Continue after the remote checkpoint.");
+      await f.compactSettings.update({ notifyOnFallback });
+      const before = f.manager.getBranch();
+      const requests = f.requests.length;
+      f.failRemote();
+      await assert.rejects(f.session.compact(), /cancel/i);
+      assert.equal(f.requests.length, requests + 1, "remote failure must not dispatch native summarization");
+      assert.deepEqual(f.manager.getBranch(), before, "cancellation preserves the effective checkpoint and branch");
+      const latest = before.filter((entry) => entry.type === "compaction").at(-1);
+      assert.ok(latest?.type === "compaction" && parseCheckpointDetails(latest.details));
+      await f.session.prompt("Continue after the cancelled compaction.");
+      assert.match(JSON.stringify(f.requests.at(-1)?.payload), /encrypted_content/);
+      assert.match(JSON.stringify(f.requests.at(-1)?.payload), /PRIVATE_CANARY/);
     } finally {
       f.cleanup();
     }

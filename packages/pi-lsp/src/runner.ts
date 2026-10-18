@@ -1,4 +1,17 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fstatSync,
+  ftruncateSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -96,10 +109,13 @@ export async function runFix(
 ) {
   const root = resolveRoot(params.root);
   const file = resolveSupportedFile(adapter, root, params.path);
+  const rootStat = statSync(root);
+  const workspace = { root: realpathSync(root), dev: rootStat.dev, ino: rootStat.ino };
   // Namespace lookup keeps loading compatible with hosts predating the public queue.
   const queue = (piHost as { withFileMutationQueue?: <T>(file: string, run: () => Promise<T>) => Promise<T> })
     .withFileMutationQueue;
-  const run = () => runFixWindow(adapter, { ...params, root, path: file }, timeoutMs, signal, ctx, statusKey);
+  const run = () =>
+    runFixWindow(adapter, { ...params, root, path: file }, timeoutMs, signal, ctx, statusKey, workspace);
   return params.write && queue ? queue(file, run) : run();
 }
 
@@ -110,11 +126,13 @@ async function runFixWindow(
   signal: AbortSignal | undefined,
   ctx: StatusContext,
   statusKey: string,
+  workspace: FixWorkspace,
 ) {
   const root = params.root;
   const file = params.path;
   const actionKind = params.kind?.trim() || "source.fixAll";
 
+  assertFixWorkspace(adapter, root, workspace, file);
   throwIfAborted(signal, adapter);
   const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
   const abort = () => client.close();
@@ -130,7 +148,17 @@ async function runFixWindow(
     await client.initialize(root);
     throwIfAborted(signal, adapter);
     const uri = pathToFileURL(file).href;
-    const text = readFileSync(file, "utf8");
+    assertFixWorkspace(adapter, root, workspace, file);
+    const fd = openSync(file, "r");
+    let original: FixSnapshot;
+    try {
+      original = readFixSnapshot(fd, file);
+    } finally {
+      closeSync(fd);
+    }
+    assertFixWorkspace(adapter, root, workspace, file);
+    if (!sameFile(original, statSync(file))) throw staleFixError(file);
+    const text = original.bytes.toString("utf8");
     client.didOpen(uri, text, adapter.languageIdFor(file));
     let resolvedActions: CodeAction[];
     let selectedActions: CodeAction[];
@@ -156,7 +184,7 @@ async function runFixWindow(
     const changed = newText !== text;
 
     throwIfAborted(signal, adapter);
-    if (params.write && changed) writeFileSync(file, newText);
+    if (params.write && changed) writeFreshFix(adapter, root, workspace, file, original, newText);
 
     return textResult(formatEditSummary(adapter, "fix", root, file, changed, params.write, newText), {
       path: path.relative(root, file) || file,
@@ -181,6 +209,77 @@ async function runFixWindow(
       releaseWhenClosed();
       finishStatus?.();
     }
+  }
+}
+
+interface FixWorkspace {
+  root: string;
+  dev: number;
+  ino: number;
+}
+
+interface FixSnapshot {
+  dev: number;
+  ino: number;
+  bytes: Buffer;
+}
+
+function sameFile(left: { dev: number; ino: number }, right: { dev: number; ino: number }) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function staleFixError(file: string) {
+  return new Error(`File changed while computing LSP fixes; left unchanged: ${file}. Retry the fix.`);
+}
+
+function readFixSnapshot(fd: number, file: string): FixSnapshot {
+  const before = fstatSync(fd);
+  if (!before.isFile()) throw staleFixError(file);
+  const bytes = readFileSync(fd);
+  const after = fstatSync(fd);
+  if (
+    !after.isFile() ||
+    !sameFile(before, after) ||
+    before.size !== after.size ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs ||
+    bytes.length !== after.size
+  )
+    throw staleFixError(file);
+  return { dev: after.dev, ino: after.ino, bytes };
+}
+
+function assertFixWorkspace(adapter: LspServerAdapter, root: string, workspace: FixWorkspace, file: string) {
+  if (realpathSync(root) !== workspace.root || !sameFile(workspace, statSync(root))) throw staleFixError(file);
+  // Containment is relative to the captured boundary, never a retargeted root.
+  resolveSupportedFile(adapter, workspace.root, file);
+}
+
+function writeFreshFix(
+  adapter: LspServerAdapter,
+  root: string,
+  workspace: FixWorkspace,
+  file: string,
+  original: FixSnapshot,
+  text: string,
+) {
+  assertFixWorkspace(adapter, root, workspace, file);
+  // Open without truncation, then validate both the descriptor and its live
+  // workspace path. Write through this descriptor, not a newly followed link.
+  const fd = openSync(file, "r+");
+  try {
+    const current = readFixSnapshot(fd, file);
+    assertFixWorkspace(adapter, root, workspace, file);
+    if (!sameFile(original, current) || !sameFile(current, statSync(file)) || !original.bytes.equals(current.bytes))
+      throw staleFixError(file);
+    const bytes = Buffer.from(text, "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      offset += writeSync(fd, bytes, offset, bytes.length - offset, offset);
+    }
+    ftruncateSync(fd, bytes.length);
+  } finally {
+    closeSync(fd);
   }
 }
 

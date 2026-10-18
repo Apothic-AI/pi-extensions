@@ -64,6 +64,7 @@ import {
   type ManagedSpawnRequest,
   type ManagedSpawnResult,
   type ManagedSpawnTombstone,
+  type SpawnOptions,
 } from "./agent-manager.js";
 import {
   getAgentConversation,
@@ -327,7 +328,7 @@ function snapshotOwner(owner: AgentOwner | undefined): AgentOwner | undefined {
  * Create an AgentActivity state and spawn callbacks for tracking tool usage.
  * Used by both foreground and background paths to avoid duplication.
  */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
+function buildActivityTracker(maxTurns: number | undefined, onStreamUpdate: (() => void) | undefined, isCurrent: () => boolean) {
   const state: AgentActivity = {
     activeTools: new Map(),
     toolUses: 0,
@@ -340,6 +341,7 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 
   const callbacks = {
     onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
+      if (!isCurrent()) return;
       if (activity.type === "start") {
         state.activeTools.set(
           activity.toolName + "_" + Date.now(),
@@ -357,14 +359,17 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       onStreamUpdate?.();
     },
     onTextDelta: (_delta: string, fullText: string) => {
+      if (!isCurrent()) return;
       state.responseText = fullText;
       onStreamUpdate?.();
     },
     onTurnEnd: (turnCount: number) => {
+      if (!isCurrent()) return;
       state.turnCount = turnCount;
       onStreamUpdate?.();
     },
     onSessionCreated: (session: any) => {
+      if (!isCurrent()) return;
       state.session = session;
     },
     onAssistantUsage: (usage: {
@@ -372,6 +377,7 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       output: number;
       cacheWrite: number;
     }) => {
+      if (!isCurrent()) return;
       addUsage(state.lifetimeUsage, usage);
       onStreamUpdate?.();
     },
@@ -695,17 +701,52 @@ function activateRootRuntime(
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  let notificationsRetired = false;
+  const invocationUiRetirements = new Set<() => void>();
+  const activityRetirements = new WeakMap<AgentActivity, () => void>();
+
+  function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
+    let retired = notificationsRetired;
+    const timers = new Set<ReturnType<typeof setInterval>>();
+    const isCurrent = () => !retired && !notificationsRetired;
+    const retire = () => {
+      retired = true;
+      for (const timer of timers) clearInterval(timer);
+      timers.clear();
+      invocationUiRetirements.delete(retire);
+    };
+    const tracker = buildActivityTracker(maxTurns, () => {
+      if (isCurrent()) onStreamUpdate?.();
+    }, isCurrent);
+    if (!retired) invocationUiRetirements.add(retire);
+    activityRetirements.set(tracker.state, retire);
+    return {
+      ...tracker,
+      isCurrent,
+      retire,
+      onBudgetResolved: (maxTurns: number | undefined) => {
+        if (isCurrent()) tracker.state.maxTurns = maxTurns;
+      },
+      ownTimer: (timer: ReturnType<typeof setInterval>) => {
+        if (isCurrent()) timers.add(timer);
+        else clearInterval(timer);
+      },
+    };
+  }
+
   const NUDGE_HOLD_MS = 200;
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    if (notificationsRetired) return;
     cancelNudge(key);
     pendingNudges.set(
       key,
       setTimeout(() => {
         pendingNudges.delete(key);
+        if (notificationsRetired) return;
         try {
           send();
         } catch {
@@ -725,7 +766,7 @@ function activateRootRuntime(
 
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return; // re-check at send time
+    if (notificationsRetired || record.resultConsumed) return; // re-check at send time
 
     const notification = formatTaskNotification(record, 500);
     const footer = record.outputFile
@@ -755,6 +796,7 @@ function activateRootRuntime(
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager((records, partial) => {
+    if (notificationsRetired) return;
     for (const r of records) {
       agentActivity.delete(r.id);
       fleet.onAgentFinished(r.id);
@@ -951,6 +993,8 @@ function activateRootRuntime(
   const manager = new AgentManager(
     (record) => {
       if (!record.detached) recordSessionUsage(record);
+      const activity = agentActivity.get(record.id);
+      if (activity) activityRetirements.get(activity)?.();
       // Nested children report only through their owning parent's scoped tools.
       // Keep them out of top-level lifecycle, transcript, notification, and UI channels.
       if (record.parentAgentId || record.detached) return;
@@ -998,6 +1042,10 @@ function activateRootRuntime(
           : {}),
         ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
       });
+
+      // Shutdown still needs authoritative usage, lifecycle and persistence
+      // receipts above. Only UI/notification delivery is retired.
+      if (notificationsRetired) return;
 
       // Managed workflow agents are consumed by their owner through lifecycle
       // events. Suppress only their automatic main-session nudge/group message.
@@ -1489,6 +1537,17 @@ function activateRootRuntime(
   let runtimeShutdown: Promise<void> | undefined;
   const shutdownRuntime = (): Promise<void> => {
     runtimeShutdown ??= (async () => {
+      // Retire delivery synchronously, before any provider/workflow await.
+      // Cleared timers may already have a callback captured by the host.
+      notificationsRetired = true;
+      for (const retire of [...invocationUiRetirements]) retire();
+      groupJoin.dispose();
+      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+      currentBatchAgents = [];
+      for (const timer of pendingNudges.values()) clearTimeout(timer);
+      pendingNudges.clear();
+      agentActivity.clear();
       // session_shutdown is confirmed, unlike either before-event. Start the
       // workflow's owned-agent cleanup while its RPC responder and the old leaf
       // are still available, regardless of which extension loads first.
@@ -1771,12 +1830,14 @@ function activateRootRuntime(
     // Allocate tracking only at a real fresh/reused-thread admission. An
     // idempotent request replay must not create another tracker at all.
     let tracker: ReturnType<typeof createActivityTracker> | undefined;
-    const tracking = () => tracker ??= createActivityTracker(undefined, () => fleet.update());
+    let resolvedResumeMaxTurns: number | undefined;
+    const tracking = () => tracker ??= createActivityTracker(resolvedResumeMaxTurns, () => fleet.update());
     const outputTranscript =
       getAgentConfig(dispatch.type)?.outputTranscript ??
       getOutputTranscriptDefault();
     let id = "";
     const initializeRecord = (spawnedId: string): void => {
+      if (notificationsRetired) return;
       id = spawnedId;
       agentActivity.set(id, tracking().state);
       const record = manager.getRecordMutable(id);
@@ -1802,7 +1863,12 @@ function activateRootRuntime(
       onTurnEnd: count => tracker?.callbacks.onTurnEnd(count),
       onAssistantUsage: usage => tracker?.callbacks.onAssistantUsage(usage),
       onSpawned: initializeRecord,
+      onResumeBudgetResolved: (maxTurns) => {
+        resolvedResumeMaxTurns = maxTurns;
+        tracker?.onBudgetResolved(maxTurns);
+      },
       onResumeStarting: (record: AgentRecord, startMessageIndex: number) => {
+        if (notificationsRetired) return;
         id = record.id;
         const { state } = tracking();
         state.session = record.session;
@@ -1820,6 +1886,7 @@ function activateRootRuntime(
         fleet.update();
       },
       onSessionCreated: (session: AgentSession) => {
+        if (notificationsRetired) return;
         tracking().callbacks.onSessionCreated(session);
         const record = manager.getRecordMutable(id);
         if (record?.outputFile) {
@@ -1832,6 +1899,7 @@ function activateRootRuntime(
         }
       },
       onCompaction: () => {
+        if (notificationsRetired) return;
         fleet.update();
       },
     };
@@ -1907,16 +1975,17 @@ function activateRootRuntime(
   ): string {
     const config = getAgentConfig(type);
     const resolved = resolveAgentInvocationConfig(config, {});
-    const { state, callbacks } = createActivityTracker(undefined, () => {
+    const tracker = createActivityTracker(undefined, () => {
       fleet.update();
     });
+    const { state, callbacks } = tracker;
     // Same sole gate as every other spawn path: `record.outputFile` being set is
     // what every downstream consumer keys off, so an agent whose frontmatter
     // says `output_transcript: false` must not gain one by being mentioned.
     const outputTranscript =
       config?.outputTranscript ?? getOutputTranscriptDefault();
     let id = "";
-    const spawnedId = manager.spawn(pi, ctxRef, type, prompt, {
+    const spawnOptions: SpawnOptions = {
       description: opts.description,
       maxTurns: normalizeMaxTurns(resolved.maxTurns ?? getDefaultMaxTurns()),
       isolated: resolved.isolated,
@@ -1939,6 +2008,7 @@ function activateRootRuntime(
       },
       ...callbacks,
       onSpawned: (newId) => {
+        if (notificationsRetired) return;
         id = newId;
         agentActivity.set(id, state);
         const record = manager.getRecordMutable(id);
@@ -1958,6 +2028,7 @@ function activateRootRuntime(
         fleet.update();
       },
       onSessionCreated: (session) => {
+        if (notificationsRetired) return;
         callbacks.onSessionCreated(session);
         const record = manager.getRecordMutable(id);
         if (record?.outputFile) {
@@ -1976,8 +2047,13 @@ function activateRootRuntime(
           );
         }
       },
-    });
-    return spawnedId;
+    };
+    try {
+      return manager.spawn(pi, ctxRef, type, prompt, spawnOptions);
+    } catch (error) {
+      tracker.retire();
+      throw error;
+    }
   }
 
   // ---- Join mode configuration ----
@@ -2038,6 +2114,7 @@ function activateRootRuntime(
 
   /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
   function finalizeBatch() {
+    if (notificationsRetired) return;
     batchFinalizeTimer = undefined;
     const batchAgents = [...currentBatchAgents];
     currentBatchAgents = [];
@@ -2240,24 +2317,53 @@ function activateRootRuntime(
       }
 
       if (record.session) {
+        const tracker = createActivityTracker(undefined, () => fleet.update());
+        const { state, callbacks } = tracker;
+        state.session = record.session;
+        const originCurrent = rootUiFence();
+        const session = record.session;
+        const owner = record.owner;
+        const canNotify = () => !notificationsRetired && originCurrent() &&
+          manager.getRecordMutable(record.id) === record && !record.detached &&
+          record.session === session && record.owner === owner;
+        let admitted = false;
         try {
           const resumed = await manager.resume(
             record.id,
             mention.message,
             undefined,
-            { isBackground: true },
+            {
+              isBackground: true,
+              ...callbacks,
+              onBudgetResolved: tracker.onBudgetResolved,
+              onStarted: () => {
+                if (tracker.isCurrent()) agentActivity.set(record.id, state);
+              },
+            },
           );
-          ctx.ui.notify(
+          admitted = resumed?.promise !== undefined;
+          if (resumed && tracker.isCurrent() && (resumed.status === "queued" || resumed.status === "running")) {
+            agentActivity.set(record.id, state);
+          }
+          void resumed?.promise?.finally(() => {
+            tracker.retire();
+            if (agentActivity.get(record.id) !== state) return;
+            agentActivity.delete(record.id);
+            fleet.onAgentFinished(record.id);
+          }).catch(() => {});
+          if (canNotify()) ctx.ui.notify(
             resumed
               ? `Resuming ${target}`
               : `Could not resume ${target} — it is still running.`,
             resumed ? "info" : "warning",
           );
         } catch (error) {
-          ctx.ui.notify(
+          if (canNotify()) ctx.ui.notify(
             `Could not resume ${target}: ${error instanceof Error ? error.message : String(error)}`,
             "warning",
           );
+        } finally {
+          if (!admitted) tracker.retire();
         }
         return { action: "handled" };
       }
@@ -3076,8 +3182,8 @@ Terse command-style prompts produce shallow, generic work.
         // the flag was accepted then silently dropped — a resumed agent always
         // blocked the caller until it finished.
         if (runInBackground) {
-          const { state: bgState, callbacks: bgCallbacks } =
-            createActivityTracker(effectiveMaxTurns);
+          const bgTracker = createActivityTracker(undefined, () => fleet.update());
+          const { state: bgState, callbacks: bgCallbacks } = bgTracker;
           // resumeAgent has no onSessionCreated — the session predates this run
           // — so seed the activity tracker directly.
           bgState.session = existing.session;
@@ -3097,6 +3203,8 @@ Terse command-style prompts produce shallow, generic work.
           // this index, so it is written exactly once.
           const transcriptAnchor = existing.session.messages.length ?? 0;
           const attachTranscript = (): void => {
+            if (!bgTracker.isCurrent()) return;
+            agentActivity.set(existing.id, bgState);
             if (!existing.outputFile || existing.outputCleanup) return;
             existing.outputCleanup = streamToOutputFile(
               existing.session!,
@@ -3106,25 +3214,38 @@ Terse command-style prompts produce shallow, generic work.
               transcriptAnchor,
             );
           };
-          const record = await manager.resume(
-            params.resume,
-            params.prompt,
-            undefined,
-            {
+          let record: AgentRecord | undefined;
+          let admitted = false;
+          try {
+            record = await manager.resume(params.resume, params.prompt, undefined, {
               isBackground: true,
+              maxTurns: params.max_turns,
+              onBudgetResolved: bgTracker.onBudgetResolved,
               onToolActivity: bgCallbacks.onToolActivity,
+              onTurnEnd: bgCallbacks.onTurnEnd,
+              onTextDelta: bgCallbacks.onTextDelta,
               onAssistantUsage: bgCallbacks.onAssistantUsage,
               onStarted: attachTranscript,
-            },
-          );
+            });
+            admitted = record?.promise !== undefined;
+          } finally {
+            if (!admitted) bgTracker.retire();
+          }
           if (!record) {
             return textResult(
               `Cannot resume agent "${params.resume}" in background — it is already running. ` +
                 "Wait for it to settle, or steer it with steer_subagent.",
             );
           }
-          agentActivity.set(params.resume, bgState);
-          void bgCallbacks;
+          if (bgTracker.isCurrent() && (record.status === "queued" || record.status === "running")) {
+            agentActivity.set(params.resume, bgState);
+          }
+          void record.promise?.finally(() => {
+            bgTracker.retire();
+            if (agentActivity.get(record.id) !== bgState) return;
+            agentActivity.delete(record.id);
+            fleet.onAgentFinished(record.id);
+          }).catch(() => {});
           return textResult(
             record.status === "queued"
               ? `Agent "${params.resume}" resumed in background (queued at the concurrency limit).`
@@ -3133,11 +3254,34 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(
-          params.resume,
-          params.prompt,
-          signal,
-        );
+        const tracker = createActivityTracker(undefined, () => {
+          if (!tracker.isCurrent()) return;
+          fleet.update();
+          if (!tracker.isCurrent()) return;
+          onUpdate?.(textResult(
+            "Resuming agent...",
+            buildDetails(detailBase, existing, state),
+          ));
+        });
+        const { state, callbacks } = tracker;
+        state.session = existing.session;
+        let record: AgentRecord | undefined;
+        try {
+          record = await manager.resume(params.resume, params.prompt, signal, {
+            ...callbacks,
+            maxTurns: params.max_turns,
+            onBudgetResolved: tracker.onBudgetResolved,
+            onStarted: () => {
+              if (tracker.isCurrent()) agentActivity.set(existing.id, state);
+            },
+          });
+        } finally {
+          tracker.retire();
+          if (agentActivity.get(existing.id) === state) {
+            agentActivity.delete(existing.id);
+            fleet.onAgentFinished(existing.id);
+          }
+        }
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -3146,19 +3290,21 @@ Terse command-style prompts produce shallow, generic work.
         if (record.status === "error") {
           return textResult(
             `Agent failed: ${record.error}${partialOutputSuffix(record)}`,
-            buildDetails(detailBase, record),
+            buildDetails(detailBase, record, state),
           );
         }
+        const output = record.result?.trim() || "No output.";
+        const outcome = getForegroundOutcomeNote(record.status);
         return textResult(
-          record.result?.trim() || "No output.",
-          buildDetails(detailBase, record),
+          outcome ? `${output}\n\n[pi-subagents outcome]${outcome}` : output,
+          buildDetails(detailBase, record, state),
         );
       }
 
       // Background execution
       if (runInBackground) {
-        const { state: bgState, callbacks: bgCallbacks } =
-          createActivityTracker(effectiveMaxTurns);
+        const bgTracker = createActivityTracker(effectiveMaxTurns);
+        const { state: bgState, callbacks: bgCallbacks } = bgTracker;
 
         // Wrap onSessionCreated to wire output file streaming.
         // The callback lazily reads record.outputFile (set right after spawn)
@@ -3166,6 +3312,7 @@ Terse command-style prompts produce shallow, generic work.
         let id: string;
         const origBgOnSession = bgCallbacks.onSessionCreated;
         bgCallbacks.onSessionCreated = (session: any) => {
+          if (notificationsRetired) return;
           origBgOnSession(session);
           const rec = manager.getRecordMutable(id);
           if (rec?.outputFile) {
@@ -3180,7 +3327,7 @@ Terse command-style prompts produce shallow, generic work.
 
         // A startup throw means the agent never started. Let pi mark the tool
         // call as failed instead of returning a successful-looking text result.
-        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+        const spawnOptions: SpawnOptions = {
           description: params.description,
           model: resolvedConfig.agentTierSelected ? undefined : model,
           maxTurns: effectiveMaxTurns,
@@ -3196,7 +3343,13 @@ Terse command-style prompts produce shallow, generic work.
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
-        });
+        };
+        try {
+          id = manager.spawn(pi, ctx, subagentType, params.prompt, spawnOptions);
+        } catch (error) {
+          bgTracker.retire();
+          throw error;
+        }
         // The clone needs a positive spawn witness before any UI, transcript,
         // or event observer can throw. A startup failure inside manager.spawn
         // removes its record and does not reach this acknowledgement.
@@ -3275,8 +3428,9 @@ Terse command-style prompts produce shallow, generic work.
       let handedOff = false;
 
       const streamUpdate = () => {
+        if (!fgTracker.isCurrent()) return;
         fleet.update();
-        if (!foregroundUpdates) return;
+        if (!fgTracker.isCurrent() || !foregroundUpdates) return;
         const details: AgentDetails = {
           ...detailBase,
           toolUses: fgState.toolUses,
@@ -3294,16 +3448,15 @@ Terse command-style prompts produce shallow, generic work.
         });
       };
 
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(
-        effectiveMaxTurns,
-        streamUpdate,
-      );
+      const fgTracker = createActivityTracker(effectiveMaxTurns, streamUpdate);
+      const { state: fgState, callbacks: fgCallbacks } = fgTracker;
 
       // Wire session creation: register in the FleetView list + stream to the output file.
       // The output file path is set synchronously after spawn (below),
       // before onSessionCreated fires — same pattern as background agents.
       const origOnSession = fgCallbacks.onSessionCreated;
       fgCallbacks.onSessionCreated = (session: any) => {
+        if (!fgTracker.isCurrent()) return;
         origOnSession(session);
         for (const a of manager.listAgentsMutable()) {
           if (a.session === session) {
@@ -3329,9 +3482,11 @@ Terse command-style prompts produce shallow, generic work.
       };
 
       const spinnerInterval = setInterval(() => {
+        if (!fgTracker.isCurrent()) return;
         spinnerFrame++;
         streamUpdate();
       }, SPINNER_INTERVAL_MS);
+      fgTracker.ownTimer(spinnerInterval);
 
       streamUpdate();
 
@@ -3374,7 +3529,8 @@ Terse command-style prompts produce shallow, generic work.
         // A transfer ends this tool's spinner, not the child's activity or stream.
         foregroundUpdates = false;
         clearInterval(spinnerInterval);
-        if (fgId && !handedOff) {
+        if (!handedOff) fgTracker.retire();
+        if (fgId && !handedOff && !notificationsRetired) {
           agentActivity.delete(fgId);
           fleet.onAgentFinished(fgId);
         }
