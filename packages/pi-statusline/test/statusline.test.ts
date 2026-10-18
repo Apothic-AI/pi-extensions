@@ -911,7 +911,7 @@ test("extension status helpers strip prefixes, icons, and simplify text", () => 
     text: "plain status",
   });
   assert.equal(stripExtensionStatusPrefix("firecrawl", "firecrawl: ready"), "ready");
-  assert.equal(simplifyExtensionStatusText("ready, missing (details)"), "ready missing");
+  assert.equal(simplifyExtensionStatusText("  ready, \t missing (details)  "), "ready missing (details)");
   assert.equal(extensionColor("codex", "checking"), "accent");
   assert.equal(extensionColor("lsp", "command missing"), "warning");
 });

@@ -37,7 +37,7 @@ export function formatExtensionStatuses(
     ...[...statuses.entries()]
       .filter(([key, value]) => key !== STATUSLINE_KEY && !hiddenKeys.has(key) && value.trim().length > 0)
       .map(([key, value]) => formatExtensionStatus(key, value, theme, config, runtime.extensionStatusIconAliases)),
-  ].slice(0, 5);
+  ];
 
   return visibleStatuses.join(separator);
 }
@@ -235,11 +235,7 @@ export function stripExtensionStatusPrefix(key: string, value: string): string {
 }
 
 export function simplifyExtensionStatusText(value: string): string {
-  return value
-    .trim()
-    .replace(/,\s*/g, " ")
-    .replace(/\s+\([^)]*\)\s*$/, "")
-    .replace(/\s+/g, " ");
+  return value.trim().replace(/,\s*/g, " ").replace(/\s+/g, " ");
 }
 
 function escapeRegExp(value: string): string {

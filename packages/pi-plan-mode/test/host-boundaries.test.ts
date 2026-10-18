@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type AssistantMessage, createAssistantMessageEventStream, getCurrentTools } from "@earendil-works/pi-ai";
@@ -14,8 +14,9 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { startFreshImplementationSession } from "../src/fresh-implementation.js";
+import * as hypaWrapper from "../src/hypa-wrapper.js";
 import planMode from "../src/plan-mode.js";
 import type { PlanModeSettings } from "../src/settings.js";
 
@@ -31,7 +32,10 @@ const questions = [
   },
 ];
 
-async function fixture(settings: PlanModeSettings = { thinkingLevel: "inherit" }) {
+async function fixture(
+  settings: PlanModeSettings = { thinkingLevel: "inherit" },
+  beforePlan?: (pi: ExtensionAPI) => void,
+) {
   const cwd = await mkdtemp(join(tmpdir(), "plan-host-"));
   await writeFile(join(cwd, "auth.json"), JSON.stringify({ anthropic: { type: "api_key", key: "test-only" } }));
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -58,6 +62,7 @@ async function fixture(settings: PlanModeSettings = { thinkingLevel: "inherit" }
         name: "plan-host",
         factory: (pi) => {
           api = pi;
+          beforePlan?.(pi);
           planMode(pi, {
             readSettings: async () => ({ kind: "loaded", settings }),
             loadInteractiveUi: async () => {
@@ -102,6 +107,7 @@ async function fixture(settings: PlanModeSettings = { thinkingLevel: "inherit" }
     return tool;
   };
   return {
+    cwd,
     api,
     tool,
     uiLoads: () => uiLoads,
@@ -139,6 +145,129 @@ function response(content: AssistantMessage["content"], stopReason: AssistantMes
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
   };
+}
+
+test("real Pi final bash gate checks Hypa-shaped earlier hook mutations, not the original command", async () => {
+  let rewritten = "";
+  const f = await fixture({ thinkingLevel: "inherit" }, (pi) => {
+    pi.on("tool_call", (event) => {
+      if (event.toolName === "bash") event.input.command = rewritten;
+    });
+  });
+  const previousPath = process.env.PATH;
+  const previousOverride = process.env.HYPA_BIN;
+  delete process.env.HYPA_BIN;
+  try {
+    const bin = join(f.cwd, "Hypa's bin");
+    await mkdir(bin);
+    const path = join(bin, "hypa");
+    await writeFile(path, "#!/bin/sh\nexit 0\n");
+    await chmod(path, 0o755);
+    process.env.PATH = bin;
+    const qualified = `'${path.replaceAll("'", "'\\''")}'`;
+    await f.command("start");
+    assert.equal(f.session.getActiveToolNames().includes("hypa_shell"), false);
+    assert.equal(f.session.getActiveToolNames().includes("background"), false);
+    const cases = [
+      [`${qualified} git --no-optional-locks status --short`, true],
+      [`${qualified} --timeout-ms 2000 git diff --no-ext-diff --no-textconv --stat`, true],
+      [`${qualified} --timeout-ms 2000 -c 'ls -l -a'`, true],
+      ["hypa -c 'ls'", true],
+      [`${qualified} git reset --hard`, false],
+      [`${qualified} git status --short`, false],
+      [`${qualified} git diff --ext-diff`, false],
+      [`${qualified} -c 'touch output'`, false],
+      [`${qualified} -c 'ls && touch output'`, false],
+      [`${qualified} -c 'sh -c ls'`, false],
+      [`${qualified} -c 'hypa -c ls'`, false],
+      [`${qualified} --config custom -c ls`, false],
+      ["/tmp/hypa -c ls", false],
+    ] as const;
+    for (const [command, accepted] of cases) {
+      rewritten = command;
+      const event = {
+        type: "tool_call" as const,
+        toolName: "bash" as const,
+        toolCallId: "rewritten",
+        input: { command: "ls", originalCommand: "ls" },
+      };
+      const result = await f.runner.emitToolCall(event);
+      assert.equal(event.input.command, command, "the earlier hook rewrote the final input");
+      assert.equal(result?.block === true, !accepted, command);
+      if (!accepted) assert.ok(result?.reason?.includes(command), command);
+    }
+    // Runtime resolution is live, not a stale allowlist from session startup.
+    process.env.PATH = join(f.cwd, "missing");
+    for (const command of [`${qualified} -c ls`, "hypa -c ls"]) {
+      rewritten = command;
+      assert.equal(
+        (
+          await f.runner.emitToolCall({
+            type: "tool_call",
+            toolName: "bash",
+            toolCallId: "no-longer-resolved",
+            input: { command: "ls" },
+          })
+        )?.block,
+        true,
+      );
+    }
+    // The actual integration can qualify an explicit native override instead
+    // of the first PATH shim; that exact selection is also inspected.
+    process.env.HYPA_BIN = path;
+    rewritten = `${qualified} -c pwd`;
+    assert.notEqual(
+      (
+        await f.runner.emitToolCall({
+          type: "tool_call",
+          toolName: "bash",
+          toolCallId: "override",
+          input: { command: "pwd" },
+        })
+      )?.block,
+      true,
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousOverride === undefined) delete process.env.HYPA_BIN;
+    else process.env.HYPA_BIN = previousOverride;
+    await f.dispose();
+  }
+});
+
+for (const change of ["disable", "restart", "command"] as const) {
+  test(`real Pi wrapper resolution fences concurrent ${change} changes`, async () => {
+    const f = await fixture({ thinkingLevel: "inherit" });
+    const entered = Promise.withResolvers<void>();
+    const resolved = Promise.withResolvers<ReadonlySet<string>>();
+    const spy = vi.spyOn(hypaWrapper, "resolveHypaExecutablePaths").mockImplementation(async () => {
+      entered.resolve();
+      return resolved.promise;
+    });
+    try {
+      await f.command("start");
+      const event = {
+        type: "tool_call" as const,
+        toolName: "bash" as const,
+        toolCallId: "pending",
+        input: { command: "hypa -c pwd" },
+      };
+      const pending = f.runner.emitToolCall(event);
+      await entered.promise;
+      if (change === "command") event.input.command = "hypa -c 'touch output'";
+      else {
+        await f.command("off");
+        if (change === "restart") await f.command("start");
+      }
+      resolved.resolve(new Set(["/trusted/bin/hypa"]));
+      assert.equal((await pending)?.block, true);
+    } finally {
+      resolved.resolve(new Set());
+      spy.mockRestore();
+      await f.dispose();
+    }
+  });
 }
 
 test("real Pi late registration refresh is excluded from the next response and denied for nested calls", async () => {
