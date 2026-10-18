@@ -23,6 +23,7 @@ type MockFlag = {
 
 type MockPiApi = {
   registerCommand(name: string, command: unknown): void;
+  registerShortcut(key: string, shortcut: { handler: MockHandler }): void;
   registerFlag(name: string, flag: unknown): void;
   registerTool(tool: unknown): void;
   registerEntryRenderer(customType: string, renderer: MockHandler): void;
@@ -57,6 +58,7 @@ export function createMockPi(
   } = {},
 ) {
   const commands = new Map<string, MockCommand>();
+  const shortcuts = new Map<string, { handler: MockHandler }>();
   const entryRenderers = new Map<string, MockHandler>();
   const flags = new Map<string, MockFlag>();
   const events = new Map<string, MockHandler[]>();
@@ -103,6 +105,9 @@ export function createMockPi(
   const rawPi: MockPiApi = {
     registerCommand(name: string, command: unknown) {
       commands.set(name, command as MockCommand);
+    },
+    registerShortcut(key, shortcut) {
+      shortcuts.set(key, shortcut);
     },
     registerFlag(name: string, flag: unknown) {
       flags.set(name, flag as MockFlag);
@@ -176,6 +181,7 @@ export function createMockPi(
     pi: rawPi as never,
     rawPi,
     commands,
+    shortcuts,
     entryRenderers,
     flags,
     events,

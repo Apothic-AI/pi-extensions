@@ -26,7 +26,7 @@
     "typecheck": "node scripts/run-package-scripts.mjs typecheck && bun run typecheck:integration",
     "typecheck:integration": "tsc --noEmit -p tsconfig.integration.json",
     "test": "node scripts/run-package-scripts.mjs test",
-    "test:integration": "vitest run scripts/editor-composition.test.ts --config vitest.integration.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:release": "node --test scripts/publish-packages.test.mjs scripts/publish-changesets.test.mjs scripts/publish-with-token.test.mjs scripts/configure-npm-trusted-publishers.test.mjs scripts/publish-workflow.test.mjs",
     "test:config": "node --test scripts/check-package-config.test.mjs scripts/check-changesets.test.mjs scripts/smoke-pi-loaders.test.mjs",
     "smoke:pi": "node scripts/smoke-pi-loaders.mjs",

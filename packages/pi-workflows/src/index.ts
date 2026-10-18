@@ -17,6 +17,7 @@ import {
   queryChildSessionContextImmediate,
 } from "./rpc-client.js";
 import { listSavedWorkflows, loadSavedWorkflow, saveWorkflow } from "./saved-workflows.js";
+import { guardStatusMount, StatusActions, type StatusSurface, workflowStatusSummary } from "./status-actions.js";
 import {
   defaultStrengthTable,
   isWorkflowStrength,
@@ -379,6 +380,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let workflowUiBridge: WorkflowUiBridge | undefined;
   let workflowUiSurfaceId = randomUUID();
   let refreshQueued = false;
+  let statusActions: StatusActions | undefined;
+  let statusSource: (() => StatusSurface | undefined) | undefined;
+  const navigatorOpen = new Map<string, number>();
+  const retireStatusActions = (): void => {
+    const hadStatus = !!statusSource;
+    statusActions?.dispose();
+    statusActions = undefined;
+    statusSource = undefined;
+    if (hadStatus && deliveryContext?.mode === "tui") deliveryContext.ui.setStatus("pi-workflows", undefined);
+  };
 
   const currentEngine = (): WorkflowEngine => {
     if (!active || !engine || engine.isDisposed())
@@ -409,6 +420,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     return { cancel: true };
   };
   const invalidateDelivery = (): void => {
+    navigatorOpen.delete(workflowUiSurfaceId);
+    retireStatusActions();
     workflowUiBridge?.retire(workflowUiSurfaceId);
     workflowUiSurfaceId = randomUUID();
     deliveryGeneration++;
@@ -482,6 +495,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       .list()
       .map((summary) => workflowEngine.getRun(String(summary.runId)))
       .filter((run): run is NonNullable<typeof run> => run !== undefined);
+    if (statusSource?.()) tui.setStatus("pi-workflows", workflowStatusSummary(runs));
     const hasActive = runs.some((run) => !["completed", "failed", "stopped"].includes(run.status));
     const surfaceId = workflowUiSurfaceId;
     tui.setWidget(
@@ -578,7 +592,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     throw new Error("Provide either `script` or `name`.");
   };
 
-  const showNavigator = async (ctx: ExtensionContext, initialRunId?: string): Promise<void> => {
+  const showNavigator = async (ctx: ExtensionContext, initialRunId?: string, guard?: () => void): Promise<void> => {
+    guard?.();
     if (ctx.mode !== "tui" || !ctx.hasUI) {
       await showWorkflowNavigator(ctx, currentEngine, { initialRunId });
       return;
@@ -588,6 +603,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     const manager = ctx.sessionManager;
     const sessionId = manager.getSessionId();
     const resolve = (): WorkflowEngine => {
+      guard?.(); // Keep a mounted status navigator bound to its exact source.
       if (
         surfaceId !== workflowUiSurfaceId ||
         selectedEngine !== currentEngine() ||
@@ -598,38 +614,104 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         throw new Error("Workflow inspector belongs to a retired session or branch.");
       return selectedEngine;
     };
-    await showWorkflowNavigator(ctx, resolve, {
-      initialRunId,
-      getPresentation: (runId) => resolve().getInspection(runId),
-      openConversation: async (runId, callIndex) => {
-        const current = resolve();
-        if (!/^(?:0|[1-9]\d*)$/u.test(callIndex)) throw new Error("This call has no retained root conversation.");
-        const state = current.getState(runId);
-        const run = state?.run;
-        const agentId = run?.agentIds[callIndex];
-        const attempt = run?.attempts[callIndex];
-        if (!state || !run || !agentId || !Number.isInteger(attempt) || (attempt ?? 0) < 1)
-          throw new Error("No retained conversation is available for this call.");
-        const executionGeneration = state.executionGeneration;
-        await openOwnedConversation(
-          pi.events,
-          agentId,
-          { extension: "pi-workflows", runId, nodeId: `call-${callIndex}`, attemptId: `attempt-${attempt}` },
-          () => {
-            try {
-              return (
-                resolve().getState(runId) === state &&
-                state.executionGeneration === executionGeneration &&
-                run.agentIds[callIndex] === agentId &&
-                run.attempts[callIndex] === attempt
-              );
-            } catch {
-              return false;
-            }
-          },
-        );
-      },
-    });
+    navigatorOpen.set(surfaceId, (navigatorOpen.get(surfaceId) ?? 0) + 1);
+    try {
+      await showWorkflowNavigator(guard ? guardStatusMount(ctx, guard) : ctx, resolve, {
+        initialRunId,
+        getPresentation: (runId) => resolve().getInspection(runId),
+        openConversation: async (runId, callIndex) => {
+          const current = resolve();
+          if (!/^(?:0|[1-9]\d*)$/u.test(callIndex)) throw new Error("This call has no retained root conversation.");
+          const state = current.getState(runId);
+          const run = state?.run;
+          const agentId = run?.agentIds[callIndex];
+          const attempt = run?.attempts[callIndex];
+          if (!state || !run || !agentId || !Number.isInteger(attempt) || (attempt ?? 0) < 1)
+            throw new Error("No retained conversation is available for this call.");
+          const executionGeneration = state.executionGeneration;
+          await openOwnedConversation(
+            pi.events,
+            agentId,
+            { extension: "pi-workflows", runId, nodeId: `call-${callIndex}`, attemptId: `attempt-${attempt}` },
+            () => {
+              try {
+                return (
+                  resolve().getState(runId) === state &&
+                  state.executionGeneration === executionGeneration &&
+                  run.agentIds[callIndex] === agentId &&
+                  run.attempts[callIndex] === attempt
+                );
+              } catch {
+                return false;
+              }
+            },
+          );
+        },
+      });
+    } finally {
+      // An obsolete factory cannot hold or release a replacement surface's slot.
+      const remaining = (navigatorOpen.get(surfaceId) ?? 0) - 1;
+      if (remaining > 0) navigatorOpen.set(surfaceId, remaining);
+      else navigatorOpen.delete(surfaceId);
+    }
+  };
+
+  const registerStatusActions = (): void => {
+    const ctx = deliveryContext;
+    if (!active || !engine || ctx?.mode !== "tui" || !ctx.hasUI) return;
+    const selectedEngine = currentEngine();
+    const surfaceId = workflowUiSurfaceId;
+    const manager = ctx.sessionManager;
+    const sessionId = manager.getSessionId();
+    let branchIds = manager.getBranch().map((entry) => entry.id);
+    let retired = false;
+    const source = (): StatusSurface | undefined => {
+      if (retired) return;
+      let valid = false;
+      try {
+        const branch = manager.getBranch().map((entry) => entry.id);
+        valid =
+          active &&
+          engine === selectedEngine &&
+          !selectedEngine.isDisposed() &&
+          workflowUiSurfaceId === surfaceId &&
+          deliveryContext?.sessionManager === manager &&
+          manager.getSessionId() === sessionId &&
+          ctx.mode === "tui" &&
+          ctx.hasUI &&
+          ownsDeliveryBranch() &&
+          branchIds.every((id, index) => branch[index] === id);
+        if (valid) branchIds = branch;
+      } catch {
+        // A disposed context permanently retires this presentation surface.
+      }
+      if (!valid) {
+        retired = true;
+        if (statusSource === source) retireStatusActions();
+        return;
+      }
+      return {
+        owner: selectedEngine,
+        surfaceId,
+        sessionId,
+        busy: () => (navigatorOpen.get(surfaceId) ?? 0) > 0,
+        open: () =>
+          showNavigator(ctx, undefined, () => {
+            if (!source()) throw new Error("Workflow status surface is retired.");
+          }),
+      };
+    };
+    statusSource = source;
+    statusActions = new StatusActions(
+      pi.events,
+      { providerId: "pi-workflows", statusKey: "pi-workflows", actionId: "runs", label: "Workflow runs" },
+      source,
+    );
+    if (source())
+      ctx.ui.setStatus(
+        "pi-workflows",
+        workflowStatusSummary(selectedEngine.list().map((run) => ({ status: String(run.status) }))),
+      );
   };
 
   const workflowUiSurface = (): WorkflowUiSurface | undefined => {
@@ -1452,6 +1534,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         workflowEngine.resumeLifecycle();
         deliveryContext = ctx;
         deliveryBranchAnchor = journalBranchAnchor;
+        registerStatusActions();
         hydratePendingDeliveries(entries);
         schedulePendingDeliveries();
       } catch (error: unknown) {
@@ -1799,6 +1882,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // ownership, not a captured function value, provide session affinity.
     deliveryContext = ctx;
     deliveryBranchAnchor = journalBranchAnchor;
+    registerStatusActions();
     workflowUiBridge ??= new WorkflowUiBridge(pi.events, workflowUiSurface);
     workflowUiBridge.publish();
     inputPreparing = false;

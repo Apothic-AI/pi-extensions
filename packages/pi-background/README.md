@@ -172,12 +172,24 @@ Commands remain available:
 /background retry          # existing explicit notification recovery
 ```
 
-Task selection follows the opaque ID as jobs change. The selected task shows its
-command, cwd, status, exit code/signal, and dropped log bytes. The log viewer has
-scrolling, follow-tail, and both/stdout/stderr filters. Keyboard controls:
+The compact task roster puts status, elapsed time, and description before a short
+ID, with running/completed counts and visible/selected positions. It stays a plain
+list, without a dashboard or empty full-terminal padding. Selection and the first
+visible row follow opaque IDs as jobs change. If the selected job disappears,
+selection clears: Enter/stop/clear cannot silently target a neighbor. Navigate
+again to choose another job.
 
-- **↑/↓**, **Home/End**, **PgUp/PgDn**: select tasks or scroll logs; End follows the log tail.
-- **Enter**: open selected logs; **Esc**: return to tasks, then close.
+**Enter** opens a scrollable overview with wrapped description, full ID, command,
+cwd, status, exit code/signal, error, and dropped log bytes. Enter again or **l**
+opens logs. `/background view <job-id>` still opens logs directly. The log viewer
+has scrolling, follow-tail, and both/stdout/stderr filters. Keyboard controls
+(defaults below; Pi's configured selection up/down, page, confirm, and cancel keys
+are honored and shown in the screen's help):
+
+- **↑/↓**, **Home/End**, **PgUp/PgDn**: select tasks or scroll details/logs; End follows the log tail.
+- **Enter**: tasks → overview → logs; **l**: overview → logs.
+- **Esc**: logs → overview → tasks → close, preserving parent selection and viewport.
+  Escape remains available even in a tiny terminal.
 - **f**: toggle tail following; **s**: cycle both/stdout/stderr.
   Pausing keeps one bounded, sanitized snapshot stable while output continues;
   End or resuming follow refreshes the current retained tail. Resize preserves
@@ -198,7 +210,9 @@ narrow/CJK terminals. Untrusted logs are byte-bounded **before** sanitization an
 wrapping, without Markdown interpretation or terminal control sequences. The
 viewer shows at most the latest 1,000 retained lines and 64 KiB before wrapping;
 manager retention stays at 256 KiB per job. Closing a view releases its local
-subscriptions; output changes request coalesced TUI renders, not model turns.
+subscriptions and its elapsed-time refresh timer; the timer runs only while a
+mounted roster/overview has running jobs. Output changes request coalesced TUI
+renders, not model turns or automatic navigation.
 
 Custom screens require both `ctx.mode === "tui"` and `ctx.hasUI`. RPC/JSON/print
 keep all tools and command snapshots/hints, but never call custom UI. The TUI
@@ -357,3 +371,17 @@ explicitly named shortcut harness for reproducible checks.
 ## License
 
 MIT
+
+## Status navigation
+
+With a compatible status selector, **Ctrl+Alt+S**, choose **Background tasks**,
+then **Enter** opens this package's existing task UI. Ctrl+Alt+B and `/background`
+remain available. This optional integration is TUI-only and presentation-only:
+querying status never opens a screen, starts a job, or sends a model message.
+Selections are bound to one live session/branch surface; stale selections are
+not redirected after navigation or reload. The wire carries bounded action
+identifiers and labels, never commands, logs, execution controls, or callbacks.
+
+Passive task counts also refresh after silent (`notify: "off"`) completion,
+retention changes, and clears, without another tool/model turn. Output bursts
+coalesce into a short refresh rather than opening UI or producing notifications.

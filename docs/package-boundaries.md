@@ -63,8 +63,10 @@ native operations or descendant execution frames are quiescent.
 literal-match watches, and session-local notification outbox. It does not replace
 builtin `bash`, own remote workspace execution, spawn agents, or mutate Goal state.
 Session shutdown and successful session-tree navigation terminate owned jobs and
-discard logs/outbox state. There is no persistence or cross-extension control
-protocol. Permission policies must cover its launch tools separately from `bash`.
+discard logs/outbox state. There is no persistence or cross-extension process-control
+protocol. The optional [status-action UI contract](status-navigation.md) only admits
+explicit user navigation to the owning extension's view; it grants no job-control
+or execution authority. Permission policies must cover its launch tools separately from `bash`.
 When `pi-approvals` is loaded, launch adapters capture its local service and wait
 before starting a command; a captured broken/retired service cannot become an
 unreviewed fallback. Attaching a watch to an existing job is not a new command

@@ -132,9 +132,16 @@ describe("Fleet authoritative workflow rows", () => {
     fleet.setUICtx(ui);
     const peer = new WorkflowUiClient(bus, () => true, () => fleet.update()); disposals.push(() => peer.dispose());
     fleet.setWorkflowClient(peer); publish(bus);
-    expect(widget!.render(180).join("\n")).toContain("Named workflow · running · validate · 1/3 running · 1 done · 0 failed");
+    expect(widget!.render(180).join("\n")).toContain("▸ Named workflow · running · validate · 1/3 running · 1 done · 0 failed");
+    expect(widget!.render(180).join("\n")).not.toContain("● Named workflow");
     expect(widget!.render(180).join("\n")).toContain("3s · 50 tokens");
-    expect(widget!.render(180).at(-1)).toBe("");
+    for (const status of ["completed", "failed", "paused", "running"] as const) {
+      publish(bus, [run({ status })]);
+      const lines = widget!.render(180);
+      expect(lines.find(line => line.includes("Named workflow"))).toContain("▸ Named workflow");
+      expect(lines.at(-1)).toBe("");
+      expect(lines.at(-2)?.trim()).not.toBe("");
+    }
     for (const rows of [0, 4, 8, 24]) { tui.terminal.rows = rows; expect(widget!.render(120).length).toBeLessThanOrEqual(Math.floor(rows / 2)); }
     for (const width of [0, 1, 12, 80]) expect(widget!.render(width).every(line => visibleWidth(line) <= width)).toBe(true);
     const opened = vi.fn((raw: unknown) => {

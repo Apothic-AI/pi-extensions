@@ -192,8 +192,33 @@ git diff --check
 Subagents＋Workflows 组合、24 个 stable 扩展同时加载、34 包打包验证和凭据扫描。
 最后运行前后所有 Git 跟踪及未忽略的 `packages/` 文件指纹一致：
 `122114b1de8b8ca94010e20fbe53c79f0c7f753cea5924c7fef2e50178e0936a`（SHA-256）。
-职责清单覆盖 31 个扩展及三个库；只修改五个选定包，均有 Changeset，Statusline 无差异。
+职责清单覆盖 31 个扩展及三个库；该轮选择性修复只修改五个包，均有 Changeset，Statusline 在该轮无差异。后续明确批准的 UI 改动及其独立验收见下节。
 
 这些证据不构成真实 provider／OAuth、外部 LSP、通知服务、物理终端或其他宿主／平台的全面验收。
 运行中的已安装发布物不会因为源码改动自动替换；必须经过独立 Changesets 发版、更新安装和
 重新加载。没有全局配置改写、安装、发布或私有历史迁移。
+
+## 后续明确批准的任务 UI 改进
+
+用户随后选择先完成 UI，再与五包修复一起提交、发版；最终涉及八个包。范围是后台 **shell**
+任务的列表／详情／日志导航、状态栏选择后打开拥有者详情，以及 Fleet 的间距和类型标识。
+“Workflow UI 变了”的反馈最终定位为 Workflow 与 Agent 图标相同，不重做现有 Workflow
+布局或详情交互。Workflow 分组改用 `▸`，Fleet 删除重复尾部空行，只保留一行分隔。
+
+Statusline 新增 `/statusline inspect` 与 Ctrl+Alt+S，通过独立、可选的版本 1 UI 事件协议
+进入 Background／Workflows 拥有的现有视图；不以命令字符串猜测拥有者，不发送模型消息，
+也不修改显示筛选或用户设置。Background 的静默进程退出仍刷新状态，Workflows 的计数来自
+运行本身，不能把子任务完成数当作 Workflow 已完成。协议及限制见
+[任务与状态导航](status-navigation.md)。
+
+独立八路复核发现并修复四个边界：冲突拥有者的状态键不能因过滤歧义而错误变成唯一归属；
+配置按键优先于固定箭头回退；旧的延迟 Workflow 挂载不能占住或释放替代 surface 的槽位；
+详情连续缩放保留原始文本锚点，而不是重复舍入后的行首。相应回归与分包检查通过：
+Background 185、Statusline 226（另有 Node 上下文刷新检查）、Workflows 823。
+
+新增私有根集成测试经公共 loader 加载四个扩展，覆盖两种加载顺序及 regular/fullscreen
+渲染器，核对菜单与直接命令进入详情、草稿不变、无模型轮次和组合 Fleet/footer 间距。
+后台 shell＋Statusline 的实际离线 CLI 在 Pi 1.0.4 和 1.3.0 各通过 112 项检查，包含
+原生快捷键、外部对话框、CJK 草稿／光标、真实日志、确认停止与运行时 resize；不是物理
+终端 IME 验收或所有宿主／平台兼容声明。合并改动仍须重新通过完整根检查和 CI，版本化及
+npm 发布另由 Changesets／GitHub Actions 处理，不因这些局部验收而视为已发布。

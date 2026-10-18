@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { JobManager } from "./contracts.js";
 import { createJobManager } from "./manager.js";
 import { MESSAGE_TYPE, Notifications, safeText, WAKE_PREFIX, wakeIdFromText } from "./notifications.js";
 import { Ownership } from "./ownership.js";
+import { StatusActions } from "./status-actions.js";
 import { showBackgroundUI } from "./task-ui.js";
 import { registerTools } from "./tools.js";
 import { WakeTokens } from "./wake-tokens.js";
@@ -18,6 +20,9 @@ interface Owner {
   navigating: boolean;
   closeView?: () => void;
   openingView?: symbol;
+  statusActions?: StatusActions;
+  unsubscribeStatus?: () => void;
+  statusTimer?: ReturnType<typeof setTimeout>;
 }
 
 /** One extension instance owns one live branch; nothing starts in the factory. */
@@ -32,6 +37,10 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   function retire(owner: Owner): void {
     if (active !== owner) return;
     active = undefined;
+    owner.statusActions?.dispose();
+    owner.unsubscribeStatus?.();
+    if (owner.statusTimer) clearTimeout(owner.statusTimer);
+    owner.statusTimer = undefined;
     const closeView = owner.closeView;
     owner.closeView = undefined;
     try {
@@ -154,6 +163,34 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
       navigating: false,
     };
     active = owner;
+    if (ctx.mode === "tui" && ctx.hasUI) {
+      const surfaceId = randomUUID();
+      const sessionId = ctx.sessionManager.getSessionId();
+      owner.statusActions = new StatusActions(
+        pi.events,
+        { providerId: "pi-background", statusKey: "pi-background", actionId: "tasks", label: "Background tasks" },
+        () => {
+          if (!live(owner) || owner.context.mode !== "tui" || !owner.context.hasUI) return;
+          return {
+            owner,
+            surfaceId,
+            sessionId,
+            busy: () => !!(owner.closeView || owner.openingView),
+            open: async () => {
+              requireOwner(owner.context, owner);
+              await openTaskView(owner.context, owner);
+            },
+          };
+        },
+      );
+      owner.unsubscribeStatus = owner.manager.subscribe(() => {
+        if (!live(owner) || owner.statusTimer) return;
+        owner.statusTimer = setTimeout(() => {
+          owner.statusTimer = undefined;
+          updateStatus(owner);
+        }, 100);
+      });
+    }
     updateStatus(owner);
   }
 
@@ -184,6 +221,8 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   /** Shared command/shortcut interaction; the manager and retirement policy stay identical. */
   async function openTaskView(ctx: ExtensionContext, owner: Owner, viewId?: string): Promise<void> {
     requireOwner(ctx, owner);
+    // One common admission guard covers commands, shortcuts and status actions.
+    if (owner.closeView || owner.openingView) throw new Error("Background task view is already open.");
     const opening = Symbol();
     owner.openingView = opening;
     const manager = owner.ownership.guard(owner.manager, () => {

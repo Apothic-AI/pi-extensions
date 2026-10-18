@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JobEvent, JobManager, JobSnapshot, StartOptions } from "../src/contracts.js";
 import extension from "../src/extension.js";
 import { MESSAGE_TYPE } from "../src/notifications.js";
+import { STATUS_OPEN, STATUS_QUERY } from "../src/status-actions.js";
 import { nativeUIFixture } from "./tui-fixture.js";
 
 const fake = vi.hoisted(() => ({
@@ -96,6 +97,20 @@ interface Tool {
 }
 
 function harness(mode = "tui") {
+  const bus = new Map<string, Set<(data: unknown) => void>>();
+  const events = {
+    on: (channel: string, handler: (data: unknown) => void) => {
+      const listeners = bus.get(channel) ?? new Set();
+      listeners.add(handler);
+      bus.set(channel, listeners);
+      return () => {
+        listeners.delete(handler);
+      };
+    },
+    emit: (channel: string, data: unknown) => {
+      for (const handler of [...(bus.get(channel) ?? [])]) handler(data);
+    },
+  };
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
@@ -140,6 +155,7 @@ function harness(mode = "tui") {
     waitForIdle: () => waitForIdle(),
   } as unknown as ExtensionContext;
   const pi = {
+    events,
     getAllTools: () => [],
     getCommands: () => [],
     registerTool: (tool: Tool) => tools.set(tool.name, tool),
@@ -165,6 +181,8 @@ function harness(mode = "tui") {
   extension(pi);
   return {
     pi,
+    bus,
+    events,
     ctx,
     tools,
     commands,
@@ -206,6 +224,121 @@ function event(jobId = "job-0"): JobEvent {
 afterEach(() => {
   fake.managers.length = 0;
   vi.useRealTimers();
+});
+
+describe("status action integration", () => {
+  function query(h: ReturnType<typeof harness>) {
+    const replies: Array<{ data: { surfaceId: string; providerId: string; sessionId: string } }> = [];
+    const off = h.events.on(`${STATUS_QUERY}:reply:q`, (raw) => replies.push(raw as (typeof replies)[number]));
+    h.events.emit(STATUS_QUERY, { version: 1, requestId: "q", sessionId: "session-a" });
+    off();
+    const data = replies[0]?.data;
+    return data && { surfaceId: data.surfaceId, providerId: data.providerId, sessionId: data.sessionId };
+  }
+
+  it("advertises only a live TUI, admits before mount and shares duplicate command admission", async () => {
+    const h = harness();
+    const native = nativeUIFixture();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    expect(query(h)).toBeUndefined();
+    await h.emit("session_start");
+    const selected = query(h);
+    expect(selected).toMatchObject({ providerId: "pi-background", sessionId: "session-a" });
+    expect(native.custom).not.toHaveBeenCalled();
+    const reply = vi.fn();
+    const off = h.events.on(`${STATUS_OPEN}:reply:o`, reply);
+    try {
+      h.events.emit(STATUS_OPEN, { version: 1, requestId: "o", ...selected, actionId: "tasks" });
+      expect(reply).toHaveBeenCalledWith({ success: true, data: { accepted: true } });
+      expect(native.custom).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      h.events.emit(STATUS_OPEN, { version: 1, requestId: "o", ...selected, actionId: "tasks" });
+      expect(reply).toHaveBeenLastCalledWith({ success: false, error: "Status action is unavailable." });
+      await expect(h.commands.get("background")?.handler("", h.ctx)).rejects.toThrow("already open");
+      expect(native.custom).toHaveBeenCalledOnce();
+      expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+      expect(h.messages).toEqual([]);
+      expect(h.userMessages).toEqual([]);
+    } finally {
+      off();
+      await h.emit("session_shutdown");
+      expect(fake.managers[0].listeners.size).toBe(0);
+      expect(h.bus.get(STATUS_QUERY)?.size).toBe(0);
+      expect(h.bus.get(STATUS_OPEN)?.size).toBe(0);
+      native.dispose();
+    }
+  });
+
+  it("permanently retires queried divergence, keeps appends, rotates on tree and fences admitted late opens", async () => {
+    const h = harness();
+    await h.emit("session_start");
+    const first = query(h);
+    h.setBranch(["root", "append"]);
+    expect(query(h)).toEqual(first);
+    h.events.emit(STATUS_OPEN, { version: 1, requestId: "late", ...first, actionId: "tasks" });
+    h.setBranch(["root", "sibling"]);
+    expect(query(h)).toBeUndefined();
+    h.setBranch(["root", "append"]);
+    expect(query(h)).toBeUndefined();
+    await Promise.resolve();
+    expect(h.custom).not.toHaveBeenCalled();
+    expect(fake.managers[0].listeners.size).toBe(0);
+    await h.emit("session_tree");
+    expect(query(h)?.surfaceId).not.toBe(first?.surfaceId);
+    const second = query(h);
+    h.events.emit(STATUS_OPEN, { version: 1, requestId: "shutdown-late", ...second, actionId: "tasks" });
+    await h.emit("session_shutdown");
+    await Promise.resolve();
+    expect(h.custom).not.toHaveBeenCalled();
+    await h.emit("session_start");
+    expect(query(h)?.surfaceId).not.toBe(second?.surfaceId);
+    await h.emit("session_shutdown");
+  });
+
+  it.each(["rpc", "json", "print"])("has no provider or permanent status subscription in %s", async (mode) => {
+    const h = harness(mode);
+    await h.emit("session_start");
+    expect(query(h)).toBeUndefined();
+    expect(fake.managers.at(-1)?.listeners.size).toBe(0);
+    expect(h.status).not.toHaveBeenCalled();
+    await h.emit("session_shutdown");
+  });
+
+  it("coalesces silent completion/output/clear bursts without model turns and releases the pending timer", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.emit("session_start");
+    const owned = fake.managers[0];
+    const job = await owned.manager.start({ command: "true", cwd: process.cwd(), attention: "off" });
+    vi.advanceTimersByTime(100);
+    expect(h.status).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R1 F0");
+    h.status.mockClear();
+    job.status = "exited";
+    job.endedAt = 2;
+    for (let i = 0; i < 50; i++) owned.changes();
+    vi.advanceTimersByTime(99);
+    expect(h.status).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(h.status).toHaveBeenCalledExactlyOnceWith("pi-background", "Ctrl+Alt+B tasks · R0 F1");
+    owned.manager.clear(job.id);
+    vi.advanceTimersByTime(100);
+    expect(h.status).toHaveBeenLastCalledWith("pi-background", undefined);
+    owned.changes();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.mocked(owned.manager.shutdown).mockImplementationOnce(async () => {
+      expect(owned.listeners.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+    await h.emit("session_shutdown");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(owned.listeners.size).toBe(0);
+    const calls = h.status.mock.calls.length;
+    owned.changes();
+    vi.advanceTimersByTime(1000);
+    expect(h.status).toHaveBeenCalledTimes(calls);
+    expect(h.messages).toEqual([]);
+    expect(h.userMessages).toEqual([]);
+  });
 });
 
 describe("extension lifecycle", () => {
@@ -538,7 +671,7 @@ describe("extension lifecycle", () => {
       expect(native.custom).not.toHaveBeenCalled();
       const opening = h.commands.get("background")?.handler("", h.ctx);
       await vi.waitFor(() => expect(native.component()).toBeDefined());
-      expect(fake.managers[0].listeners.size).toBe(1);
+      expect(fake.managers[0].listeners.size).toBe(2);
       native.key("x");
       native.key("y");
       await vi.waitFor(() => expect(fake.managers[0].manager.stop).toHaveBeenCalledWith("job-0"));
@@ -546,7 +679,7 @@ describe("extension lifecycle", () => {
       expect(list?.details.pendingNotifications).toBe(0);
       native.key("\x1b");
       await opening;
-      expect(fake.managers[0].listeners.size).toBe(0);
+      expect(fake.managers[0].listeners.size).toBe(1);
     } finally {
       await h.emit("session_shutdown");
       native.dispose();
@@ -607,6 +740,7 @@ describe("extension lifecycle", () => {
       expect(fake.managers[1].manager.stop).not.toHaveBeenCalled();
       native.key("\x1b");
       native.key("\x1b");
+      native.key("\x1b");
       await newer;
     } finally {
       await h.emit("session_shutdown");
@@ -642,7 +776,7 @@ describe("extension lifecycle", () => {
       expect(h.userMessages).toEqual([]);
       native.key("\x1b");
       await opening;
-      expect(fake.managers[0].listeners.size).toBe(0);
+      expect(fake.managers[0].listeners.size).toBe(1);
       // Both entrypoints keep the same owned stop/cancel/status/retirement path.
       await h.tools.get("bash_background")?.execute("start", { command: "sleep 1" }, undefined, undefined, h.ctx);
       fake.managers[0].emit(event());

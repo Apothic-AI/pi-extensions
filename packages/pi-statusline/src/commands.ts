@@ -1,4 +1,9 @@
-import { DynamicBorder, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  DynamicBorder,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   Container,
   Key,
@@ -63,6 +68,7 @@ export interface StatuslineCommandOptions {
   save?: (settingsPath: string, rawDocument: string) => LoadedStatuslineSettings;
   getMenuOwner?(): CommandOwner;
   getExternalEditorCommand?(): string | undefined;
+  inspect?(ctx: ExtensionContext): Promise<void>;
   /**
    * Whether `ctx` belongs to the session this runtime is currently drawing.
    *
@@ -82,7 +88,7 @@ export interface StatuslineCommandOptions {
  */
 export function registerStatuslineCommand(pi: ExtensionAPI, options: StatuslineCommandOptions) {
   pi.registerCommand("statusline", {
-    description: "Open or inspect the statusline settings",
+    description: "Configure the statusline or inspect extension statuses",
     getArgumentCompletions: completeStatuslineArguments,
     handler: async (args, ctx) => {
       if (options.isCurrentSession?.(ctx) === false) return;
@@ -160,6 +166,9 @@ export async function handleStatuslineCommand(
     case "settings":
       await editSettings(ctx, options);
       return;
+    case "inspect":
+      if (current()) await options.inspect?.(originalCtx);
+      return;
     case "status":
       showStatus(ctx, options);
       return;
@@ -185,7 +194,8 @@ async function showMainMenu(ctx: ExtensionCommandContext, options: StatuslineCom
   };
   if (owner.signal.aborted || !owner.isCurrent()) return;
   type Screen = "main" | "advanced" | "information";
-  type Action = "appearance" | "setInformation" | "layout" | "edit" | "status" | "help" | "back";
+  type Action = "appearance" | "setInformation" | "layout" | "edit" | "inspect" | "status" | "help" | "back";
+  let inspectRequested = false;
   const menu = defineMenu<undefined, Screen, Action, ExtensionCommandContext>({
     start: "main",
     screens: {
@@ -208,6 +218,7 @@ async function showMainMenu(ctx: ExtensionCommandContext, options: StatuslineCom
             { id: "advanced", label: "Advanced", to: "advanced" },
             { id: "status", label: "Status", action: "status" },
             { id: "help", label: "Help", action: "help" },
+            { id: "inspect", label: "Inspect extension statuses", action: "inspect" },
           ],
           hint: "close",
         };
@@ -270,6 +281,11 @@ async function showMainMenu(ctx: ExtensionCommandContext, options: StatuslineCom
         await editSettings(ctx, options);
         return { kind: "close" };
       },
+      inspect: async () => {
+        // Finish the settings menu before transferring focus to an inspector.
+        inspectRequested = true;
+        return { kind: "close" };
+      },
       status: async () => {
         showStatus(ctx, options);
         return { kind: "close" };
@@ -290,6 +306,7 @@ async function showMainMenu(ctx: ExtensionCommandContext, options: StatuslineCom
   } finally {
     fallbackController.abort(new DOMException("Statusline menu closed", "AbortError"));
   }
+  if (inspectRequested && isOwnerCurrent(owner)) await options.inspect?.(ctx);
 }
 
 async function choosePalettePreset(ctx: ExtensionCommandContext, options: StatuslineCommandOptions) {
@@ -883,10 +900,12 @@ function showHelp(ctx: ExtensionCommandContext, settingsPath: string) {
   ctx.ui.notify(
     [
       "/statusline — open Appearance, Information, Advanced, Status, and Help",
+      "/statusline inspect — inspect extension statuses (Ctrl+Alt+S)",
       "/statusline settings — edit and apply JSON",
       "/statusline status — show source, path, information level, and warnings",
       "/statusline help — show this help",
-      "Menu actions: Appearance, Information, Advanced, Status, Help.",
+      "Menu actions: Appearance, Information, Advanced, Status, Help, Inspect extension statuses.",
+      "Inspector: arrows/configured selection keys navigate, Enter opens owner detail, Esc closes.",
       "Information levels: minimal, balanced, detailed; any other segment array is custom.",
       "Advanced actions: Custom layout, Edit settings JSON, Back.",
       `Settings: ${settingsPath}`,

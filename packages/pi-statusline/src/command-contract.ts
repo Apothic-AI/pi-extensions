@@ -4,6 +4,7 @@ export const STATUSLINE_SUBCOMMANDS: readonly AutocompleteItem[] = [
   { value: "settings", label: "settings", description: "Edit pi-statusline.json" },
   { value: "status", label: "status", description: "Show effective statusline settings" },
   { value: "help", label: "help", description: "Show configuration help" },
+  { value: "inspect", label: "inspect", description: "Inspect extension statuses (Ctrl+Alt+S)" },
 ];
 
 export function completeStatuslineArguments(prefix: string): AutocompleteItem[] | null {

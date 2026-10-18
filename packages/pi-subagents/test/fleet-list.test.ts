@@ -71,7 +71,7 @@ interface Harness {
 const fleets: FleetList[] = [];
 afterEach(() => { for (const fleet of fleets.splice(0)) fleet.dispose(); });
 
-function harness(agents: AgentRecord[]): Harness {
+function harness(agents: AgentRecord[], rows = 40): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
   let editorText = "";
@@ -80,7 +80,7 @@ function harness(agents: AgentRecord[]): Harness {
   let overlayDone: ((r: undefined) => void) | undefined;
   let overlayComponent: { handleInput(data: string): void; render(width: number): string[] } | undefined;
   let focused: unknown;
-  const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 }, getFocusedComponent: () => focused };
+  const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows }, getFocusedComponent: () => focused };
   let mounted: { render(w: number): string[]; invalidate(): void } | undefined;
 
   const ui: FleetUICtx = {
@@ -376,10 +376,25 @@ describe("FleetList vs other focused components (#123)", () => {
 });
 
 describe("FleetList rendering", () => {
+  it.each([4, 8, 24, 40])("keeps exactly one separator before the footer at %i rows", rows => {
+    for (const count of [0, 1, 5, 8]) {
+      const agents = Array.from({ length: count }, (_, i) => makeRecord({ id: `a${i}` }));
+      const lines = harness(agents, rows).render(120);
+      if (!count) {
+        expect(lines).toEqual([]);
+        continue;
+      }
+      expect(lines.length).toBeLessThanOrEqual(Math.floor(rows / 2));
+      expect(lines.at(-1)).toBe("");
+      expect(lines.at(-2)?.trim()).not.toBe("");
+      if (rows >= 24) expect(lines.some(line => line.includes("Sleep then report 1"))).toBe(true);
+    }
+  });
+
   it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
     const lines = h.render(120);
-    // hint + blank + main + one agent
+    // hint + blank + main + one agent + one footer separator
     expect(lines[0]).toContain("← agents");
     expect(lines.find(l => l.includes("main"))).toContain("<accent>"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
