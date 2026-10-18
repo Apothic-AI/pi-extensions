@@ -5,6 +5,8 @@
 > [!WARNING]
 > This extension is experimental. Its metrics, storage format, and dashboard may change between releases.
 
+Healthy startup, reload, and resume do not emit an experimental warning. Storage initialization and write failures still report actionable warnings.
+
 `@signalridge/pi-analytics` is independently publishable and opt-in: it is marked `piExtension.lifecycle: experimental`, so it is released only when a changeset names it and is never enabled for you automatically.
 
 `@signalridge/pi-analytics` is a local-first [Pi coding agent](https://pi.dev) extension that counts model calls, skill activations, tool activity, and observed provider errors without storing conversation or tool content.

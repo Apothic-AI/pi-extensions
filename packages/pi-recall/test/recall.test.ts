@@ -69,16 +69,17 @@ async function navigate(
   }
 }
 
-test("registers /recall and warns visibly on every started UI session", async () => {
+test("registers /recall without routine warnings on startup, reload, resume or new sessions", async () => {
   const mock = createMockPi();
   createRecallExtension({ getAgentDir: () => "/agent", createStore: () => emptyStore() })(mock.pi);
   assert.ok(mock.commands.has("recall"));
-  const first = createMockContext({ hasUI: true, mode: "rpc" });
-  const second = createMockContext({ hasUI: true, mode: "rpc" });
-  await emit(mock, "session_start", { reason: "startup" }, first.ctx);
-  await emit(mock, "session_start", { reason: "new" }, second.ctx);
-  assert.match(first.notifications[0]?.message ?? "", /Pi Recall is experimental/i);
-  assert.match(second.notifications[0]?.message ?? "", /Pi Recall is experimental/i);
+  for (const mode of ["tui", "rpc", "print", "json"] as const) {
+    for (const reason of ["startup", "reload", "resume", "new"] as const) {
+      const current = createMockContext({ hasUI: mode === "tui" || mode === "rpc", mode });
+      await emit(mock, "session_start", { reason }, current.ctx);
+      assert.deepEqual(current.notifications, [], `${mode}/${reason}`);
+    }
+  }
 });
 
 test("rejects arguments and print/json modes before opening interactive UI", async () => {

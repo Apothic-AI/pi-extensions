@@ -69,8 +69,11 @@ Avoid loading a global npm installation and the local workspace at the same time
 4. Run `/codex-compact` to inspect the effective route or choose **Compact now**.
 5. After compaction, continue the session normally; compatible requests replay the opaque checkpoint.
 
-The extension shows an experimental warning at session start in UI-capable modes. When the active
-model is unsupported, compaction remains entirely Pi-native.
+Healthy startup, reload, and resume do not emit an experimental warning. In UI-capable modes,
+a short portability warning appears once per loaded extension instance when its first remote
+checkpoint is committed—not on native compaction or failed/cancelled remote attempts. Invalid
+settings, fallback failures, and incompatible-model warnings remain visible. When the active model
+is unsupported, compaction remains entirely Pi-native.
 
 ## Command
 

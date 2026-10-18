@@ -148,7 +148,7 @@ test("factory registers lifecycle hooks without constructing or opening storage"
   ]);
 });
 
-test("session start synchronously installs a lazy store and shows the experimental warning", async () => {
+test("session start synchronously installs a lazy store without a routine warning", async () => {
   const store = new FakeStore();
   let path = "";
   const mock = createMockPi();
@@ -162,10 +162,20 @@ test("session start synchronously installs a lazy store and shows the experiment
   const started = lifecycleContext();
   await emit(mock, "session_start", { reason: "startup" }, started.ctx);
   assert.equal(path, "/agent/pi-analytics");
-  assert.deepEqual(started.notifications[0], {
-    message: "pi-analytics is experimental; its metrics and dashboard may change.",
-    level: "warning",
-  });
+  assert.deepEqual(started.notifications, []);
+});
+
+test("healthy startup, reload, resume and new sessions stay quiet in every mode", async () => {
+  for (const mode of ["tui", "rpc", "print", "json"] as const) {
+    const mock = createMockPi();
+    createAnalyticsExtension({ createStore: () => new FakeStore(), getAgentDir: () => "/agent" })(mock.pi);
+    const current = lifecycleContext({ mode, hasUI: mode === "tui" || mode === "rpc" });
+    for (const reason of ["startup", "reload", "resume", "new"] as const) {
+      await emit(mock, "session_start", { reason }, current.ctx);
+      assert.deepEqual(current.notifications, [], `${mode}/${reason}`);
+    }
+    await emit(mock, "session_shutdown", { reason: "quit" }, current.ctx);
+  }
 });
 
 test("a repeated session start aborts and closes the previous lazy store", async () => {

@@ -5,6 +5,8 @@
 > [!WARNING]
 > Pi Recall is experimental. Its storage format and interaction flow may change between releases.
 
+Healthy startup, reload, and resume do not emit an experimental warning. Command and storage errors are still reported when the affected action runs.
+
 `@signalridge/pi-recall` saves selected text messages from the active Pi session branch and lets you preview or quote them in another session. Saved content remains local until you explicitly insert a quote into a draft and submit it.
 
 ## Features
