@@ -9,7 +9,6 @@ import type { AnalyticsSnapshot, TimeRange } from "./storage/queries.js";
 import { AnalyticsStore } from "./storage/store.js";
 import type { ModelIdentity, SettledRun, TriggerSource } from "./types.js";
 
-const EXPERIMENTAL_WARNING = "pi-analytics is experimental; its metrics and dashboard may change.";
 const STORAGE_DIRECTORY = "pi-analytics";
 
 export interface AnalyticsStorePort {
@@ -87,7 +86,6 @@ export function createAnalyticsExtension(
 
     pi.on("session_start", (event, ctx) => {
       ++sessionGeneration;
-      if (ctx.hasUI) ctx.ui.notify(EXPERIMENTAL_WARNING, "warning");
       const previousStore = store;
       sessionController.abort(new DOMException("Analytics session replaced", "AbortError"));
       if (previousStore) retire(previousStore);

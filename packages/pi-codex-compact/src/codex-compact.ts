@@ -60,7 +60,7 @@ function resetTailProvenance(ctx: ExtensionContext): void {
 
 const STATUS_KEY = "codex-compact";
 const EXPERIMENTAL_WARNING =
-  "Experimental: Codex Remote Compaction V2 uses an opaque, provider-specific checkpoint. Sessions require this extension and openai-codex for full replay.";
+  "Codex remote compaction is experimental; full replay requires this extension and the same openai-codex model.";
 
 function isSupportedModel(model: Model<Api> | undefined): model is Model<"openai-codex-responses"> {
   return model?.provider === "openai-codex" && piAi.hasApi(model, "openai-codex-responses");
@@ -380,6 +380,7 @@ export function createCodexCompactExtension(
     let sessionController = new AbortController();
     let generation = 0;
     let active = true;
+    let experimentalWarningShown = false;
 
     pi.registerCommand("codex-compact", {
       description: "Compact now or configure experimental Codex Remote Compaction V2",
@@ -423,7 +424,6 @@ export function createCodexCompactExtension(
         return;
       }
       if (ctx.hasUI) {
-        ctx.ui.notify(EXPERIMENTAL_WARNING, "warning");
         if (state.kind === "invalid") {
           ctx.ui.notify(
             `Invalid pi-codex-compact.json; using defaults without overwriting it. ${state.issue}`,
@@ -451,6 +451,14 @@ export function createCodexCompactExtension(
       if (!active) return;
       resetTailProvenance(ctx);
       const checkpoint = activeCheckpoint(ctx);
+      if (checkpoint?.entry.id === event.compactionEntry.id && ctx.hasUI && !experimentalWarningShown) {
+        experimentalWarningShown = true;
+        try {
+          ctx.ui.notify(EXPERIMENTAL_WARNING, "warning");
+        } catch {
+          // An unavailable UI must not interfere with a committed checkpoint.
+        }
+      }
       if (
         !piCodingAgentCompat.buildSessionProjection &&
         event.willRetry &&
