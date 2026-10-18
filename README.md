@@ -249,6 +249,9 @@ See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 
 ## Reference reviews
 
+- [Task and status navigation](docs/status-navigation.md): shell-job overview/logs, selectable owner detail views, and compact Fleet presentation.
+
+- [October extension refresh](docs/extension-refresh-2026-10.md): current upstream deltas, all-package role choices, additive candidates, experimental risks, and selective remediation.
 - [Community extension survey](docs/community-extension-survey.md): Todo/checklist alternatives, project task ledgers, and additive plugin patterns with primary-source links and compatibility caveats.
 - [Task and human-control acceptance ledger](docs/task-human-controls.md): implementation scope, verified evidence and remaining release gates; not a publication claim.
 - [Workflow and subagent UI synchronization](docs/workflow-ui-upstream-sync.md): selective upstream adoption, interactive ownership and verification boundaries.

@@ -85,6 +85,7 @@ async function fixture(earlier = () => {}) {
     session,
     manager,
     root,
+    cwd,
     command,
     faux,
     queued,
@@ -689,6 +690,83 @@ for (const deletion of ["cancel owned", "nuke --yes"]) {
       held.release();
       await running;
       assert.equal(tools, 0);
+    } finally {
+      held.release();
+      await f.close();
+    }
+  });
+}
+
+for (const stopFirst of [false, true]) {
+  test(`resume during a later tool hook preserves the accepted run until ${stopFirst ? "stopped" : "settled"}`, async () => {
+    const f = await fixture();
+    const entered = gate();
+    const held = gate();
+    let tools = 0;
+    let toolSignal;
+    try {
+      f.api.registerTool({
+        name: "probe",
+        label: "Probe",
+        description: "Substantive probe",
+        parameters: { type: "object", properties: {} },
+        execute: async () => {
+          tools++;
+          return { content: [], details: undefined };
+        },
+      });
+      f.api.on("tool_call", async (event, ctx) => {
+        if (event.toolName === "probe") {
+          toolSignal = ctx.signal;
+          entered.release();
+          await held.promise;
+        }
+      });
+      await f.command("start owned");
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" }),
+        response("ordinary"),
+      ]);
+      const running = f.session.prompt(f.queued[0], { source: "extension" });
+      await entered.promise;
+      const stateFile = path.join(f.cwd, ".ralph", "owned.state.json");
+      const before = fs.readFileSync(stateFile);
+      await f.command("resume owned");
+      assert.deepEqual(fs.readFileSync(stateFile), before);
+      assert.equal(f.state().iteration, 1);
+      assert.equal(f.queued.length, 1);
+      assert.equal(toolSignal.aborted, false);
+      // Invalid starts also cannot steal the accepted operation's abort authority.
+      await f.command("start other --max-iterations 0.5");
+      const start = f.session.extensionRunner.getToolDefinition("ralph_start");
+      await assert.rejects(
+        start.execute(
+          "invalid",
+          { name: "other", taskContent: "overwrite", reflectEvery: -1 },
+          undefined,
+          undefined,
+          f.session.extensionRunner.createCommandContext(),
+        ),
+        /reflectEvery.*nonnegative safe integer/,
+      );
+      assert.deepEqual(fs.readFileSync(stateFile), before);
+      assert.equal(fs.existsSync(path.join(f.cwd, ".ralph", "other.md")), false);
+      assert.equal(f.queued.length, 1);
+      if (stopFirst) {
+        await f.command("stop");
+        assert.equal(toolSignal.aborted, true, "resume rejection preserves cancellation capability");
+      }
+      held.release();
+      await running;
+      assert.equal(tools, stopFirst ? 0 : 1);
+      assert.equal(f.state().status, stopFirst ? "paused" : "active");
+      await f.command("resume owned");
+      assert.equal(f.state().iteration, 2);
+      assert.equal(f.state().status, "active");
+      assert.equal(f.queued.length, 2);
+      f.faux.setResponses([response("resumed")]);
+      await f.session.prompt(f.queued[1], { source: "extension" });
+      assert.equal(f.state().iteration, 2);
     } finally {
       held.release();
       await f.close();

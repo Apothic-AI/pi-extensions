@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
 import { WorkflowEngine } from "../src/engine.js";
 import piWorkflows from "../src/index.js";
+import { STATUS_OPEN, STATUS_QUERY } from "../src/status-actions.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -110,6 +111,7 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
     hasUI: false,
     mode: "print" as "print" | "rpc" | "tui",
     ui: {
+      setStatus: vi.fn(),
       setWidget: (_key: string, content: Parameters<ExtensionContext["ui"]["setWidget"]>[1]) => {
         if (typeof content === "function") {
           const component = content(
@@ -168,6 +170,273 @@ type WorkflowTool = {
 function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
   return fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as WorkflowTool;
 }
+
+describe("workflow status lifecycle", () => {
+  function query(fixture: ReturnType<typeof createPi>) {
+    const replies: Array<{ data: { surfaceId: string; providerId: string; sessionId: string } }> = [];
+    const off = fixture.bus.on(`${STATUS_QUERY}:reply:q`, (raw) => replies.push(raw as (typeof replies)[number]));
+    fixture.bus.emit(STATUS_QUERY, { version: 1, requestId: "q", sessionId: "workflow-fixture-session" });
+    off();
+    const data = replies[0]?.data;
+    return data && { surfaceId: data.surfaceId, providerId: data.providerId, sessionId: data.sessionId };
+  }
+
+  it("opens the owned navigator only after admission without starting work, then clears only its status", async () => {
+    const f = createPi(false);
+    const screens: string[] = [];
+    let close: (() => void) | undefined;
+    const custom = vi.fn(async (factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) => {
+      await new Promise<void>((resolve) => {
+        void Promise.resolve(
+          factory(
+            { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
+            { fg: (_token: string, text: string) => text, bold: (text: string) => text } as never,
+            { matches: () => false, getKeys: () => [] } as never,
+            resolve,
+          ),
+        ).then((component) => {
+          screens.push(component.render(80).join("\n"));
+          close = () => {
+            component.handleInput?.("\u001b");
+            component.handleInput?.("\u001b");
+          };
+        });
+      });
+    });
+    const ctx = { ...f.ctx, mode: "tui" as const, hasUI: true, ui: { ...f.ctx.ui, custom } };
+    const start = vi.spyOn(WorkflowEngine.prototype, "start");
+    piWorkflows(f.pi as never);
+    expect(query(f)).toBeUndefined();
+    await f.lifecycle.get("session_start")?.({}, ctx);
+    const selected = query(f);
+    expect(selected).toMatchObject({ providerId: "pi-workflows", sessionId: "workflow-fixture-session" });
+    expect(custom).not.toHaveBeenCalled();
+    const reply = vi.fn();
+    const off = f.bus.on(`${STATUS_OPEN}:reply:o`, reply);
+    try {
+      f.bus.emit(STATUS_OPEN, { version: 1, requestId: "o", ...selected, actionId: "runs" });
+      expect(reply).toHaveBeenCalledExactlyOnceWith({ success: true, data: { accepted: true } });
+      expect(custom).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(screens).toHaveLength(1));
+      f.bus.emit(STATUS_OPEN, { version: 1, requestId: "o", ...selected, actionId: "runs" });
+      expect(reply).toHaveBeenLastCalledWith({ success: false, error: "Status action is unavailable." });
+      expect(custom).toHaveBeenCalledOnce();
+      expect(start).not.toHaveBeenCalled();
+      expect(f.entries).toEqual([]);
+      close?.();
+    } finally {
+      off();
+      close?.();
+      await f.lifecycle.get("session_shutdown")?.({}, ctx);
+      expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", undefined);
+      expect(f.ctx.ui.setStatus.mock.calls.every(([key]) => key === "pi-workflows")).toBe(true);
+      expect(query(f)).toBeUndefined();
+      start.mockRestore();
+    }
+  });
+
+  it("keeps ordinary appends but retires live divergence permanently and rotates before late tree/reload callbacks", async () => {
+    const f = createPi(false, 0, [{ id: "root", type: "custom" }]);
+    const custom = vi.fn();
+    const ctx = {
+      ...f.ctx,
+      mode: "tui" as const,
+      hasUI: true,
+      ui: { ...f.ctx.ui, custom },
+      sessionManager: {
+        ...f.ctx.sessionManager,
+        getLeafId: () => f.ctx.sessionManager.getBranch().at(-1)?.id ?? null,
+      },
+    };
+    piWorkflows(f.pi as never);
+    await f.lifecycle.get("session_start")?.({}, ctx);
+    const first = query(f);
+    f.entries.push({ id: "append", type: "custom" });
+    expect(query(f)).toEqual(first);
+    f.bus.emit(STATUS_OPEN, { version: 1, requestId: "late", ...first, actionId: "runs" });
+    f.entries.splice(1, 1, { id: "sibling", type: "custom" });
+    expect(query(f)).toBeUndefined();
+    f.entries.splice(1, 1, { id: "append", type: "custom" });
+    expect(query(f)).toBeUndefined();
+    await Promise.resolve();
+    expect(custom).not.toHaveBeenCalled();
+    await f.lifecycle.get("session_tree")?.({}, ctx);
+    const second = query(f);
+    expect(second?.surfaceId).not.toBe(first?.surfaceId);
+    f.bus.emit(STATUS_OPEN, { version: 1, requestId: "before-tree", ...second, actionId: "runs" });
+    f.bus.emit("subagents:session_tree_committed", { event: {} });
+    await Promise.resolve();
+    expect(custom).not.toHaveBeenCalled();
+    await f.lifecycle.get("session_tree")?.({}, ctx);
+    const third = query(f);
+    expect(third?.surfaceId).not.toBe(second?.surfaceId);
+    f.bus.emit(STATUS_OPEN, { version: 1, requestId: "shutdown", ...third, actionId: "runs" });
+    await f.lifecycle.get("session_shutdown")?.({}, ctx);
+    await Promise.resolve();
+    expect(custom).not.toHaveBeenCalled();
+    await f.lifecycle.get("session_start")?.({}, ctx);
+    expect(query(f)?.surfaceId).not.toBe(third?.surfaceId);
+    await f.lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it.each(["rpc", "print", "tui"] as const)(
+    "does not advertise or set footer status without terminal UI in %s",
+    async (mode) => {
+      const f = createPi(false);
+      f.ctx.mode = mode;
+      f.ctx.hasUI = mode === "rpc";
+      piWorkflows(f.pi as never);
+      await f.lifecycle.get("session_start")?.({}, f.ctx);
+      expect(query(f)).toBeUndefined();
+      await f.lifecycle.get("session_shutdown")?.({}, f.ctx);
+      expect(f.ctx.ui.setStatus).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rechecks the exact source when the host defers custom construction past retirement", async () => {
+    const f = createPi(false);
+    let mount: (() => Promise<unknown>) | undefined;
+    const custom = vi.fn(
+      (factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) =>
+        new Promise<void>((resolve, reject) => {
+          mount = async () => {
+            try {
+              const component = await factory(
+                { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
+                { fg: (_token: string, text: string) => text, bold: (text: string) => text } as never,
+                { matches: () => false, getKeys: () => [] } as never,
+                resolve,
+              );
+              return component;
+            } catch (error) {
+              reject(error);
+              throw error;
+            }
+          };
+        }),
+    );
+    const ctx = { ...f.ctx, mode: "tui" as const, hasUI: true, ui: { ...f.ctx.ui, custom } };
+    piWorkflows(f.pi as never);
+    await f.lifecycle.get("session_start")?.({}, ctx);
+    const selected = query(f);
+    f.bus.emit(STATUS_OPEN, { version: 1, requestId: "deferred", ...selected, actionId: "runs" });
+    await vi.waitFor(() => expect(mount).toBeDefined());
+    await f.lifecycle.get("session_tree")?.({}, ctx);
+    const current = query(f);
+    expect(current?.surfaceId).not.toBe(selected?.surfaceId);
+    await expect(mount?.()).rejects.toThrow("retired");
+    await Promise.resolve();
+    expect(query(f)).toEqual(current);
+    expect(custom).toHaveBeenCalledOnce();
+    expect(f.entries).toEqual([]);
+    await f.lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("admits a replacement surface before the retired factory settles and keeps its reservation independent", async () => {
+    const f = createPi(false);
+    const mounts: Array<() => Promise<{ handleInput?(data: string): void; dispose?(): void }>> = [];
+    const custom = vi.fn(
+      (factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) =>
+        new Promise<void>((resolve, reject) => {
+          mounts.push(async () => {
+            try {
+              return await factory(
+                { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
+                { fg: (_token: string, text: string) => text, bold: (text: string) => text } as never,
+                { matches: () => false, getKeys: () => [] } as never,
+                resolve,
+              );
+            } catch (error) {
+              reject(error);
+              throw error;
+            }
+          });
+        }),
+    );
+    const ctx = { ...f.ctx, mode: "tui" as const, hasUI: true, ui: { ...f.ctx.ui, custom } };
+    piWorkflows(f.pi as never);
+    await f.lifecycle.get("session_start")?.({}, ctx);
+    const old = query(f);
+    f.bus.emit(STATUS_OPEN, { version: 1, requestId: "old", ...old, actionId: "runs" });
+    await vi.waitFor(() => expect(mounts).toHaveLength(1));
+    await f.lifecycle.get("session_tree")?.({}, ctx);
+    const current = query(f);
+    const reply = vi.fn();
+    const off = f.bus.on(`${STATUS_OPEN}:reply:new`, reply);
+    const offProbe = f.bus.on(`${STATUS_OPEN}:reply:probe`, reply);
+    let directOpening: Promise<void> | undefined;
+    let component: Awaited<ReturnType<(typeof mounts)[number]>> | undefined;
+    try {
+      f.bus.emit(STATUS_OPEN, { version: 1, requestId: "new", ...current, actionId: "runs" });
+      expect(reply).toHaveBeenLastCalledWith({ success: true, data: { accepted: true } });
+      await vi.waitFor(() => expect(mounts).toHaveLength(2));
+      component = await mounts[1]();
+      component.handleInput?.("\u001b");
+      component.dispose?.();
+      component = undefined;
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+      // Open directly so StatusActions.opening cannot mask a broken map slot.
+      const command = f.commandDefinitions.get("workflows") as {
+        handler(args: string, context: unknown): Promise<void>;
+      };
+      directOpening = command.handler("", ctx);
+      await vi.waitFor(() => expect(mounts).toHaveLength(3));
+      component = await mounts[2]();
+      await expect(mounts[0]()).rejects.toThrow("retired");
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+      // A fresh request ID also avoids duplicate-request rejection as a false positive.
+      f.bus.emit(STATUS_OPEN, { version: 1, requestId: "probe", ...current, actionId: "runs" });
+      expect(reply).toHaveBeenLastCalledWith({ success: false, error: "Status action is unavailable." });
+      expect(custom).toHaveBeenCalledTimes(3);
+    } finally {
+      off();
+      offProbe();
+      component?.handleInput?.("\u001b");
+      component?.dispose?.();
+      await directOpening;
+      await f.lifecycle.get("session_shutdown")?.({}, ctx);
+    }
+  });
+
+  it("publishes active, paused, stopped and empty run authority on the existing refresh cadence", async () => {
+    const f = createPi(false);
+    f.ctx.mode = "tui";
+    f.ctx.hasUI = true;
+    piWorkflows(f.pi as never);
+    await f.lifecycle.get("session_start")?.({}, f.ctx);
+    const pending = workflowTool(f).execute(
+      "footer",
+      {
+        script: 'export const meta = { name: "footer", description: "test" }; await checkpoint("wait");',
+        background: false,
+      },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    f.ctx.ui.confirm.mockImplementation(() => new Promise<boolean>(() => {}));
+    const control = f.toolDefinitions.find(
+      (tool) => (tool as { name: string }).name === "workflow_control",
+    ) as WorkflowTool;
+    try {
+      await vi.waitFor(() => expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · A1 P0"));
+      const runId = (f.entries.find((raw) => (raw as { kind?: string }).kind === "run_created") as { runId: string })
+        .runId;
+      await control.execute("pause", { action: "pause", run_id: runId }, undefined, undefined, f.ctx);
+      await pending;
+      await vi.waitFor(() => expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · A0 P1"));
+      await control.execute("stop", { action: "stop", run_id: runId }, undefined, undefined, f.ctx);
+      await vi.waitFor(() =>
+        expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · C0 F0 S1"),
+      );
+      await control.execute("rm", { action: "rm", run_id: runId }, undefined, undefined, f.ctx);
+      await vi.waitFor(() => expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", undefined));
+    } finally {
+      await f.lifecycle.get("session_shutdown")?.({}, f.ctx);
+      await pending;
+    }
+  });
+});
 
 describe("pi-workflows loader context isolation", () => {
   it("sanitizes command notifications without changing stored workflow names and reports missing watches", async () => {

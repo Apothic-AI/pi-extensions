@@ -274,6 +274,16 @@ Parameters:
 - `write?`: write fixed text back to the file. Defaults to false.
 - `server?`: optional configured server name.
 
+Writing fixes uses Pi's native file-mutation queue when available, covering the complete
+read/compute/write window for cooperating tools. Immediately before a changed write,
+LSP rechecks that the workspace's canonical root and directory identity are unchanged,
+that the path is a regular file inside that captured boundary, and that its device,
+inode, and bytes still match the snapshot sent to the server. Detected external saves,
+replacements, or workspace/file symlink retargets reject the write; rerun the fix to
+compute fresh edits. Preview and no-op results do not write or require this final check.
+This is not filesystem locking or an atomic compare-and-swap: an external writer can
+still race the final check and descriptor write.
+
 ## Command
 
 ```text

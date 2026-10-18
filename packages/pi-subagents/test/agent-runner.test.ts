@@ -614,7 +614,9 @@ describe("agent-runner final output capture", () => {
     const { session } = createSession("");
     session.messages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: "old" });
     session.prompt.mockImplementation(async () => { session.messages = []; });
-    expect(await resumeAgent(session as never, "go")).toEqual({ text: "", failure: undefined });
+    expect(await resumeAgent(session as never, "go")).toEqual({
+      text: "", failure: undefined, aborted: false, steered: false,
+    });
   });
   it("returns the final assistant text even when no text_delta events were streamed", async () => {
     const { session } = createSession("LOCKED");

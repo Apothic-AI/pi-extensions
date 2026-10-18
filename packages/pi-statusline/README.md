@@ -52,10 +52,30 @@ Useful commands:
 
 ```text
 /statusline          open the interactive menu in TUI mode
+/statusline inspect  inspect current extension statuses (also Ctrl+Alt+S)
 /statusline settings edit and apply the canonical JSON document
 /statusline status   show the effective source and diagnostics
 /statusline help     show configuration help
 ```
+
+## Inspect extension statuses
+
+Use **Inspect extension statuses** in `/statusline`, `/statusline inspect`, or **Ctrl+Alt+S** to open a compact, read-only list of the current extension statuses. Arrows and Pi's configured selection bindings navigate; Enter opens the selected owner's detail view when that extension cooperates. Other statuses show bounded, sanitized, wrapped plain text inside the inspector. Esc closes without changing the editor draft. Inspection does not change status visibility or settings, execute slash commands, or send model messages. `/statusline status` remains the settings report.
+
+The shortcut opens only when the host's public focus capabilities identify an editor without autocomplete and no overlay is active. Hosts without these capabilities fail closed; use the slash command instead. The footer itself is unchanged. Lists and pending requests retire with their footer/session owner; removed rows lose selection rather than activating a neighbor.
+
+### Optional owner-detail protocol (v1)
+
+Statusline is a consumer, not a command dispatcher. Providers implement these `pi.events` channels locally; no cross-package source imports are needed. The exported wire types and consumer helpers live in `src/status-actions.ts`.
+
+- Query channel: `pi-ui:status-actions:v1:query`, request `{version:1,requestId,sessionId}`.
+- Reply channel: `${channel}:reply:${requestId}`, reply `{success:true,data:{version:1,providerId,surfaceId,sessionId,entries:[{statusKey,actionId,label}]}}`.
+- Open channel: `pi-ui:status-actions:v1:open`, request `{version:1,requestId,providerId,surfaceId,sessionId,actionId}`.
+- Open reply: `{success:true,data:{accepted:true}}` on its request's reply channel means **admission**, not completion. Providers reply on admission, then asynchronously open their owner-local view.
+
+Providers answer queries synchronously only for their active TUI session/branch, and handle opens only for their matching, unique owned surface; mismatches are ignored. Identifiers are nonempty strings of at most 128 characters; labels/status keys are at most 512. Snapshots use exact own data fields (no extra, inherited, or accessor fields), with unique status keys/action IDs. Discovery collects for 50 ms, at most 32 providers/64 entries in total. Exact repeated snapshots deduplicate; conflicting snapshots/surfaces suppress that provider, and multiply claimed status keys have no action. Aggregate overflow fails closed. Only exact current status keys match.
+
+Before opening, statusline fully disposes the selector, re-queries to validate the selected action identity, and rechecks session generation, live branch prefix, context and status key. Open admission times out after two seconds. Both requests support cancellation and clean up timers/listeners. Provider data grants no command-execution or session-control authority.
 
 ## Default information hierarchy
 
@@ -87,6 +107,8 @@ packages/pi-statusline/
 ├── src/
 │   ├── statusline.ts          # thin Pi lifecycle entrypoint
 │   ├── commands.ts            # settings and menu workflows
+│   ├── status-inspector.ts    # owned, read-only status navigation
+│   ├── status-actions.ts      # bounded owner-detail protocol consumer
 │   ├── render.ts              # data-to-segment projection
 │   ├── powerline.ts           # restrained text and optional powerline renderers
 │   ├── settings.ts            # canonical/legacy loading and atomic saves

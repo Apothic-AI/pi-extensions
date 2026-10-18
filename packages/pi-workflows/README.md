@@ -544,3 +544,21 @@ used it.
 - **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
 State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters. Navigation preflight vetoes while agents or workflows are active or cleaning up, without interrupting them. An accepted tree commit fences old callbacks in either extension load order and restores only the committed branch; preflight itself is not a commit point.
+
+## Status navigation
+
+With a compatible status selector, **Ctrl+Alt+S**, choose **Workflow runs**, then
+**Enter** opens this package's existing workflow navigator. `/workflows` and its
+watch/detail paths remain unchanged. Querying this optional TUI-only endpoint
+never opens a screen, starts/resumes a run, or sends a model/user message. Each
+selection belongs to one live session/branch surface; navigation and reload
+retire it rather than redirecting an old selection to another owner. Only
+bounded identifiers and labels cross this presentation wire, not execution
+controls, source, logs, or callbacks.
+
+The compact `pi-workflows` footer reports `A` active runs (pending, running,
+pausing, stopping) and `P` paused/interrupted runs. With only retained terminal
+runs it reports `C` completed, `F` failed, and `S` stopped counts; an empty run
+list clears it. Counts reflect run status, never inferred child completion.
+This uses the existing progress refresh cadence without adding another widget
+or taking focus.

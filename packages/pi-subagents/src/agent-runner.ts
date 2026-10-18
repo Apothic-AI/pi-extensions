@@ -48,6 +48,7 @@ import { ANSWER_SUBAGENT_QUESTION, type ParentQuestionHandler } from "./parent-q
 import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { captureQuestionOrigin } from "./question-origin.js";
+import { getDefaultTurnPolicy, type RunBudgets, selectResumeTurnPolicy, sessionBudgets, setDefaultTurnPolicy } from "./run-budget-policy.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createSupervisorTool } from "./supervisor.js";
@@ -353,9 +354,6 @@ async function runConfiguredGate(command: string, cwd: string, pi: ExtensionAPI)
   }
 }
 
-/** Default max turns. undefined = unlimited (no turn limit). */
-let defaultMaxTurns: number | undefined;
-
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
 export function normalizeMaxTurns(n: number | undefined): number | undefined {
   if (n == null || n === 0) return undefined;
@@ -363,9 +361,9 @@ export function normalizeMaxTurns(n: number | undefined): number | undefined {
 }
 
 /** Get the default max turns value. undefined = unlimited. */
-export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurns; }
+export function getDefaultMaxTurns(): number | undefined { return getDefaultTurnPolicy(); }
 /** Set the default max turns value. undefined or 0 = unlimited, otherwise minimum 1. */
-export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
+export function setDefaultMaxTurns(n: number | undefined): void { setDefaultTurnPolicy(normalizeMaxTurns(n)); }
 
 /** Additional turns allowed after the soft limit steer message. */
 /**
@@ -1810,9 +1808,84 @@ export async function runAgent(
     options.onSessionCreated(session);
   }
 
-  // Track turns for graceful max_turns enforcement
+  const limits = {
+    maxTurns: options.maxTurns ?? agentConfig?.maxTurns ?? getDefaultMaxTurns(),
+    maxTokens: normalizeMaxTurns(agentConfig?.maxTokens ?? defaultMaxTokens),
+    maxToolCalls: normalizeMaxTurns(agentConfig?.maxToolCalls ?? defaultMaxToolCalls),
+  };
+  sessionBudgets.set(session, limits);
+  const budget = createRunBudget(session, limits, options.onTurnEnd);
+
+  let currentMessageText = "";
+  const toolTimeouts = createToolTimeouts(session, noExtensions ? 0 : TOOL_CALL_ABORT_GRACE_MS, approvalTimer.isInteractiveAsk);
+  approvalTimer.armApproved = toolTimeouts.armApproved;
+  approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
+  // Own finalized output before dispatching observers that may throw.
+  const collector = collectResponseText(session);
+  const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+    budget.onEvent(event);
+    if (event.type === "message_start") currentMessageText = "";
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      currentMessageText += event.assistantMessageEvent.delta;
+      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+    }
+    if (event.type === "tool_execution_start") {
+      options.onToolActivity?.({ type: "start", toolName: event.toolName });
+      toolTimeouts.start(event);
+    }
+    if (event.type === "tool_execution_end") {
+      toolTimeouts.end(event);
+      options.onToolActivity?.({ type: "end", toolName: event.toolName });
+    }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const u = event.message.usage;
+      if (u) options.onAssistantUsage?.({
+        input: u.input ?? 0,
+        output: u.output ?? 0,
+        cacheWrite: u.cacheWrite ?? 0,
+      });
+    }
+    if (event.type === "compaction_end" && !event.aborted && event.result) {
+      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+    }
+  });
+
+  try {
+    throwIfAborted(options.signal);
+    await session.prompt(prompt);
+  } finally {
+    approvalTimer.armApproved = () => {};
+    approvalTimer.pauseHuman = () => () => {};
+    unsubTurns();
+    collector.unsubscribe();
+    toolTimeouts.dispose();
+  }
+
+  const baseText = collector.getText();
+  // Acceptance gates report evidence after the run, never spend another turn.
+  const responseText = agentConfig?.gate
+    ? `${baseText}${await runConfiguredGate(agentConfig.gate, effectiveCwd, options.pi)}`
+    : baseText;
+  completed = true;
+  return { responseText, session, ...budget.outcome(), failure: collector.getFailure() };
+  } finally {
+    cleanupAbort();
+    // Until onSessionCreated hands ownership to the manager, the runner must
+    // close a session whose setup/prompt failed.
+    if (!handedOff && !completed) {
+      try {
+        if (!options.signal?.aborted) await session.abort();
+      } finally {
+        await shutdownAndDisposeSession(session);
+      }
+    }
+  }
+}
+
+/** One invocation's soft/hard budgets, shared by fresh and resumed prompts. */
+function createRunBudget(session: AgentSession, limits: RunBudgets, onTurnEnd?: (count: number) => void) {
   let turnCount = 0;
-  const maxTurns = normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
+  const maxTurns = normalizeMaxTurns(limits.maxTurns);
   let softLimitReached = false;
   let aborted = false;
 
@@ -1825,8 +1898,8 @@ export async function runAgent(
   // `maxTurns`. That is the opposite of `maxSubagentSpawnsPerBranch`, and
   // deliberately: these are opt-in resource caps that ship off, while the
   // branch spawn budget is a safety valve that ships on.
-  const tokenBudget = normalizeMaxTurns(agentConfig?.maxTokens ?? defaultMaxTokens);
-  const toolCallBudget = normalizeMaxTurns(agentConfig?.maxToolCalls ?? defaultMaxToolCalls);
+  const tokenBudget = limits.maxTokens;
+  const toolCallBudget = limits.maxToolCalls;
   let budgetTokens = 0;
   let budgetToolCalls = 0;
   let tokenSoftReached = false;
@@ -1860,102 +1933,33 @@ export async function runAgent(
     return softReached;
   };
 
-  let currentMessageText = "";
-  // Per-tool timeout: a hung bash/MCP call must not stall the subagent forever.
-  // Each tool_execution_start arms a timer; the matching end clears it. On
-  // timeout the session is aborted — which propagates via the tool's
-  // AbortSignal into the hanging execute() and surfaces as an error result.
-  // `contact_supervisor` is excluded: it intentionally waits for a human.
-  const toolTimeouts = createToolTimeouts(session, noExtensions ? 0 : TOOL_CALL_ABORT_GRACE_MS, approvalTimer.isInteractiveAsk);
-  approvalTimer.armApproved = toolTimeouts.armApproved;
-  approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
-  // Own finalized output before observer dispatch: a synchronous callback
-  // failure must remain visible without erasing the answer it interrupted.
-  const collector = collectResponseText(session);
-  const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "turn_end") {
-      turnCount++;
-      options.onTurnEnd?.(turnCount);
-      if (maxTurns != null) {
-        if (!softLimitReached && turnCount >= maxTurns) {
-          softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
-        } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
-          aborted = true;
-          session.abort();
+  return {
+    outcome: () => ({ aborted, steered: softLimitReached }),
+    onEvent: (event: AgentSessionEvent): void => {
+      if (event.type === "turn_end") {
+        turnCount++;
+        if (maxTurns != null) {
+          if (!softLimitReached && turnCount >= maxTurns) {
+            softLimitReached = true;
+            session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
+            aborted = true;
+            session.abort();
+          }
         }
+        onTurnEnd?.(turnCount);
       }
-    }
-    if (event.type === "message_start") {
-      currentMessageText = "";
-    }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      currentMessageText += event.assistantMessageEvent.delta;
-      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
-    }
-    if (event.type === "tool_execution_start") {
-      options.onToolActivity?.({ type: "start", toolName: event.toolName });
-      toolTimeouts.start(event);
-    }
-    if (event.type === "tool_execution_end") {
-      toolTimeouts.end(event);
-      options.onToolActivity?.({ type: "end", toolName: event.toolName });
-      budgetToolCalls++;
-      toolSoftReached = applyBudget(budgetToolCalls, toolCallBudget, toolSoftReached, "tool call");
-    }
-    if (event.type === "message_end" && event.message.role === "assistant") {
-      const u = (event.message as any).usage;
-      if (u) options.onAssistantUsage?.({
-        input: u.input ?? 0,
-        output: u.output ?? 0,
-        cacheWrite: u.cacheWrite ?? 0,
-      });
-      if (u) {
-        // Same total as `getLifetimeTotal`: input + output + cacheWrite, with
-        // cacheRead deliberately excluded.
+      if (event.type === "tool_execution_end") {
+        budgetToolCalls++;
+        toolSoftReached = applyBudget(budgetToolCalls, toolCallBudget, toolSoftReached, "tool call");
+      }
+      if (event.type === "message_end" && event.message.role === "assistant" && event.message.usage) {
+        const u = event.message.usage;
         budgetTokens += (u.input ?? 0) + (u.output ?? 0) + (u.cacheWrite ?? 0);
         tokenSoftReached = applyBudget(budgetTokens, tokenBudget, tokenSoftReached, "token");
       }
-    }
-    if (event.type === "compaction_end" && !event.aborted && event.result) {
-      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-    }
-  });
-
-  try {
-    throwIfAborted(options.signal);
-    await session.prompt(prompt);
-  } finally {
-    approvalTimer.armApproved = () => {};
-    approvalTimer.pauseHuman = () => () => {};
-    unsubTurns();
-    collector.unsubscribe();
-    toolTimeouts.dispose();
-  }
-
-  const baseText = collector.getText();
-  // The acceptance gate runs AFTER the agent is done and its verdict is
-  // appended to the result, so the parent reads the check and the claim it is
-  // checking side by side. It deliberately does not steer the agent to fix
-  // what failed: the gate is evidence for the caller, not another turn.
-  const responseText = agentConfig?.gate
-    ? `${baseText}${await runConfiguredGate(agentConfig.gate, effectiveCwd, options.pi)}`
-    : baseText;
-  completed = true;
-  return { responseText, session, aborted, steered: softLimitReached, failure: collector.getFailure() };
-  } finally {
-    cleanupAbort();
-    // The manager takes ownership only after onSessionCreated is invoked. If
-    // setup or the first prompt fails before that hand-off, this runner owns
-    // the session and must close it instead of leaving a live session behind.
-    if (!handedOff && !completed) {
-      try {
-        if (!options.signal?.aborted) await session.abort();
-      } finally {
-        await shutdownAndDisposeSession(session);
-      }
-    }
-  }
+    },
+  };
 }
 
 /**
@@ -1965,34 +1969,48 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: {
+    maxTurns?: number;
+    onTurnEnd?: (count: number) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; aborted: boolean; steered: boolean }> {
   throwIfAborted(options.signal);
   assertSafeChildSession(session);
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-          });
-        }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-        }
-      })
-    : () => {};
+  const inherited = sessionBudgets.get(session);
+  const budget = createRunBudget(session, {
+    maxTurns: selectResumeTurnPolicy(session, options.maxTurns),
+    maxTokens: inherited ? inherited.maxTokens : normalizeMaxTurns(defaultMaxTokens),
+    maxToolCalls: inherited ? inherited.maxToolCalls : normalizeMaxTurns(defaultMaxToolCalls),
+  }, options.onTurnEnd);
+  let currentMessageText = "";
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
+    budget.onEvent(event);
+    if (event.type === "message_start") currentMessageText = "";
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      currentMessageText += event.assistantMessageEvent.delta;
+      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+    }
+    if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
+    if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const u = event.message.usage;
+      if (u) options.onAssistantUsage?.({
+        input: u.input ?? 0,
+        output: u.output ?? 0,
+        cacheWrite: u.cacheWrite ?? 0,
+      });
+    }
+    if (event.type === "compaction_end" && !event.aborted && event.result) {
+      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+    }
+  });
   // The child policy and its consent gate survive resumed turns. Replace the
   // original prompt's timer callback so a delayed approval cannot arm a stale
   // timer that the first prompt no longer clears.
@@ -2025,6 +2043,7 @@ export async function resumeAgent(
 
   return {
     text: collector.getText(),
+    ...budget.outcome(),
     failure: collector.getFailure(),
   };
 }

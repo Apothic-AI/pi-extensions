@@ -21,6 +21,7 @@ import {
   checkpointMarkerVariants,
   createCheckpointDetails,
   fallbackSummary,
+  fallbackSummaryVariants,
   parseCheckpointDetails,
   projectCheckpointContext,
 } from "./checkpoint.js";
@@ -71,6 +72,20 @@ function activeCompaction(entries: SessionEntry[]) {
   // superseded remote checkpoint after native fallback.
   const entry = buildContextEntries(entries, entries.at(-1)?.id ?? null)[0];
   return entry?.type === "compaction" ? entry : undefined;
+}
+
+function isOpaqueCompaction(entry: ReturnType<typeof activeCompaction>): boolean {
+  if (!entry) return false;
+  const details = entry.details;
+  if (details && typeof details === "object" && "kind" in details && details.kind === CHECKPOINT_KIND) return true;
+  // Missing details still have a recognizable complete portability summary.
+  // A native summary discussing checkpoints may share the introduction; that
+  // alone must not prevent future compaction of readable context.
+  const prefix = "OpenAI Codex Remote Compaction V2 checkpoint ";
+  if (!entry.summary.startsWith(prefix)) return false;
+  const end = entry.summary.indexOf(" stores the older history opaquely.", prefix.length);
+  if (end < 0) return false;
+  return fallbackSummaryVariants(entry.summary.slice(prefix.length, end)).includes(entry.summary);
 }
 
 function activeCheckpoint(ctx: ExtensionContext) {
@@ -176,11 +191,7 @@ function projectedCurrentMessages(
   const compaction = activeCompaction(event.branchEntries);
   const prior = parseCheckpointDetails(compaction?.details);
   if (!prior) {
-    const details = compaction?.details;
-    if (
-      (details && typeof details === "object" && "kind" in details && details.kind === CHECKPOINT_KIND) ||
-      compaction?.summary.startsWith("OpenAI Codex Remote Compaction V2 checkpoint ")
-    ) {
+    if (isOpaqueCompaction(compaction)) {
       throw new Error("The active opaque checkpoint is malformed");
     }
     return { messages: session.messages, transcript: session.messages };
@@ -335,6 +346,19 @@ async function compactRemotely(
     };
   } catch {
     if (!isCurrent()) {
+      return { cancel: true };
+    }
+    // Native preparation sees only this boundary's portability warning, not
+    // the opaque history. Falling through would replace it with a lossy native
+    // summary. Historical checkpoints superseded by a native boundary do not
+    // block fallback; current malformed/incompatible opaque boundaries do.
+    if (isOpaqueCompaction(activeCompaction(event.branchEntries))) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          "Codex remote compaction failed; cancelled to preserve the existing opaque checkpoint. Retry with its original Codex model or recover a pre-compaction branch.",
+          "warning",
+        );
+      }
       return { cancel: true };
     }
     notifyFailure(ctx, settings);

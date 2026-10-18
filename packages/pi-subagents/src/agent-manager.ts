@@ -35,15 +35,19 @@ import {
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
+  INTERNAL_RESUME_BUDGET_POLICY,
   type InternalAgentConfigOverride,
   type ParentPolicySnapshot,
+  type ResumeBudgetPolicy,
 } from "./internal-run.js";
+import { resolveMaxTurns } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
 import {
   assertParentModelRuntimeAvailable,
   parentModelSessionOptions,
 } from "./model-runtime-bridge.js";
 import type { ParentQuestionHandler } from "./parent-questions.js";
+import { selectResumeTurnPolicy } from "./run-budget-policy.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { TierThinking } from "./settings.js";
 import type {
@@ -313,6 +317,21 @@ function snapshotCleanupFailure(
     reason,
     recoveryCommands: Object.freeze([...recovery]),
   });
+}
+
+/** Hard budgets take precedence over provider failure, then soft wrap-up. */
+function applyRunOutcome(
+  record: AgentRecord,
+  outcome: { aborted?: boolean; steered?: boolean; failure?: string },
+): void {
+  if (outcome.aborted) {
+    record.status = "aborted";
+  } else if (outcome.failure) {
+    record.status = "error";
+    record.error = outcome.failure;
+  } else {
+    record.status = outcome.steered ? "steered" : "completed";
+  }
 }
 
 interface SpawnArgs {
@@ -1021,9 +1040,26 @@ export type ManagedSpawnCallbacks = Pick<
   | "onCompaction"
   | "onSpawned"
 > & {
+  /** Reused thread's effective display budget, before queue admission. */
+  onResumeBudgetResolved?: (maxTurns: number | undefined) => void;
   /** Reused thread's actual run boundary, before native steering or prompt. */
   onResumeStarting?: (record: AgentRecord, startMessageIndex: number) => void;
 };
+
+export interface ResumeOptions {
+  readonly [INTERNAL_RESUME_BUDGET_POLICY]?: ResumeBudgetPolicy;
+  isBackground?: boolean;
+  maxTurns?: number;
+  onToolActivity?: (activity: ToolActivity) => void;
+  onTurnEnd?: (count: number) => void;
+  onTextDelta?: (delta: string, fullText: string) => void;
+  onAssistantUsage?: SpawnOptions["onAssistantUsage"];
+  onCompaction?: (info: CompactionInfo) => void;
+  /** Effective display cap, published synchronously before queue admission. */
+  onBudgetResolved?: (maxTurns: number | undefined) => void;
+  /** Called at actual admission, including a queued background resume. */
+  onStarted?: () => void;
+}
 
 interface ResumeTerminalSnapshot {
   status: AgentRecord["status"];
@@ -1863,9 +1899,13 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
-      invocation: options.invocation
-        ? cloneFrozenData(options.invocation)
-        : undefined,
+      invocation:
+        options.invocation || options.maxTurns !== undefined
+          ? cloneFrozenData({
+              ...options.invocation,
+              maxTurns: options.maxTurns ?? options.invocation?.maxTurns,
+            })
+          : undefined,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       ...(ancestorAgentIds ? { ancestorAgentIds } : {}),
@@ -2176,9 +2216,13 @@ export class AgentManager {
         }
         void this.resume(threadedId, normalized.prompt, undefined, {
           isBackground: true,
+          maxTurns: policy.maxTurns,
+          onBudgetResolved: callbacks?.onResumeBudgetResolved,
           onStarted: () => {
             void Promise.resolve(callbacks?.onResumeStarting?.(record, record.session!.messages.length)).catch(() => {});
           },
+          onTurnEnd: callbacks?.onTurnEnd,
+          onTextDelta: callbacks?.onTextDelta,
           onToolActivity: callbacks?.onToolActivity,
           onAssistantUsage: callbacks?.onAssistantUsage,
           onCompaction: callbacks?.onCompaction
@@ -2560,14 +2604,7 @@ export class AgentManager {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
           // (provider error that pi resolved instead of rejecting, #144) is an
           // honest "error" — not a completion with an empty or stale result.
-          if (aborted) {
-            record.status = "aborted";
-          } else if (failure) {
-            record.status = "error";
-            record.error = failure;
-          } else {
-            record.status = steered ? "steered" : "completed";
-          }
+          applyRunOutcome(record, { aborted, steered, failure });
         }
         record.completedAt ??= Date.now();
         detach();
@@ -3094,21 +3131,7 @@ export class AgentManager {
     id: string,
     prompt: string,
     signal?: AbortSignal,
-    options?: {
-      isBackground?: boolean;
-      onToolActivity?: (activity: {
-        type: "start" | "end";
-        toolName: string;
-      }) => void;
-      onAssistantUsage?: (usage: {
-        input: number;
-        output: number;
-        cacheWrite: number;
-      }) => void;
-      onCompaction?: (info: unknown) => void;
-      /** Called once a queued background resume has acquired its run slot. */
-      onStarted?: () => void;
-    },
+    options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     if (this.disposed) return undefined;
     const record = this.agents.get(id);
@@ -3124,6 +3147,28 @@ export class AgentManager {
       record.invocation?.inheritContext === true,
     );
 
+    if (
+      options?.maxTurns !== undefined &&
+      (!Number.isSafeInteger(options.maxTurns) || options.maxTurns < 0)
+    ) {
+      throw new Error("maxTurns must be a non-negative safe integer");
+    }
+    // Nested definitions belong to their branch, never the global root registry.
+    // Without the scoped tool's capability, retain the admitted invocation policy.
+    const policy = record.parentAgentId === undefined
+      ? getAgentConfig(record.type)
+      : options?.[INTERNAL_RESUME_BUDGET_POLICY] ?? record.invocation;
+    const maxTurns = selectResumeTurnPolicy(record.session, resolveMaxTurns(
+      policy,
+      // A caller's zero cannot erase the original/configured safety policy.
+      options?.maxTurns || record.invocation?.maxTurns,
+    ));
+    try {
+      options?.onBudgetResolved?.(maxTurns === 0 ? undefined : maxTurns);
+    } catch {
+      // UI observers cannot alter the authoritative policy or admission.
+    }
+    options = { ...options, maxTurns };
     const snapshot = this.resumeSnapshot(record);
     if (options?.isBackground) {
       // A background resume is one lifecycle, including time spent queued. Keep
@@ -3177,18 +3222,31 @@ export class AgentManager {
     record.result = undefined;
     record.error = undefined;
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      options.onStarted?.();
+      const { text, failure, aborted, steered } = await resumeAgent(record.session, prompt, {
+        maxTurns,
+        onTurnEnd: (count) => {
+          if (!record.detached) options.onTurnEnd?.(count);
+        },
+        onTextDelta: (delta, text) => {
+          if (!record.detached) options.onTextDelta?.(delta, text);
+        },
         onToolActivity: (activity) => {
-          if (!record.detached && activity.type === "end") record.toolUses++;
+          if (record.detached) return;
+          if (activity.type === "end") record.toolUses++;
+          options.onToolActivity?.(activity);
         },
         onAssistantUsage: (usage) => {
-          if (!record.detached) addUsage(record.lifetimeUsage, usage);
+          if (record.detached) return;
+          addUsage(record.lifetimeUsage, usage);
+          options.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
           if (record.detached) return;
           record.compactionCount++;
           this.syncManagedRecord(record);
           this.onCompact?.(record, info);
+          options.onCompaction?.(info);
         },
         signal: control.controller.signal,
       });
@@ -3197,8 +3255,7 @@ export class AgentManager {
         !control.controller.signal.aborted &&
         (record.status as AgentRecord["status"]) !== "stopped"
       ) {
-        record.status = failure ? "error" : "completed";
-        if (failure) record.error = failure;
+        applyRunOutcome(record, { aborted, steered, failure });
         record.result = text;
         record.completedAt = Date.now();
       }
@@ -3242,21 +3299,7 @@ export class AgentManager {
     record: AgentRecord,
     prompt: string,
     control: ResumeControl,
-    options?: {
-      isBackground?: boolean;
-      onToolActivity?: (activity: {
-        type: "start" | "end";
-        toolName: string;
-      }) => void;
-      onAssistantUsage?: (usage: {
-        input: number;
-        output: number;
-        cacheWrite: number;
-      }) => void;
-      onCompaction?: (info: unknown) => void;
-      /** Called once a queued background resume has acquired its run slot. */
-      onStarted?: () => void;
-    },
+    options?: ResumeOptions,
   ): Promise<string> {
     const snapshot = control.snapshot;
     let slotHeld = false;
@@ -3305,13 +3348,22 @@ export class AgentManager {
       }
 
       try {
-        const { text, failure } = await resumeAgent(record.session!, prompt, {
+        const { text, failure, aborted, steered } = await resumeAgent(record.session!, prompt, {
+          maxTurns: options?.maxTurns,
+          onTurnEnd: (count) => {
+            if (!record.detached) options?.onTurnEnd?.(count);
+          },
+          onTextDelta: (delta, text) => {
+            if (!record.detached) options?.onTextDelta?.(delta, text);
+          },
           onToolActivity: (activity) => {
-            if (!record.detached && activity.type === "end") record.toolUses++;
+            if (record.detached) return;
+            if (activity.type === "end") record.toolUses++;
             options?.onToolActivity?.(activity);
           },
           onAssistantUsage: (usage) => {
-            if (!record.detached) addUsage(record.lifetimeUsage, usage);
+            if (record.detached) return;
+            addUsage(record.lifetimeUsage, usage);
             options?.onAssistantUsage?.(usage);
           },
           onCompaction: (info) => {
@@ -3328,8 +3380,7 @@ export class AgentManager {
           !control.controller.signal.aborted &&
           (record.status as AgentRecord["status"]) !== "stopped"
         ) {
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          applyRunOutcome(record, { aborted, steered, failure });
           record.result = text;
           record.completedAt = Date.now();
         }

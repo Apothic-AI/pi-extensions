@@ -44,10 +44,13 @@ export class TodoStore {
     return this.unavailable !== undefined;
   }
   get persistenceStatus(): string {
+    return this.persistenceNotice ?? "saved";
+  }
+  get persistenceNotice(): string | undefined {
     if (this.unavailable) return "unavailable; repair storage and reconcile/reload";
     if (this.storage?.kind === "volatile") return VOLATILE;
     if (!this.storage?.conversation) return "not persisted yet; send an ordinary message first";
-    return "verified session-file record (not an fsync guarantee)";
+    return undefined;
   }
   private quarantine(message: string) {
     this.unavailable = message;

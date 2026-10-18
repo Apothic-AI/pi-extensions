@@ -84,7 +84,7 @@ test("/statusline keeps compatibility subcommands and an argument-free interacti
   assert.ok(command?.getArgumentCompletions);
   assert.deepEqual(
     (command.getArgumentCompletions("") as Array<{ value: string }>).map((item) => item.value),
-    ["settings", "status", "help"],
+    ["settings", "status", "help", "inspect"],
   );
   assert.deepEqual(
     (command.getArgumentCompletions("st") as Array<{ value: string }>).map((item) => item.value),
@@ -103,7 +103,14 @@ test("/statusline keeps compatibility subcommands and an argument-free interacti
 
   await command.handler("", context.ctx);
   assert.equal(selectCalls, 1);
-  assert.deepEqual(mainChoices, ["Appearance (classic)", "Information (balanced)", "Advanced", "Status", "Help"]);
+  assert.deepEqual(mainChoices, [
+    "Appearance (classic)",
+    "Information (balanced)",
+    "Advanced",
+    "Status",
+    "Help",
+    "Inspect extension statuses",
+  ]);
 
   await command.handler("palette", context.ctx);
   assert.equal(selectCalls, 1);
@@ -418,6 +425,7 @@ test("segment menu toggles displayed segments and preserves JSON fields and layo
       "Advanced",
       "Status",
       "Help",
+      "Inspect extension statuses",
     ]);
     assert.deepEqual(selections[1]?.choices, ["Custom layout (2/13 shown)", "Edit settings JSON", "Back"]);
     assert.match(initialScreen, /Statusline segments/u);
@@ -920,6 +928,7 @@ test("palette picker preserves custom colors and unknown fields while applying a
       "Advanced",
       "Status",
       "Help",
+      "Inspect extension statuses",
     ]);
     assert.match(pickerText, /current: custom/u);
     for (const palettePreset of ["tokyo-night", "ocean", "sunset", "forest", "candy", "neon", "mono", "custom"]) {

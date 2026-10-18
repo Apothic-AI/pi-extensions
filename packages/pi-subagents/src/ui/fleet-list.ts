@@ -556,7 +556,9 @@ export class FleetList {
           const color = status === "error" ? "error" : status === "stopped" ? "warning" : selected ? "accent" : "dim";
           const name = sanitizeDisplayText(run.name);
           const phase = run.currentPhase ? ` · ${sanitizeDisplayText(run.currentPhase)}` : "";
-          const left = `  ${theme.fg(color, getAgentStatusMark(status))} ${theme.fg(selected ? "accent" : "muted", name)} · ${theme.fg(color, run.status)}${phase} · ${run.runningCalls}/${run.callCount} running · ${run.completedCalls} done · ${run.failedCalls} failed${run.restored ? " · restored" : ""}`;
+          // A workflow is an expandable group, not another agent. Keep its
+          // type mark distinct at every outcome; color/text still report status.
+          const left = `  ${theme.fg(color, "▸")} ${theme.fg(selected ? "accent" : "muted", name)} · ${theme.fg(color, run.status)}${phase} · ${run.runningCalls}/${run.callCount} running · ${run.completedCalls} done · ${run.failedCalls} failed${run.restored ? " · restored" : ""}`;
           const right = `${formatFleetElapsed(run.elapsedMs)}${run.tokenCount === undefined ? "" : ` · ${formatFleetTokens(run.tokenCount)}`}`;
           lines.push(rightAlign(left, theme.fg("dim", right), width));
         } else {
@@ -567,7 +569,7 @@ export class FleetList {
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `${hiddenBelow} more below`), width));
 
-    lines.push(""); // breathing room below the roster, including narrow terminals
+    // One separator belongs to Fleet; do not stack two empty rows before the footer.
     return [...lines.slice(0, height - 1), ""].map(line => truncateToWidth(line, Math.max(0, width)));
   }
 

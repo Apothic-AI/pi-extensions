@@ -5,7 +5,7 @@
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "./types.js";
+import type { AgentConfig, ThinkingLevel } from "./types.js";
 
 /**
  * Immutable policy used while asking a model to draft an agent definition.
@@ -38,6 +38,10 @@ export interface ParentPolicySnapshot {
 }
 
 export const INTERNAL_PARENT_POLICY_SNAPSHOT = Symbol("pi-subagents.internal-parent-policy-snapshot");
+
+/** Branch-local frontmatter only; never accepts another run/config capability. */
+export type ResumeBudgetPolicy = Pick<AgentConfig, "maxTurns">;
+export const INTERNAL_RESUME_BUDGET_POLICY = Symbol("pi-subagents.internal-resume-budget-policy");
 
 /** The only no-tool policy currently issued by the package. */
 export const AGENT_DEFINITION_GENERATION_OVERRIDE: InternalAgentConfigOverride = Object.freeze({

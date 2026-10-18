@@ -22,8 +22,16 @@ export interface LoopState {
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function count(value: unknown) {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+export const LOOP_COUNT_BOUNDS = { minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+
+export function isLoopCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= LOOP_COUNT_BOUNDS.minimum;
+}
+
+const LOOP_CONTROL_KEYS = ["maxIterations", "itemsPerIteration", "reflectEvery"] as const;
+
+export function invalidLoopControl(controls: Partial<Record<(typeof LOOP_CONTROL_KEYS)[number], unknown>>) {
+  return LOOP_CONTROL_KEYS.find((key) => controls[key] !== undefined && !isLoopCount(controls[key]));
 }
 
 export function validateLoopState(value: unknown): LoopState | undefined {
@@ -37,7 +45,7 @@ export function validateLoopState(value: unknown): LoopState | undefined {
   if (!raw.name || !raw.taskFile || !Number.isFinite(Date.parse(String(raw.startedAt)))) return;
   if (
     ["iteration", "maxIterations", "itemsPerIteration", "reflectEvery", "lastReflectionAt"].some(
-      (key) => !count(raw[key]),
+      (key) => !isLoopCount(raw[key]),
     )
   )
     return;

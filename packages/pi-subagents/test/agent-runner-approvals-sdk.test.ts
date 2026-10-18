@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import {
@@ -132,6 +133,33 @@ describe("root human operation approvals in native child sessions", () => {
   async function waiting(count = 1) {
     await vi.waitFor(() => expect(events.filter(event => event.phase === "waiting")).toHaveLength(count));
     return events.filter(event => event.phase === "waiting")[count - 1];
+  }
+
+  // Prove pause accounting independently of OS process scheduling. After
+  // approval the real backend runs without advancing its execution clock;
+  // the real-process negative controls below still prove timeout resumption.
+  function approvalWaitClock() {
+    let now = performance.now();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const monotonic = vi.spyOn(performance, "now").mockImplementation(() => now);
+    let resolve!: (request: ApprovalLifecycle) => void;
+    const waiting = new Promise<ApprovalLifecycle>(yes => { resolve = yes; });
+    const unsubscribe = api.events.on(APPROVAL_LIFECYCLE_CHANNEL, value => {
+      const event = validateLifecycle(value);
+      if (event.phase === "waiting") resolve(event);
+    });
+    return {
+      waiting,
+      advance: async (ms: number) => {
+        now += ms;
+        await vi.advanceTimersByTimeAsync(ms);
+      },
+      restore: () => {
+        unsubscribe();
+        monotonic.mockRestore();
+        vi.useRealTimers();
+      },
+    };
   }
 
   async function review(request: ApprovalLifecycle, approved = true) {
@@ -376,13 +404,22 @@ describe("root human operation approvals in native child sessions", () => {
     const first = await run("resumed");
     setDefaultToolTimeoutMs(40);
     responses({ name: "write", args: { path: "resumed", content: "approved" } });
-    const turn = resumeAgent(first.session, "continue");
-    const request = await waiting();
-    await new Promise(resolve => setTimeout(resolve, 90));
-    expect(events.filter(event => event.phase === "resolved")).toEqual([]);
-    await review(request);
-    await turn;
-    expect(readFileSync(join(cwd, "resumed"), "utf8")).toBe("approved");
+    const clock = approvalWaitClock();
+    try {
+      const turn = resumeAgent(first.session, "continue");
+      const request = await clock.waiting;
+      await clock.advance(90);
+      expect(events.filter(event => event.phase === "waiting")).toEqual([request]);
+      expect(events.filter(event => event.phase === "resolved")).toEqual([]);
+      await review(request);
+      await turn;
+      expect(readFileSync(join(cwd, "resumed"), "utf8")).toBe("approved");
+      expect(events.filter(event => event.phase === "resolved").map(event => event.outcome)).toEqual(["approved"]);
+      expect(resultText(first.session)).not.toMatch(/abort|cancel|timed out/i);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      clock.restore();
+    }
   });
 
   it.each(["direct", "nested"])("excludes >80ms human waiting from a 40ms execution budget (%s)", async (kind) => {
@@ -394,13 +431,22 @@ describe("root human operation approvals in native child sessions", () => {
     }`)] });
     setDefaultToolTimeoutMs(40);
     responses(kind === "direct" ? { name: "bash", args: { command: "printf yes > timer-marker" } } : { name: "gateway", args: {} });
-    const turn = run();
-    const request = await waiting();
-    await new Promise(resolve => setTimeout(resolve, 90));
-    expect(events.filter(event => event.phase === "resolved")).toEqual([]);
-    await review(request);
-    await turn;
-    expect(readFileSync(join(cwd, "timer-marker"), "utf8")).toBe("yes");
+    const clock = approvalWaitClock();
+    try {
+      const turn = run();
+      const request = await clock.waiting;
+      await clock.advance(90);
+      expect(events.filter(event => event.phase === "waiting")).toEqual([request]);
+      expect(events.filter(event => event.phase === "resolved")).toEqual([]);
+      await review(request);
+      const result = await turn;
+      expect(readFileSync(join(cwd, "timer-marker"), "utf8")).toBe("yes");
+      expect(events.filter(event => event.phase === "resolved").map(event => event.outcome)).toEqual(["approved"]);
+      expect(resultText(result.session)).not.toMatch(/abort|cancel|timed out/i);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      clock.restore();
+    }
   });
 
   it("restores the resumed execution budget after human review", async () => {

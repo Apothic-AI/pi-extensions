@@ -61,7 +61,7 @@ Each iteration delivery has a private, one-use identity, consumed at accepted na
 
 Pending provenance expires after five minutes and is bounded to 256 candidates and 128 deliveries. Authenticated runtime nonces still recognize stale deliveries after eviction or retirement without retaining old task bodies or an unbounded replay list. An expired queued iteration needs an explicit `/ralph resume <name>`. Pause, cancel, and confirmed nuke synchronously retire ownership before deleting state. An active authenticated iteration also aborts immediately through its public operation context, so a later awaited tool-call handler cannot let a previously permitted substantive tool execute. The abort is pinned to the accepted nonce, live manager/session/branch, and original signal; it never transfers to a new root, ordinary manual user turn, or unrelated background wake. User continuations may advance loop progress without transferring ownership of their operation. Late tools from retired extension iterations remain blocked until settlement.
 
-State publication uses private temporary files and atomic rename. Malformed state warns by filename, remains unchanged, and does not prevent other valid loops from loading.
+State publication uses private temporary files and atomic rename. Malformed state warns by filename, remains unchanged, and does not prevent other valid loops from loading. Resume refuses to replace a still-running authenticated iteration; stop it or wait for settlement first, preserving its cancellation authority.
 
 ## Completion gate
 
@@ -98,6 +98,10 @@ Known paused, completed, replayed, or retired iteration deliveries are rejected 
 | `--max-iterations N` | Stop after N iterations (default 50) |
 | `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
 | `--reflect-every N` | Reflect every N iterations |
+
+Counts must be nonnegative safe integers, validated before task files or ownership change.
+CLI values use decimal integer digits (optionally quoted), not fractions or exponent notation.
+`0` preserves the existing no-limit/disabled behavior; omitted values keep their defaults.
 
 ## Agent tool
 

@@ -1,5 +1,6 @@
 import {
   type ExtensionCommandContext,
+  type ExtensionContext,
   ExtensionEditorComponent,
   type KeybindingsManager,
   type Theme,
@@ -42,7 +43,11 @@ function editorTui(tui: TUI, owner: CommandOwner): TUI {
 }
 
 export function isOwnerCurrent(owner: CommandOwner): boolean {
-  return !owner.signal.aborted && owner.isCurrent();
+  try {
+    return !owner.signal.aborted && owner.isCurrent();
+  } catch {
+    return false;
+  }
 }
 
 /** Use Pi's editor semantics with a custom dialog that can close before navigation. */
@@ -71,13 +76,11 @@ export async function ownedEditor(
 }
 
 /** Close raw custom dialogs before Pi gives the captured editor to another branch. */
-export function ownedCustom(
-  ctx: ExtensionCommandContext,
-  owner: CommandOwner,
-): ExtensionCommandContext["ui"]["custom"] {
-  return async <T>(factory: CustomFactory<T>, options?: Parameters<ExtensionCommandContext["ui"]["custom"]>[1]) => {
+export function ownedCustom(ctx: ExtensionContext, owner: CommandOwner): ExtensionContext["ui"]["custom"] {
+  return async <T>(factory: CustomFactory<T>, options?: Parameters<ExtensionContext["ui"]["custom"]>[1]) => {
     if (!isOwnerCurrent(owner)) return undefined as T;
     let cancel: (() => void) | undefined;
+    let mounted: Promise<CustomComponent> | undefined;
     try {
       return await ctx.ui.custom<T>((tui, theme, keys, done) => {
         let settled = false;
@@ -125,10 +128,15 @@ export function ownedCustom(
             },
           });
         };
-        return built instanceof Promise ? built.then(attach) : attach(built);
+        if (!(built instanceof Promise)) return attach(built);
+        mounted = built.then(attach);
+        return mounted;
       }, options);
     } finally {
       if (cancel) owner.signal.removeEventListener("abort", cancel);
+      // Cancellation can resolve custom() before an async factory mounts. Do not
+      // admit another owner's view until that late component is disposed too.
+      await mounted;
     }
   };
 }

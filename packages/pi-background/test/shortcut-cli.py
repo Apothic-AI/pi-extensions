@@ -15,9 +15,10 @@ import termios
 import time
 
 ROOT = Path(__file__).resolve().parents[3]
-CLI = ROOT / "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+CLI = Path(os.environ.get("PI_TEST_CLI", str(ROOT / "node_modules/@earendil-works/pi-coding-agent/dist/cli.js")))
 FIXTURE = Path(__file__).with_name("shortcut-cli-fixture.ts")
 TASKS = b"\x1b[98;7u"  # Kitty Ctrl+Alt+B, exercised through the real terminal parser.
+STATUSES = b"\x1b[115;7u"  # Kitty Ctrl+Alt+S, owned by Statusline.
 DRAFT = b"\x1b[100;7u"
 ESC = b"\x1b"
 checks = 0
@@ -43,7 +44,8 @@ class CLIHost:
                    "BACKGROUND_SHORTCUT_PROBE": str(self.probe), "TERM": "xterm-256color",
                    "PI_OFFLINE": "1", "PI_TELEMETRY": "0"}
             os.execvpe("node", ["node", str(CLI), "--offline", "--no-session", "-ne", "-ns", "-np",
-                              "--no-themes", "-nc", "--no-mcp", "-e", str(FIXTURE),
+                              "--no-themes", "-nc", "--no-mcp", "-e", str(ROOT / "packages/pi-statusline/src/index.ts"),
+                              "-e", str(FIXTURE),
                               "--model", "background-shortcut-faux/acceptance", "--tui-mode", mode], env)
         self.resize(width, height)
         self.wait(lambda: any(e["event"] == "ready" for e in self.events()))
@@ -149,6 +151,9 @@ for mode in ["fullscreen", "regular"]:
             host.command("/probe-other")
             host.wait(lambda: bool(host.of("other-open")))
             host.key(TASKS)
+            status_start = len(host.raw)
+            host.key(STATUSES)
+            check(b"Extension statuses" not in host.raw[status_start:], "status shortcut does not steal a native dialog")
             check(len(host.of("open")) == 1, "does not steal another native dialog")
             host.key(ESC)
             host.wait(lambda: bool(host.of("other-close")))
@@ -164,19 +169,43 @@ for mode in ["fullscreen", "regular"]:
             host.command("Start independent background work")
             host.wait(lambda: bool(host.of("settled")))
             host.paste("unfinished 中 draft")
+            status_start = len(host.raw)
+            host.key(STATUSES)
+            host.wait(lambda: b"Extension statuses" in host.raw[status_start:])
+            host.wait(lambda: b"Enter details" in host.raw[status_start:])
+            check(b"pi-background" in host.raw[status_start:], "native status selector lists the shell owner")
+            owner_start = len(host.raw)
+            turns_before_status = len(host.of("agent-start"))
+            host.key(b"\r")
+            host.wait(lambda: b"Background tasks" in host.raw[owner_start:])
+            host.key(ESC)
+            host.key(DRAFT)
+            check(host.of("draft")[-1]["draft"] == "unfinished 中 draft", "status-to-owner navigation preserves draft")
+            check(len(host.of("agent-start")) == turns_before_status, "status selection never starts a model turn")
             host.key(TASKS)
-            host.wait(lambda: "Background tasks" in host.text() and "2 retained" in host.text())
+            host.wait(lambda: "Background tasks" in host.text() and "2 running" in host.text())
+            for resized_width, resized_height in [(100, 30), (40, 12), (20, 8), (width, height)]:
+                host.resize(resized_width, resized_height)
+                host.wait(lambda: host.of("frame")[-1]["width"] == resized_width
+                          and host.of("frame")[-1]["rows"] == resized_height)
+                check(len(host.of("frame")[-1]["lines"]) <= resized_height, "live resize stays bounded")
+            host.key(b"\r")
+            host.wait(lambda: "Background details" in host.text())
             host.key(b"\r")
             host.wait(lambda: "first-log" in [row.strip() for row in host.text().splitlines()])
             check("first-log" in [row.strip() for row in host.text().splitlines()], "first real output row")
             host.key(ESC)
+            host.wait(lambda: "Background details" in host.text())
+            host.key(ESC)
             host.key(b"\x1b[B")
-            selected = next(row for row in host.text().splitlines() if row.startswith("ID:"))
+            selected = next(row for row in host.text().splitlines() if row.startswith(">"))
             opens = len(host.of("open"))
             turns = len(host.of("agent-start"))
             host.key(TASKS)
             check(len(host.of("open")) == opens, "repeat does not replace task selector")
             check(selected in host.text(), "repeat preserves stable task selection")
+            host.key(b"\r")
+            host.wait(lambda: "Background details" in host.text())
             host.key(b"\r")
             host.wait(lambda: "second-log" in [row.strip() for row in host.text().splitlines()])
             check("second-log" in [row.strip() for row in host.text().splitlines()], "second real output row")
@@ -184,11 +213,12 @@ for mode in ["fullscreen", "regular"]:
             check("Background logs" in host.text() and len(host.of("open")) == opens, "repeat preserves logs mode")
             host.key(b"x")
             host.key(ESC)
-            check("Status: running" in host.text(), "escape cancels stop confirmation")
+            check("Background logs · running" in host.text(), "escape cancels stop confirmation")
             host.key(b"x")
             host.key(b"y")
-            host.wait(lambda: "Status: stopped" in host.text())
+            host.wait(lambda: "Background logs · stopped" in host.text())
             check(len(host.of("agent-start")) == turns, "navigation/stop cause no model turn")
+            host.key(ESC)
             host.key(ESC)
             host.key(ESC)
             host.wait(lambda: len(host.of("close")) == opens)

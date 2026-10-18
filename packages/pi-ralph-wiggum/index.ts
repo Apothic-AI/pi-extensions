@@ -8,7 +8,14 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { captureOwner, extendsOwner, hasCompletionMarker, IterationOwnership, type LoopOwner } from "./ownership.ts";
-import { type LoopState, publishLoopState, readLoopState } from "./state-store.ts";
+import {
+  invalidLoopControl,
+  isLoopCount,
+  LOOP_COUNT_BOUNDS,
+  type LoopState,
+  publishLoopState,
+  readLoopState,
+} from "./state-store.ts";
 
 const RALPH_DIR = ".ralph";
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
@@ -78,24 +85,26 @@ export default function (pi: ExtensionAPI) {
   let acceptedRun:
     | { ctx: ExtensionContext; signal: AbortSignal; nonce: string; loop: string; owner: LoopOwner }
     | undefined;
-  function retireOwnership(ctx?: ExtensionContext) {
+  function ownedAcceptedRun(ctx: ExtensionContext) {
     const run = acceptedRun;
-    acceptedRun = undefined;
-    // Commands have no run signal. Abort through the positively accepted run's
-    // public context only while its manager, native branch and nonce still own
-    // the live operation. Never abort a new root through a captured old context.
-    if (
-      ctx &&
-      run &&
+    // Commands have no run signal. Only the accepted run's live context,
+    // manager, native branch and nonce prove ownership of the operation.
+    return run &&
       !run.signal.aborted &&
       run.loop === currentLoop &&
       ownership.ownsRun(run.nonce) &&
       extendsOwner(ctx, run.owner) &&
       extendsOwner(ctx, liveOwner) &&
       run.ctx.signal === run.signal
-    ) {
-      run.ctx.abort();
-    }
+      ? run
+      : undefined;
+  }
+
+  function retireOwnership(ctx?: ExtensionContext) {
+    const run = ctx ? ownedAcceptedRun(ctx) : undefined;
+    acceptedRun = undefined;
+    // Never abort a new root through a captured old context.
+    run?.ctx.abort();
     ownership.retire();
     liveOwner = undefined;
     currentLoop = null;
@@ -414,14 +423,19 @@ export default function (pi: ExtensionAPI) {
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
       const next = tokens[i + 1];
-      if (tok === "--max-iterations" && next) {
-        result.maxIterations = parseInt(next, 10) || 0;
-        i++;
-      } else if (tok === "--items-per-iteration" && next) {
-        result.itemsPerIteration = parseInt(next, 10) || 0;
-        i++;
-      } else if (tok === "--reflect-every" && next) {
-        result.reflectEvery = parseInt(next, 10) || 0;
+      if (tok === "--max-iterations" || tok === "--items-per-iteration" || tok === "--reflect-every") {
+        const token = next?.replace(/^"(.*)"$/u, "$1");
+        // Check the integer token before Number(): fractions/exponents can round
+        // or underflow to an accepted integer, including unlimited zero.
+        const value = token !== undefined && /^\d+$/u.test(token) ? Number(token) : NaN;
+        if (!isLoopCount(value)) throw new Error(`${tok} must be a nonnegative safe integer.`);
+        const key =
+          tok === "--max-iterations"
+            ? "maxIterations"
+            : tok === "--items-per-iteration"
+              ? "itemsPerIteration"
+              : "reflectEvery";
+        result[key] = value;
         i++;
       } else if (tok === "--reflect-instructions" && next) {
         result.reflectInstructions = next.replace(/^"|"$/g, "");
@@ -437,7 +451,13 @@ export default function (pi: ExtensionAPI) {
 
   const commands: Record<string, (rest: string, ctx: ExtensionContext) => void | Promise<void>> = {
     start(rest, ctx) {
-      const args = parseArgs(rest);
+      let args: ReturnType<typeof parseArgs>;
+      try {
+        args = parseArgs(rest);
+      } catch (error: unknown) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        return;
+      }
       if (!args.name) {
         ctx.ui.notify(
           "Usage: /ralph start <name|path> [--items-per-iteration N] [--reflect-every N] [--max-iterations N]",
@@ -509,6 +529,13 @@ export default function (pi: ExtensionAPI) {
       const loopName = rest.trim();
       if (!loopName) {
         ctx.ui.notify("Usage: /ralph resume <name>", "warning");
+        return;
+      }
+
+      // Do not retire a still-running accepted iteration: a later async tool
+      // hook may already have passed Ralph's fence. Keep its abort authority.
+      if (ownedAcceptedRun(ctx)) {
+        ctx.ui.notify("Ralph iteration is still running. Stop it or wait for it to settle before resuming.", "warning");
         return;
       }
 
@@ -774,11 +801,19 @@ Examples:
     parameters: Type.Object({
       name: Type.String({ description: "Loop name (e.g., 'refactor-auth')" }),
       taskContent: Type.String({ description: "Task in markdown with goals and checklist" }),
-      itemsPerIteration: Type.Optional(Type.Number({ description: "Suggest N items per turn (0 = no limit)" })),
-      reflectEvery: Type.Optional(Type.Number({ description: "Reflect every N iterations" })),
-      maxIterations: Type.Optional(Type.Number({ description: "Max iterations (default: 50)", default: 50 })),
+      itemsPerIteration: Type.Optional(
+        Type.Integer({ ...LOOP_COUNT_BOUNDS, description: "Suggest N items per turn (0 = no limit)" }),
+      ),
+      reflectEvery: Type.Optional(Type.Integer({ ...LOOP_COUNT_BOUNDS, description: "Reflect every N iterations" })),
+      maxIterations: Type.Optional(
+        Type.Integer({ ...LOOP_COUNT_BOUNDS, description: "Max iterations (default: 50)", default: 50 }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Direct callers can bypass the host's schema validation. Reject before
+      // touching task files, persisted state, or live iteration ownership.
+      const invalid = invalidLoopControl(params);
+      if (invalid) throw new Error(`${invalid} must be a nonnegative safe integer.`);
       const loopName = sanitize(params.name);
       const taskFile = path.join(RALPH_DIR, `${loopName}.md`);
 

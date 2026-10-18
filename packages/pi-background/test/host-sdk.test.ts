@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import {
   AgentSessionRuntime,
@@ -132,17 +133,21 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       const command = session.prompt("/background");
       await vi.waitFor(() => expect(native.component()).toBeDefined());
       expect(native.render().join("\n")).toContain("Background tasks");
-      native.key("\r");
+      native.key("\r"); // Job overview.
+      native.key("\r"); // Actual logs, not the command's quoted marker in metadata.
       native.key("s");
       native.key("s");
-      await vi.waitFor(() => expect(native.render().join("\n")).toContain("stderr-marker"));
+      await vi.waitFor(() =>
+        expect(native.render().some((line) => stripVTControlCharacters(line).trim() === "stderr-marker")).toBe(true),
+      );
       native.key("x");
       native.key("x");
       native.key("y");
-      expect(native.render().join("\n")).toContain("Status: running");
+      expect(native.render().join("\n")).toContain("Background logs · running");
       native.key("x");
       native.key("y");
-      await vi.waitFor(() => expect(native.render().join("\n")).toContain("Status: stopped"));
+      await vi.waitFor(() => expect(native.render().join("\n")).toContain("Background logs · stopped"));
+      native.key("\x1b");
       native.key("\x1b");
       native.key("\x1b");
       await command;
@@ -150,6 +155,37 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       expect(session.messages.some((message) => message.role === "custom" && message.customType === MESSAGE_TYPE)).toBe(
         false,
       );
+      expect(errors).toEqual([]);
+    });
+
+    it("refreshes passive status for real notify-off completion without any later model or tool turn", async () => {
+      const native = nativeUIFixture();
+      cleanup.push(async () => native.dispose());
+      const { session, faux, errors, prompts, inputs } = await fixture(undefined, undefined, native);
+      const unexpected = vi.fn(() => fauxAssistantMessage("Unexpected wake."));
+      faux.setResponses([
+        fauxAssistantMessage(
+          fauxToolCall("bash_background", {
+            command: "sleep 0.2; printf complete",
+            notify: "off",
+          }),
+          { stopReason: "toolUse" },
+        ),
+        fauxAssistantMessage("Independent work can continue."),
+        unexpected,
+      ]);
+      await session.prompt("Start silent independent work.");
+      await vi.waitFor(
+        () => expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R0 F1"),
+        { timeout: 5000 },
+      );
+      expect(prompts).toEqual(["Start silent independent work."]);
+      expect(inputs).toEqual(["interactive"]);
+      expect(unexpected).not.toHaveBeenCalled();
+      expect(session.messages.some((message) => message.role === "custom" && message.customType === MESSAGE_TYPE)).toBe(
+        false,
+      );
+      expect(native.custom).not.toHaveBeenCalled();
       expect(errors).toEqual([]);
     });
 

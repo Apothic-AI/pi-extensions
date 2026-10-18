@@ -1,5 +1,7 @@
 import { homedir } from "node:os";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
+import { type CommandOwner, isOwnerCurrent } from "./command-owner.js";
 import { registerStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
 import {
   buildExtensionStatusIconAliases,
@@ -16,6 +18,7 @@ import {
   loadStatuslineSettingsForAgent,
   settingsFilePath,
 } from "./settings.js";
+import { inspectStatuses, type StatusReader } from "./status-inspector.js";
 import { type TerminalLifetime, terminalLifetime } from "./terminal-lifetime.js";
 import type { PalettePreset } from "./types.js";
 import { FooterUsageAccumulator } from "./usage.js";
@@ -68,8 +71,13 @@ export default function statusline(pi: ExtensionAPI) {
   let sessionGeneration = 0;
   let menuController = new AbortController();
   let gitStatusRequestId = 0;
-  let activeGitStatusTarget: { cwd: string; generation: number; ctx: ExtensionContext } | undefined;
+  let activeGitStatusTarget:
+    | { cwd: string; generation: number; ctx: ExtensionContext; ui: ExtensionContext["ui"] }
+    | undefined;
   let activeFooterRetire: (() => void) | undefined;
+  let readExtensionStatuses: StatusReader | undefined;
+  let footerTui: TUI | undefined;
+  let inspectorOpen = false;
   let gitStatusRefreshInFlight = false;
   let gitStatusAbortController: AbortController | undefined;
   let gitStatusDebounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -113,6 +121,8 @@ export default function statusline(pi: ExtensionAPI) {
     // Invalidate before cleanup: an abort or unsubscribe may synchronously call back.
     activeGitStatusTarget = undefined;
     activeSessionManager = undefined;
+    readExtensionStatuses = undefined;
+    footerTui = undefined;
     gitStatusRequestId += 1;
     pendingGitStatusRefresh = undefined;
     runtime.requestRender = undefined;
@@ -137,7 +147,13 @@ export default function statusline(pi: ExtensionAPI) {
     if (!target || target.cwd !== cwd || target.generation !== generation || generation !== sessionGeneration)
       return false;
     try {
-      if (target.ctx.mode === "tui" && target.ctx.hasUI && target.ctx.sessionManager === activeSessionManager)
+      if (
+        target.ctx.mode === "tui" &&
+        target.ctx.hasUI &&
+        target.ctx.cwd === cwd &&
+        target.ctx.sessionManager === activeSessionManager &&
+        target.ctx.ui === target.ui
+      )
         return true;
     } catch {
       // SDK dispose invalidates getters without delivering session_shutdown.
@@ -214,7 +230,7 @@ export default function statusline(pi: ExtensionAPI) {
     previewPalettePreset = undefined;
     abortGitStatusRefresh("Statusline session context replaced");
     clearGitStatusDebounce();
-    activeGitStatusTarget = { cwd, generation, ctx };
+    activeGitStatusTarget = { cwd, generation, ctx, ui: ctx.ui };
     runtime.gitStatus = undefined;
     runtime.duplicateExtensions = [];
     runtime.extensionStatusIconAliases = EMPTY_EXTENSION_STATUS_ICON_ALIASES;
@@ -232,6 +248,8 @@ export default function statusline(pi: ExtensionAPI) {
 
       let retired = false;
       const isCurrent = () => !retired && isActiveGitStatusTarget(cwd, generation);
+      footerTui = tui;
+      readExtensionStatuses = () => (isCurrent() ? footerData.getExtensionStatuses() : new Map());
       const refreshFooterGitStatus = () => refreshGitStatus(cwd, generation);
       const branchUnsubscribe = footerData.onBranchChange(() => {
         if (!isCurrent()) return;
@@ -296,22 +314,87 @@ export default function statusline(pi: ExtensionAPI) {
     refreshGitStatus(cwd, generation);
   };
 
+  const getMenuOwner = (): CommandOwner => {
+    const generation = sessionGeneration;
+    const controller = menuController;
+    const terminal = activeTerminal;
+    const target = activeGitStatusTarget;
+    // A branch may append while a dialog is open. Only replacement of the
+    // captured prefix retires it; session_tree can be delivered much later.
+    const prefix = target?.ctx.sessionManager.getBranch().map((entry) => entry.id);
+    return {
+      signal: controller.signal,
+      isCurrent: () => {
+        if (generation !== sessionGeneration || controller.signal.aborted) return false;
+        if (!target) return true; // Manual settings reports also work headlessly.
+        if (!isActiveGitStatusTarget(target.cwd, generation)) return false;
+        const branch = target.ctx.sessionManager.getBranch();
+        if (prefix?.some((id, index) => branch[index]?.id !== id)) {
+          controller.abort(new DOMException("Statusline branch replaced", "AbortError"));
+          previewPalettePreset = undefined;
+          return false;
+        }
+        return true;
+      },
+      isHostActive: () => terminal?.active === true,
+    };
+  };
+  const inspect = async (ctx: ExtensionContext) => {
+    if (inspectorOpen || ctx.mode !== "tui" || !ctx.hasUI || !ownsRuntime(ctx)) return;
+    const reader = readExtensionStatuses;
+    if (!reader) return;
+    const baseOwner = getMenuOwner();
+    const owner: CommandOwner = {
+      ...baseOwner,
+      isCurrent: () => baseOwner.isCurrent() && ctx.mode === "tui" && ctx.hasUI && ownsRuntime(ctx),
+    };
+    if (!isOwnerCurrent(owner)) return;
+    inspectorOpen = true;
+    try {
+      await inspectStatuses(pi, ctx, owner, reader);
+    } finally {
+      inspectorOpen = false;
+    }
+  };
+  pi.registerShortcut("ctrl+alt+s", {
+    description: "Inspect extension statuses",
+    handler: async (ctx) => {
+      if (ctx.mode !== "tui" || !ctx.hasUI || inspectorOpen || !ownsRuntime(ctx)) return;
+      // Public capability detection only. Unknown focus fails closed; the
+      // slash command remains available on hosts without these capabilities.
+      try {
+        const host = footerTui;
+        if (
+          !host ||
+          !("getFocusedComponent" in host) ||
+          typeof host.getFocusedComponent !== "function" ||
+          typeof host.hasOverlay !== "function" ||
+          host.hasOverlay()
+        )
+          return;
+        const focused: unknown = host.getFocusedComponent();
+        if (
+          !focused ||
+          typeof focused !== "object" ||
+          !("isShowingAutocomplete" in focused) ||
+          typeof focused.isShowingAutocomplete !== "function" ||
+          focused.isShowingAutocomplete() !== false
+        )
+          return;
+        await inspect(ctx);
+      } catch {
+        /* stale host or nonconforming focus: leave the draft alone */
+      }
+    },
+  });
+
   const agentDir = getAgentDir();
   const configPath = settingsFilePath(agentDir);
   const commandOptions: StatuslineCommandOptions = {
     settingsPath: configPath,
     getLoaded: () => loaded ?? loadStatuslineSettings(configPath),
-    getMenuOwner: () => {
-      const generation = sessionGeneration;
-      const terminal = activeTerminal;
-      return {
-        signal: menuController.signal,
-        isCurrent: () => generation === sessionGeneration && !menuController.signal.aborted,
-        // A retired command may resume the same terminal, but cannot touch its
-        // replacement session. The replacement instance shares this quit token.
-        isHostActive: () => terminal?.active === true,
-      };
-    },
+    getMenuOwner,
+    inspect,
     apply(next, ctx) {
       if (ctx.sessionManager !== activeSessionManager) return;
       previewPalettePreset = undefined;
@@ -352,6 +435,7 @@ export default function statusline(pi: ExtensionAPI) {
   };
   pi.on("session_before_switch", () => closeCommandsBeforeNavigation());
   pi.on("session_before_tree", () => closeCommandsBeforeNavigation());
+  pi.on("session_before_fork", () => closeCommandsBeforeNavigation());
 
   pi.on("session_tree", (_event, ctx) => {
     installFooter(ctx);
