@@ -10,6 +10,7 @@ import {
 } from "./completion-tool.js";
 import { isStaleExtensionContextError, onAgentSettled, setPlanThinkingLevel } from "./extension-runtime.js";
 import { formatImplementationHandoff, startFreshImplementationFromState } from "./fresh-implementation.js";
+import { resolveHypaExecutablePaths } from "./hypa-wrapper.js";
 import {
   createImplementationRetentionCoordinator,
   implementationRetentionPreview,
@@ -522,7 +523,30 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     // Built-in-compatible overrides retain the canonical name but replace its source metadata.
     if (event.toolName !== "bash") return;
 
-    const blocked = findBlockedCommandSegment(readCommand(event.input), settings.safeSubcommands);
+    const command = readCommand(event.input);
+    let blocked = findBlockedCommandSegment(command, settings.safeSubcommands, { hypaExecutables: new Set() });
+    if (blocked !== undefined) {
+      const admittedWorkflow = workflowGeneration;
+      const admittedSession = menuGeneration;
+      const hypaExecutables = await resolveHypaExecutablePaths(
+        ctx.cwd,
+        process.env.PATH,
+        process.platform,
+        process.env.HYPA_BIN,
+      );
+      if (
+        admittedWorkflow !== workflowGeneration ||
+        admittedSession !== menuGeneration ||
+        !state.enabled ||
+        !stateIsCurrent(ctx) ||
+        !permittedTools?.has(event.toolName) ||
+        command !== readCommand(event.input) ||
+        ctx.signal?.aborted
+      ) {
+        return { block: true, reason: "Plan inspection authorization changed while resolving the executable." };
+      }
+      blocked = findBlockedCommandSegment(command, settings.safeSubcommands, { hypaExecutables });
+    }
     if (blocked !== undefined) {
       return {
         block: true,

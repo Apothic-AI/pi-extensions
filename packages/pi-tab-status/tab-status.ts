@@ -248,7 +248,19 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
     // Later tool_call hooks may rewrite the command. Only the executed input
     // and its successful result can establish that this run committed.
-    if (!event.isError && (event.toolName === "bash" || event.toolName === "powershell")) {
+    // Hypa returns its process outcome in details, including nonzero exits
+    // without isError. A successful tool invocation alone is not command success.
+    const details = event.details;
+    const successfulHypa =
+      event.toolName === "hypa_shell" &&
+      typeof details === "object" &&
+      details !== null &&
+      !Array.isArray(details) &&
+      "source" in details &&
+      details.source === "hypa-cli" &&
+      "exitCode" in details &&
+      details.exitCode === 0;
+    if (!event.isError && (event.toolName === "bash" || event.toolName === "powershell" || successfulHypa)) {
       const command = typeof event.input.command === "string" ? event.input.command : "";
       if (GIT_COMMIT_RE.test(command)) status.sawCommit = true;
     }

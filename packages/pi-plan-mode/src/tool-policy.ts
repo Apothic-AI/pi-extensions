@@ -121,21 +121,65 @@ export function readCommand(input: unknown) {
   return typeof command?.command === "string" ? command.command : "";
 }
 
+export interface InspectionWrappers {
+  /**
+   * Exact POSIX executable paths resolved from the trusted runtime PATH.
+   * When supplied, an empty set disables Hypa (unavailable/unsupported runtime).
+   */
+  hypaExecutables?: ReadonlySet<string>;
+}
+
 /**
  * Plan mode accepts one parsed argv inspection command. It intentionally does
  * not accept a shell program: command lists, pipelines, redirects, and
  * substitutions are all rejected before any command-specific validator runs.
  */
-export function findBlockedCommandSegment(command: string, safeSubcommands: SafeSubcommands = {}): string | undefined {
+export function findBlockedCommandSegment(
+  command: string,
+  safeSubcommands: SafeSubcommands = {},
+  wrappers: InspectionWrappers = {},
+): string | undefined {
   const trimmed = command.trim();
   if (!trimmed) return "(empty command)";
   const tokens = shellWords(trimmed);
   if (!tokens || !isSafeTokens(tokens)) return trimmed;
-  return isSafeArgv(tokens, safeSubcommands) ? undefined : trimmed;
+  if (isSafeArgv(tokens, safeSubcommands)) return undefined;
+  // Keep native parsing unchanged. For wrappers, also preserve POSIX literal
+  // backslashes inside double quotes so a different executable cannot spoof an
+  // admitted path (and a -c string is validated as the shell receives it).
+  // POSIX does not trim Unicode whitespace. Parsing the original input keeps
+  // an NBSP-prefixed relative executable from impersonating an admitted path.
+  const wrapperTokens = shellWords(command, true);
+  return wrapperTokens && isSafeTokens(wrapperTokens) && isSafeHypaWrapper(wrapperTokens, safeSubcommands, wrappers)
+    ? undefined
+    : trimmed;
 }
 
-export function isSafeCommand(command: string, safeSubcommands: SafeSubcommands = {}) {
-  return findBlockedCommandSegment(command, safeSubcommands) === undefined;
+export function isSafeCommand(
+  command: string,
+  safeSubcommands: SafeSubcommands = {},
+  wrappers: InspectionWrappers = {},
+) {
+  return findBlockedCommandSegment(command, safeSubcommands, wrappers) === undefined;
+}
+
+function isSafeHypaWrapper(tokens: string[], safeSubcommands: SafeSubcommands, wrappers: InspectionWrappers): boolean {
+  const executable = tokens[0];
+  if (wrappers.hypaExecutables?.size === 0) return false;
+  if (executable !== "hypa" && (!executable?.startsWith("/") || !wrappers.hypaExecutables?.has(executable)))
+    return false;
+  let index = 1;
+  if (tokens[index] === "--timeout-ms") {
+    const timeout = tokens[index + 1] ?? "";
+    if (!/^[1-9]\d*$/u.test(timeout) || !Number.isSafeInteger(Number(timeout))) return false;
+    index += 2;
+  }
+  if (tokens[index] === "git") return isSafeArgv(tokens.slice(index), safeSubcommands);
+  if (tokens[index] !== "-c" || tokens.length !== index + 2) return false;
+  const inner = shellWords(tokens[index + 1] ?? "", true);
+  // Reparse once, into native argv only. Never recurse into another wrapper or
+  // rely on an earlier hook's claim about the original command.
+  return inner !== undefined && isSafeTokens(inner) && isSafeArgv(inner, safeSubcommands);
 }
 
 function isSafeArgv(tokens: string[], safeSubcommands: SafeSubcommands): boolean {
@@ -173,7 +217,7 @@ function isSafeToken(token: string): boolean {
  * A small shell-word reader is used only to support quoted paths and spaces;
  * it is not a shell parser and never returns command separators.
  */
-function shellWords(command: string): string[] | undefined {
+function shellWords(command: string, posix = false): string[] | undefined {
   if (!command || /[\n\r]/u.test(command)) return undefined;
   const words: string[] = [];
   let word = "";
@@ -191,6 +235,7 @@ function shellWords(command: string): string[] | undefined {
 
   for (const character of command) {
     if (escaped) {
+      if (posix && quote === '"' && !'$`"\\'.includes(character)) word += "\\";
       word += character;
       hasWord = true;
       escaped = false;
@@ -214,7 +259,7 @@ function shellWords(command: string): string[] | undefined {
       hasWord = true;
       continue;
     }
-    if (/\s/u.test(character)) {
+    if (posix ? character === " " || character === "\t" : /\s/u.test(character)) {
       flush();
       continue;
     }
