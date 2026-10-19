@@ -23,7 +23,7 @@ const operations = createApprovalBashOperations({
 });
 process.on("message", () => process.exit(0));
 await operations.exec(
-  "printf '%s' $$ > shell.pid; sleep 30 & printf '%s' $! > descendant.pid; printf ready > ready; wait",
+  "printf '%s' $$ > shell.pid.tmp; mv shell.pid.tmp shell.pid; sleep 30 & printf '%s' $! > descendant.pid.tmp; mv descendant.pid.tmp descendant.pid; printf ready > ready; wait",
   process.argv[2],
   { onData() {} },
 );
