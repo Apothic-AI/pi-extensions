@@ -8,12 +8,14 @@ import {
   getCurrentTools,
   InMemoryCredentialStore,
   type Model,
+  normalizeContext,
   type Provider,
   Type,
 } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   type AgentSession,
+  buildSessionContext,
   createAgentSession,
   createCodemodeExtension,
   DefaultResourceLoader,
@@ -27,6 +29,7 @@ import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import type { JsonObject } from "../src/protocol.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
+import { ToolStateTracker } from "../src/tool-state.js";
 
 const model: Model<"openai-codex-responses"> = {
   id: "gpt-5.6",
@@ -67,14 +70,99 @@ function sseResponse(compact: boolean): Response {
   );
 }
 
+for (const incremental of [true, false]) {
+  test(`native provider synthetic tool additions retain exact wire proof (incremental=${incremental})`, async () => {
+    const provider = openaiCodexProvider();
+    const read = {
+      name: "read",
+      description: "Read synthetic files",
+      parameters: Type.Object({ path: Type.String() }),
+    };
+    const todo = {
+      name: "todo",
+      description: "Synthetic checklist",
+      parameters: Type.Object({ title: Type.String() }),
+    };
+    const recorded = [read, todo];
+    const context = normalizeContext({
+      messages: [
+        { role: "system", content: "Synthetic initial system.", toolsAdded: [read], timestamp: 1 },
+        { role: "user", content: "Synthetic first message.", timestamp: 2 },
+        { role: "system", content: "", toolsAdded: [todo], timestamp: 3 },
+        { role: "user", content: "Synthetic second message.", timestamp: 4 },
+      ],
+    });
+    const syntheticModel = {
+      ...model,
+      compat: {
+        supportsMidConvoSystemMessages: true,
+        supportsAdditionalTools: incremental,
+        supportsToolSearch: incremental,
+      },
+    };
+    let fetchAttempts = 0;
+    let payload: JsonObject | undefined;
+    const stream = provider.stream(syntheticModel, context, {
+      apiKey,
+      transport: "sse",
+      maxRetries: 0,
+      fetch: async () => {
+        fetchAttempts += 1;
+        throw new Error("Offline probe must abort before transport");
+      },
+      onPayload(value) {
+        payload = structuredClone(value) as JsonObject;
+        throw new DOMException("Synthetic payload captured", "AbortError");
+      },
+    });
+    for await (const _event of stream) {
+      /* Drain the provider's handled abort. */
+    }
+    assert.ok(payload);
+    assert.equal(fetchAttempts, 0);
+    assert.deepEqual(
+      payload.tools.map((tool: JsonObject) => tool.name),
+      incremental ? ["read"] : ["read", "todo"],
+    );
+    const groups = payload.input.filter((item: JsonObject) => item.type === "additional_tools");
+    assert.equal(groups.length, incremental ? 1 : 0);
+    if (incremental) {
+      assert.equal(groups[0].role, "developer");
+      assert.deepEqual(
+        groups[0].tools.map((tool: JsonObject) => tool.name),
+        ["todo"],
+      );
+    }
+    const tracker = new ToolStateTracker();
+    const owner = {};
+    tracker.prepare(owner, "synthetic", recorded, recorded);
+    assert.equal(tracker.matches(owner, "synthetic", recorded, recorded), true);
+    tracker.observe(owner, "synthetic", recorded, recorded, payload);
+    assert.equal(tracker.matches(owner, "synthetic", recorded, recorded), true);
+    const validate = tracker.payloadValidator(owner, "synthetic");
+    assert.ok(validate);
+    assert.equal(validate(payload), true);
+    if (incremental) {
+      const flat = structuredClone(payload);
+      flat.tools.push(...groups[0].tools);
+      flat.input = flat.input.filter((item: JsonObject) => item.type !== "additional_tools");
+      assert.equal(validate(flat), false, "the same effective tool set is not the same serialized proof");
+    }
+  });
+}
+
 /** Real SDK and Codex serializer, isolated credentials, and a fully stubbed transport. */
-async function sdkFixture(mode: "on" | "only" = "on") {
+async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "auth" | "flight") {
   const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-loadout-"));
   vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected live HTTP request"));
   vi.spyOn(globalThis, "WebSocket").mockImplementation(() => {
     throw new Error("Unexpected live WebSocket request");
   });
   const requests: JsonObject[] = [];
+  let appendGoal = () => {};
+  let compacting = false;
+  let compactionAuth = 0;
+  const preparations: Array<{ firstKeptEntryId: string; tokensBefore: number; sourceIds: string[] }> = [];
   const fetch: typeof globalThis.fetch = async (_url, init) => {
     const body = init?.body;
     assert.ok(typeof body === "string" || body instanceof Uint8Array);
@@ -83,7 +171,9 @@ async function sdkFixture(mode: "on" | "only" = "on") {
     ) as JsonObject;
     requests.push(payload);
     assert.ok(Array.isArray(payload.input));
-    return sseResponse(payload.input.some((item: JsonObject) => item.type === "compaction_trigger"));
+    const compact = payload.input.some((item: JsonObject) => item.type === "compaction_trigger");
+    if (compact && goalPhase === "flight") appendGoal();
+    return sseResponse(compact);
   };
   try {
     const modelRuntime = await ModelRuntime.create({
@@ -110,7 +200,18 @@ async function sdkFixture(mode: "on" | "only" = "on") {
     const actual = openaiCodexProvider();
     const provider: Provider = {
       ...actual,
-      auth: { apiKey: { name: "Offline test", resolve: async () => ({ auth: { apiKey } }) } },
+      auth: {
+        apiKey: {
+          name: "Offline test",
+          resolve: async () => {
+            if (compacting) {
+              compactionAuth += 1;
+              if (goalPhase === "auth") appendGoal();
+            }
+            return { auth: { apiKey } };
+          },
+        },
+      },
       getModels: () => [model],
       stream: (requestModel, context, options) =>
         actual.stream(requestModel, context, { ...options, transport: "sse", fetch: options?.fetch ?? fetch }),
@@ -130,10 +231,33 @@ async function sdkFixture(mode: "on" | "only" = "on") {
         cwd: directory,
         agentDir: directory,
         settingsManager,
+        noExtensions: true,
+        noContextFiles: true,
         noSkills: true,
         noPromptTemplates: true,
         noThemes: true,
         extensionFactories: [
+          // Synthetic earlier extension uses only the public append API, not Goal source.
+          (pi) => {
+            appendGoal = () => {
+              const before = buildSessionContext(manager.getBranch(), manager.getLeafId()).messages;
+              pi.appendEntry("goal-state", { synthetic: true });
+              pi.appendEntry("goal-state", { synthetic: true });
+              assert.deepEqual(buildSessionContext(manager.getBranch(), manager.getLeafId()).messages, before);
+            };
+            pi.on("session_before_compact", (event) => {
+              compacting = true;
+              preparations.push({
+                firstKeptEntryId: event.preparation.firstKeptEntryId,
+                tokensBefore: event.preparation.tokensBefore,
+                sourceIds: event.branchEntries.map((entry) => entry.id),
+              });
+              if (goalPhase === "before") appendGoal();
+            });
+            pi.on("session_compact", () => {
+              compacting = false;
+            });
+          },
           createCodemodeExtension({ mode }),
           (pi) => {
             registerTool = (tool) => pi.registerTool(tool);
@@ -168,6 +292,8 @@ async function sdkFixture(mode: "on" | "only" = "on") {
     return {
       directory,
       requests,
+      preparations,
+      compactionAuth: () => compactionAuth,
       open,
       replayCachedRequest: async () => {
         assert.ok(cachedRequest);
@@ -253,6 +379,54 @@ test("SDK codemode request → remote compaction → persisted reload → opaque
     fixture.cleanup();
   }
 });
+
+for (const phase of ["before", "auth", "flight"] as const) {
+  test(`SDK Goal bookkeeping ${phase} compaction preserves remote checkpoint and preparation metadata`, async () => {
+    const fixture = await sdkFixture("on", phase);
+    const manager = SessionManager.create(fixture.directory, fixture.directory);
+    let session: AgentSession | undefined;
+    try {
+      session = await fixture.open(manager);
+      await session.prompt(`First task. ${"Older conversation content. ".repeat(100)}`);
+      await session.prompt("Second task.");
+      const requestsBefore = fixture.requests.length;
+      const result = await session.compact();
+      const details = parseCheckpointDetails(result.details);
+      assert.ok(details, "Goal bookkeeping must not cancel before auth or fall back for loadout mismatch");
+      assert.ok(fixture.compactionAuth() > 0);
+      assert.equal(fixture.requests.length, requestsBefore + 1, "one remote request, no native fallback");
+      const preparation = fixture.preparations.at(-1);
+      assert.ok(preparation);
+      assert.equal(result.firstKeptEntryId, preparation.firstKeptEntryId);
+      assert.equal(result.tokensBefore, preparation.tokensBefore);
+      const branch = manager.getBranch();
+      assert.deepEqual(
+        branch.slice(0, preparation.sourceIds.length).map((entry) => entry.id),
+        preparation.sourceIds,
+      );
+      const appended = branch.slice(preparation.sourceIds.length, -1);
+      assert.equal(appended.length, 2);
+      assert.ok(appended.every((entry) => entry.type === "custom" && entry.customType === "goal-state"));
+      assert.equal(branch.at(-1)?.parentId, appended.at(-1)?.id);
+      const committed = branch.at(-1);
+      assert.ok(committed?.type === "compaction");
+      assert.deepEqual(committed.details, result.details);
+      const sessionFile = manager.getSessionFile();
+      assert.ok(sessionFile);
+      session.dispose();
+      session = await fixture.open(SessionManager.open(sessionFile));
+      await session.prompt("Continue after bookkeeping checkpoint reload.");
+      const replay = fixture.requests.at(-1);
+      assert.ok(replay);
+      assert.equal(replay.input.filter((item: JsonObject) => item.type === "compaction").length, 1);
+      assert.doesNotMatch(JSON.stringify(replay), /goal-state|synthetic/);
+      assert.equal(session.getLastAssistantText(), "Done.");
+    } finally {
+      session?.dispose();
+      fixture.cleanup();
+    }
+  });
+}
 
 test("SDK codemode-only hidden declarations use native compaction, never restore hidden tools remotely", async () => {
   const fixture = await sdkFixture("only");

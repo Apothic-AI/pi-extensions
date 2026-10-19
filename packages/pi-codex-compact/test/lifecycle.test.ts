@@ -16,6 +16,7 @@ import {
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   buildSessionProjection,
+  type ExtensionContext,
   type SessionBeforeCompactEvent,
   type SessionEntry,
   SessionManager,
@@ -416,7 +417,7 @@ test("real Codex HTTP errors cannot echo credentials into fallback warnings or c
   assert.equal(sentHeaders?.get("X-Provider-Token"), providerToken);
   assert.equal(result, undefined, "failure must fall back to native compaction");
   assert.deepEqual(notifications, [
-    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+    { message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]", level: "warning" },
   ]);
   for (const secret of [apiKey, `Bearer ${apiKey}`, providerToken, envSecret]) {
     assert.equal(JSON.stringify(notifications).includes(secret), false);
@@ -477,7 +478,7 @@ test("a real Codex stalled body reaches the extension deadline and uses native f
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   assert.equal(cancellations, 1);
   assert.deepEqual(notifications, [
-    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+    { message: "Codex remote compaction failed; using Pi compaction. [remote_timeout]", level: "warning" },
   ]);
   assert.equal(statuses.get("codex-compact"), undefined);
   assert.equal(
@@ -585,7 +586,10 @@ for (const scenario of ["delayed success", "auth deadline", "cancel during auth"
       }
       if (scenario === "auth deadline" || scenario === "combined deadline") {
         assert.deepEqual(notifications, [
-          { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+          {
+            message: `Codex remote compaction failed; using Pi compaction. [${scenario === "auth deadline" ? "authentication_timeout" : "remote_timeout"}]`,
+            level: "warning",
+          },
         ]);
       }
       assert.doesNotMatch(JSON.stringify(notifications), /secret-/);
@@ -607,8 +611,14 @@ function sseResponse() {
   );
 }
 
-for (const [change, name] of [
+for (const [scenario, name] of [
   ["none", "stable transformed descriptions allow compaction"],
+  ["goal-none", "Goal bookkeeping retains fresh transformed-tool evidence"],
+  ["goal-schema", "Goal bookkeeping cannot admit a registry schema change"],
+  ["goal-prompt", "Goal bookkeeping cannot admit a live prompt change"],
+  ["goal-wire-schema", "Goal bookkeeping cannot bypass the exact wire validator"],
+  ["goal-reload-warming", "Goal bookkeeping cannot restore stale reload evidence"],
+  ["goal-in-flight", "Goal bookkeeping cannot bless a later in-flight tool edit"],
   ["description", "a registry description edit rejects compaction"],
   ["cached-description", "a cached callback cannot bless an unsent registry description"],
   ["hidden", "hidden declarations reject compaction"],
@@ -623,6 +633,8 @@ for (const [change, name] of [
   ["tree", "tree navigation discards dispatch evidence"],
 ] as const) {
   test(`transformed loadout: ${name}`, async () => {
+    const withGoal = scenario.startsWith("goal-");
+    const change = withGoal ? scenario.slice(5) : scenario;
     const read: Tool = { name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) };
     const codemode: Tool = {
       name: "codemode",
@@ -645,6 +657,7 @@ for (const [change, name] of [
       fetch: async () => {
         requests += 1;
         if (change === "in-flight") {
+          if (withGoal) manager.appendCustomEntry("goal-state", {});
           read.description = "Changed during the request";
           await mock.events.get("before_provider_request")?.[0]({ payload: { input: [] } }, ctx);
         }
@@ -664,6 +677,7 @@ for (const [change, name] of [
     const input = event();
     input.branchEntries = manager.getBranch();
     input.preparation.firstKeptEntryId = keptId;
+    if (withGoal) manager.appendCustomEntry("goal-state", {});
     const compact = mock.events.get("session_before_compact")?.[0];
     assert.ok(compact);
     assert.equal(await compact(input, ctx), undefined, "unobserved transformations fail closed");
@@ -1477,6 +1491,133 @@ test("session lifecycle reloads settings, warns once current, and drops stale re
   assert.equal(statuses.get("codex-compact"), undefined);
 });
 
+for (const phase of ["start", "final"] as const) {
+  test(`throwing ${phase} progress status preserves the opaque cancellation hook result`, async () => {
+    const session = SessionManager.inMemory();
+    const keptId = session.appendMessage({ role: "user", content: "Kept task", timestamp: 1 });
+    const details = createCheckpointDetails({
+      modelId: model.id,
+      checkpointId: "status-safety",
+      replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+      keptMessages: [],
+    });
+    session.appendCompaction(fallbackSummary(details.checkpointId), keptId, 100, details);
+    const afterId = session.appendMessage({ role: "user", content: "Continue", timestamp: 2 });
+    const before = session.getEntries();
+    const mock = createMockPi();
+    const auth = vi.fn(async () => ({ ok: false, error: "offline auth unavailable" }));
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch })(mock.pi);
+    const { ctx } = createMockContext({
+      model,
+      hasUI: true,
+      sessionManager: session,
+      modelRegistry: { getApiKeyAndHeaders: auth },
+    });
+    const status = vi.spyOn((ctx as ExtensionContext).ui, "setStatus").mockImplementation((_key, value) => {
+      if ((phase === "start") === (value !== undefined)) throw new Error("Offline status unavailable");
+    });
+    const result = await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: afterId },
+      },
+      ctx,
+    );
+    assert.deepEqual(result, { cancel: true });
+    assert.equal(auth.mock.calls.length, 1);
+    assert.equal(status.mock.calls.length, 2);
+    assert.equal(fetch.mock.calls.length, 0);
+    assert.deepEqual(session.getEntries(), before);
+  });
+}
+
+for (const selected of [
+  ["provider", { ...model, provider: "other" }],
+  ["API", { ...model, api: "openai-responses" }],
+  ["model ID", { ...model, id: "different" }],
+  ["missing model", undefined],
+  ["compatible", model],
+] as const) {
+  for (const boundary of ["opaque", "malformed", "missing details", "none", "superseded", "disabled"] as const) {
+    test(`opaque safety gate before consent/auth: ${selected[0]}, ${boundary}`, async () => {
+      const session = SessionManager.inMemory();
+      const oldId = session.appendMessage({ role: "user", content: "Older context", timestamp: 1 });
+      const keptId = session.appendMessage({ role: "user", content: "Kept context", timestamp: 2 });
+      const details = createCheckpointDetails({
+        modelId: model.id,
+        checkpointId: "safety-checkpoint",
+        replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+        keptMessages: [],
+      });
+      if (boundary !== "none") {
+        session.appendCompaction(
+          fallbackSummary(details.checkpointId),
+          keptId,
+          100,
+          boundary === "malformed"
+            ? { ...details, replacementHistory: [] }
+            : boundary === "missing details"
+              ? undefined
+              : details,
+        );
+      }
+      // Retaining the old remote entry behind the native boundary must not
+      // resurrect its opaque semantics, even though it remains in raw history.
+      if (boundary === "superseded") session.appendCompaction("Readable native summary", oldId, 100);
+      const afterId = session.appendMessage({ role: "user", content: "Continue", timestamp: 3 });
+      const original = session.getBranch();
+      const mock = createMockPi();
+      const auth = vi.fn(async () => ({ ok: false, error: "unused" }));
+      const provider = vi.fn();
+      const confirm = vi.fn(async () => false);
+      const fetch = vi.fn<typeof globalThis.fetch>();
+      createCodexCompactExtension({
+        settingsRuntime: settingsRuntime({ enabled: boundary !== "disabled", allowCanonicalHistory: false }),
+        fetch,
+      })(mock.pi);
+      const { ctx, notifications } = createMockContext({
+        model: selected[1],
+        sessionManager: session,
+        hasUI: true,
+        confirm,
+        modelRegistry: { getApiKeyAndHeaders: auth, getProvider: provider },
+      });
+      await mock.events.get("session_start")?.[0]({ reason: "startup" }, ctx);
+      assert.deepEqual(notifications, [], "healthy startup stays silent, including incompatible checkpoints");
+      const blocked =
+        boundary === "malformed" ||
+        boundary === "missing details" ||
+        (boundary === "opaque" && selected[0] !== "compatible");
+      for (const reason of ["manual", "threshold", "overflow"] as const) {
+        const result = await mock.events.get("session_before_compact")?.[0](
+          {
+            ...event(),
+            reason,
+            branchEntries: original,
+            preparation: { ...event().preparation, firstKeptEntryId: afterId },
+          },
+          ctx,
+        );
+        if (blocked) {
+          assert.deepEqual(result, { cancel: true });
+          assert.equal(confirm.mock.calls.length, 0, "unsafe opaque boundary cancels before consent");
+        } else if (boundary === "disabled" || (selected[0] !== "compatible" && selected[0] !== "model ID")) {
+          assert.equal(result, undefined, "native fallback without an effective opaque boundary or explicit opt-out");
+        } else {
+          assert.deepEqual(result, { cancel: true }, "compatible requests still follow the existing consent gate");
+          assert.ok(confirm.mock.calls.length > 0);
+        }
+      }
+      assert.equal(auth.mock.calls.length, 0);
+      assert.equal(provider.mock.calls.length, 0);
+      assert.equal(fetch.mock.calls.length, 0);
+      assert.deepEqual(session.getBranch(), original);
+    });
+  }
+}
+
 test("disabled, unsupported, auth-failed, and aborted compaction paths remain safe", async () => {
   const run = async (options: {
     settings?: CodexCompactSettingsRuntime;
@@ -1518,7 +1659,7 @@ test("disabled, unsupported, auth-failed, and aborted compaction paths remain sa
   const failed = await run({ auth: { ok: false, error: "Authorization: Bearer secret-auth-token" } });
   assert.equal(failed.result, undefined);
   assert.deepEqual(failed.notifications, [
-    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+    { message: "Codex remote compaction failed; using Pi compaction. [credentials_unavailable]", level: "warning" },
   ]);
   assert.equal(JSON.stringify(failed.notifications).includes("secret-auth-token"), false);
   assert.equal(failed.statuses.get("codex-compact"), undefined);

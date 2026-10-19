@@ -10,6 +10,13 @@ export class CodexCompactionProtocolError extends Error {
   }
 }
 
+export class CodexCompactionProviderError extends Error {
+  constructor() {
+    super("Remote compaction provider reported failure");
+    this.name = "CodexCompactionProviderError";
+  }
+}
+
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -49,9 +56,24 @@ function compactionItemsFromEvent(event: JsonObject): unknown[] {
   }
   if (event.type === "response.completed" && isObject(event.response)) {
     const output = event.response.output;
-    if (Array.isArray(output)) items.push(...output);
+    if (Array.isArray(output)) {
+      // A bounded JSON array can still exceed JavaScript's call argument limit.
+      for (const item of output) {
+        if (isObject(item) && item.type === "compaction") items.push(item);
+      }
+    }
   }
   return items.filter((item) => isObject(item) && item.type === "compaction");
+}
+
+function validateSseStep(run: () => void): void {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof CodexCompactionProtocolError || error instanceof CodexCompactionProviderError) throw error;
+    // Local decoder/JSON/item validation failures are not network read errors.
+    throw new CodexCompactionProtocolError("Remote compaction returned unsupported SSE output");
+  }
 }
 
 export async function collectCompactionSse(
@@ -90,6 +112,8 @@ export async function collectCompactionSse(
       throw new CodexCompactionProtocolError("Remote compaction returned malformed SSE JSON");
     }
     if (!isObject(parsed)) return;
+    // Closed terminal failure types only. Never parse/copy their arbitrary text.
+    if (parsed.type === "error" || parsed.type === "response.failed") throw new CodexCompactionProviderError();
     if (parsed.type === "response.completed") {
       completedResponse = isObject(parsed.response) ? parsed.response : {};
     }
@@ -113,24 +137,28 @@ export async function collectCompactionSse(
       checkAbort();
       const { done, value } = await reader.read();
       if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maxBytes) {
-        throw new CodexCompactionProtocolError("Remote compaction stream exceeded the size limit");
-      }
-      pending += decoder.decode(value, { stream: true });
-      let newline = pending.indexOf("\n");
-      while (newline !== -1) {
-        const rawLine = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
-        if (completedResponse) break;
-        newline = pending.indexOf("\n");
-      }
+      validateSseStep(() => {
+        bytes += value.byteLength;
+        if (bytes > maxBytes) {
+          throw new CodexCompactionProtocolError("Remote compaction stream exceeded the size limit");
+        }
+        pending += decoder.decode(value, { stream: true });
+        let newline = pending.indexOf("\n");
+        while (newline !== -1) {
+          const rawLine = pending.slice(0, newline);
+          pending = pending.slice(newline + 1);
+          processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+          if (completedResponse) break;
+          newline = pending.indexOf("\n");
+        }
+      });
     }
     if (!completedResponse) {
-      pending += decoder.decode();
-      if (pending.length > 0) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
-      dispatch();
+      validateSseStep(() => {
+        pending += decoder.decode();
+        if (pending.length > 0) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
+        dispatch();
+      });
     }
     checkAbort();
   } finally {

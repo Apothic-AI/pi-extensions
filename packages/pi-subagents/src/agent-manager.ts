@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type {
@@ -66,6 +66,7 @@ import {
   cleanupWorktreeAsync,
   createWorktree,
   isWorktreeIsolationEnabled,
+  protectMissingWorktree,
   pruneWorktrees,
   pruneWorktreesAsync,
   type WorktreeCleanupResult,
@@ -266,9 +267,10 @@ function worktreeRecoveryCommands(
   const c = cwd ? shellQuote(cwd) : "'.'";
   const p = path ? shellQuote(path) : "''";
   return Object.freeze([
-    `git -C ${c} worktree remove --force ${p}`,
-    `rm -rf -- ${p}`,
-    `git -C ${c} worktree prune`,
+    `git -C ${c} worktree list --porcelain`,
+    `git -C ${p} status --short`,
+    `git -C ${p} log -5 --oneline`,
+    "# Inspect and copy the checkout (including untracked files) to a safe location before repairing Git or retrying cleanup.",
   ]);
 }
 
@@ -3719,13 +3721,23 @@ export class AgentManager {
           sameFilesystemPath(child.worktree.repoRoot, worktree.path)) ||
           child.worktree === undefined),
     );
+    let recoveryDiagnostic: string | undefined;
+    if (!existsSync(worktree.path)) {
+      try {
+        // Metadata-only protection is safe before quiescence. Never run actual
+        // checkout cleanup just to retain recovery across manager replacement.
+        recoveryDiagnostic = protectMissingWorktree(worktree.repoRoot, worktree.path);
+      } catch (error) {
+        recoveryDiagnostic = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const pinnedDiagnostic = diagnostic ??
+      `Worktree cleanup is pinned because descendant ${dependent?.id ?? "agent"} still depends on ${worktree.path}`;
     const result: WorktreeCleanupResult = {
       hasChanges: false,
       path: worktree.path,
       cleanupSucceeded: false,
-      cleanupDiagnostic:
-        diagnostic ??
-        `Worktree cleanup is pinned because descendant ${dependent?.id ?? "agent"} still depends on ${worktree.path}`,
+      cleanupDiagnostic: recoveryDiagnostic ? `${pinnedDiagnostic} ${recoveryDiagnostic}` : pinnedDiagnostic,
       recoveryCommands: worktreeRecoveryCommands(
         worktree.repoRoot,
         worktree.path,
@@ -4669,11 +4681,16 @@ export class AgentManager {
       }
     };
     const pruneRepositories = async (): Promise<void> => {
+      // Defer all global orphan pruning while any worktree remains attached:
+      // its registration may hold recoverable HEAD/reflog/index data. Paths
+      // cannot establish Git identity; cwd may be a subdirectory or another
+      // linked checkout of the same repository as a retained failure.
+      if (orderedRecords.some((record) => record.worktree !== undefined)) return;
       await Promise.all([...reposToPrune].map((repo) => pruneRepository(repo)));
     };
 
-    // Pruning after the first pass can release stale child registrations. Retry
-    // only records whose worktree reference remains, still deepest-first.
+    // Retry retained worktrees deepest-first even when global orphan pruning
+    // is deferred. Individual cleanup of siblings remains independent.
     await pruneRepositories();
     for (const record of orderedRecords) {
       if (record.worktree) await attemptCleanup(record);

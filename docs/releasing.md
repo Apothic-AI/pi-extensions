@@ -8,9 +8,8 @@ the Actions workflow is the normal release path.
 ## Version policy
 
 Every package versions independently (`fixed: []` and `linked: []` in
-`.changeset/config.json`). One package can ship a fix without dragging the other
-twenty-six to a new version, and a package's version number means something
-about that package alone.
+`.changeset/config.json`). One package can ship a fix without changing unrelated
+packages' versions.
 
 Choose the bump from what the change does to someone who already installed the
 package:
@@ -27,21 +26,13 @@ warning, and the session keeps running.
 | **minor** | Everything else that changes behavior — a new capability, a retired settings key or frontmatter field, a different set of parameters on an LLM-facing tool, a changed default. |
 | **patch** | A fix, a performance change, or a documentation change that ships in the package (`README.md` is in `files`). |
 
-This line was drawn twice too wide before settling here. Retiring `widgetMode`,
-dropping `model`/`thinking` from the `Agent` tool schema, and dropping them from
-agent frontmatter are all **minor**: each leaves a key that no longer does
-anything, each warns, and none of them stops another package from compiling. The
-cost of that choice is real — configuration can quietly lose meaning across a
-minor — so retired keys warn by name rather than failing silently, and the
-changeset says what to replace them with.
+Retired settings and frontmatter fields warn by name rather than silently losing
+meaning; their changeset documents the replacement. Such retirement is minor
+unless another package's compiled contract breaks.
 
-The workspace baseline is **1.2.0**, chosen to clear every version already on
-npm (the highest were `pi-input-history@1.1.0-signalridge.1` and several
-`0.49.x`). An earlier 1.0.0 baseline was set in the repository but never
-published, so for months the manifests read 1.0.0 while installs resolved
-0.16.0, 0.11.0, or 0.1.0 — and Changesets, which only increments the local
-number, was computing bumps from a version that had never existed. Do not
-re-baseline the workspace to a number npm has already seen.
+The published workspace baseline is **1.2.0**. Never re-baseline to a number npm
+has already seen, and never let a local package version fall behind its npm
+`latest` tag.
 
 Three rules keep this honest:
 
@@ -57,13 +48,9 @@ Three rules keep this honest:
   the npm `latest` tag.** The publisher refuses to move a dist-tag backward, so
   that state blocks the release outright. Equal is the normal resting state
   right after a release and passes silently; ahead means an unreleased change is
-  pending and is reported, not failed. At the 1.0.0 baseline this would have
-  caught two of the twenty-seven — `pi-input-history` (declared 1.0.0, npm
-  already at 1.1.0-signalridge.1) and `pi-worktime` (declared 1.0.0, npm already
-  at 1.0.0) — which are exactly the two that would have failed the release. It
-  does not catch a version that is merely declared and never published; the
-  "awaiting release" line it prints is the signal for that, and reading it is a
-  human job. Registry lookups are best-effort — an unreachable registry is
+  pending and is reported, not failed. An ahead version does not prove
+  publication; inspect its "awaiting release" status separately. Registry
+  lookups are best-effort — an unreachable registry is
   reported and skipped so an offline checkout still runs `bun run check`, and
   `CHECK_VERSIONS_OFFLINE=1` skips the network entirely.
 - **A peer dependent is only bumped when the new version leaves its declared

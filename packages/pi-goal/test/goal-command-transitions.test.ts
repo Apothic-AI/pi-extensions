@@ -77,12 +77,11 @@ test("safety epochs reset on successful resume and active edit", async () => {
     safetyPauseCause: undefined,
   });
 
-  const edited = await startGoalForTest();
-  const activeGoal = requireLastGoal(edited.mock);
-  activeGoal.automaticModelTurns = 8;
-  activeGoal.toolFreeRepeatCount = 2;
-  activeGoal.lastToolFreeOutputFingerprint = "b".repeat(64);
-  edited.mock.entries.push({ customType: "goal-state", data: { goal: activeGoal } });
+  const edited = restoreGoalForTest("active", {
+    automaticModelTurns: 8,
+    toolFreeRepeatCount: 2,
+    lastToolFreeOutputFingerprint: "b".repeat(64),
+  });
   await edited.mock.commands.get("goal")?.handler("edit revised objective", edited.ctx);
   assert.deepEqual(pickSafetyState(requireLastGoal(edited.mock)), {
     automaticModelTurns: 8,
@@ -234,18 +233,31 @@ test("direct active input resets safety and reclassifies an in-flight automatic 
 });
 
 test("busy active edit claims ownership and resets safety only when its queued run starts", async () => {
-  const branch = [assistantUsageEntry({ totalTokens: 100 })];
-  const edited = await startGoalForTest(
-    { sessionManager: { getBranch: () => branch, getEntries: () => branch } },
-    "finish",
+  const edited = restoreStoredGoalForTest(
+    {
+      id: "busy-active-goal",
+      text: "finish",
+      status: "active",
+      startedAt: 1,
+      updatedAt: 1,
+      iteration: 0,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      baselineTokens: 100,
+      automaticModelTurns: 2,
+      toolFreeRepeatCount: 2,
+      lastToolFreeOutputFingerprint: "e".repeat(64),
+    },
+    [assistantUsageEntry({ totalTokens: 100 })],
+    "always",
+    {},
     LOW_LIMITS_SETTINGS_PATH,
   );
-  const kickoff = edited.mock.sentUserMessages.at(-1)?.text ?? "";
-  edited.mock.events.get("before_agent_start")?.[0]?.({ prompt: kickoff, systemPrompt: "base" }, edited.ctx);
+  const branch = edited.ctx.sessionManager.getBranch();
+  edited.mock.events.get("before_agent_start")?.[0]?.({ prompt: "existing run", systemPrompt: "base" }, edited.ctx);
   const previous = requireLastGoal(edited.mock);
-  previous.automaticModelTurns = 2;
-  previous.toolFreeRepeatCount = 2;
-  previous.lastToolFreeOutputFingerprint = "e".repeat(64);
+  assert.equal(previous.automaticModelTurns, 2);
+  const sentBeforeEdit = edited.mock.sentUserMessages.length;
 
   await edited.mock.commands.get("goal")?.handler("edit busy replacement", edited.ctx);
   const candidate = requireLastGoal(edited.mock);
@@ -266,6 +278,7 @@ test("busy active edit claims ownership and resets safety only when its queued r
   assert.equal(requireLastGoal(edited.mock).automaticModelTurns, 0);
   assert.equal(requireLastGoal(edited.mock).toolFreeRepeatCount, 0);
   assert.equal(requireLastGoal(edited.mock).baselineTokens, 120);
+  assert.equal(candidate.automaticModelTurns, 2, "starting the new run must not rewrite its queued snapshot");
 
   await edited.mock.events.get("agent_end")?.[0]?.(
     { messages: [{ role: "assistant", stopReason: "stop", content: [] }] },
@@ -273,7 +286,7 @@ test("busy active edit claims ownership and resets safety only when its queued r
   );
   await edited.mock.events.get("agent_settled")?.[0]?.({}, edited.ctx);
   assert.equal(lastGoalStatus(edited.mock), "active");
-  assert.equal(edited.mock.sentUserMessages.length, 3);
+  assert.equal(edited.mock.sentUserMessages.length, sentBeforeEdit + 2);
 });
 
 test("resume rejects active goals and exhausted budgets without rotating goal_id", async () => {

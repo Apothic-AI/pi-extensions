@@ -82,11 +82,13 @@ export function serializeGoalState(
   queue: readonly ActiveGoal[],
   pendingAction: PendingQueueAction | undefined,
 ): GoalStateEntryData {
-  return {
+  // Native session entries retain data references; later runtime updates must
+  // not rewrite historical metadata or invalidate another extension's ancestry.
+  return structuredClone({
     goal: goal ?? null,
     ...(queue.length > 0 ? { queue: [...queue] } : {}),
     ...(pendingAction ? { pendingAction } : {}),
-  };
+  });
 }
 
 export function loadGoalStateFromSession(ctx: SessionContext): LoadedGoalState {

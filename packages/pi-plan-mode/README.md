@@ -24,7 +24,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 
 ## Install
 
-The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-1.0-compatibility.md) for verification details.
+The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details.
 
 ```bash
 pi install npm:@signalridge/pi-plan-mode

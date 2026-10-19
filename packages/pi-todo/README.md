@@ -6,6 +6,8 @@ Experimental, opt-in Pi extension. One checklist belongs to the **current sessio
 
 Load this package explicitly with Pi's package settings or `pi --extension ./packages/pi-todo/src/index.ts` from a checkout. It is not enabled by default. The ordinary factory-registered model tool is `todo`, in namespace `tasks`, and is usable by default when the package is explicitly loaded. Initial selections such as `--tools read,write,todo`, `defaultTools: ["+todo"]`, and SDK `tools` work before session startup. This extension never calls `setActiveTools`: earlier/later startup restrictions and Plan/blocking policy remain in effect. Human `/todo` edits do not activate tools or alter tool policy.
 
+`todo` is the model tool; `/todo` is a human terminal command, not a model-callable interface. When the host's active tool set excludes `todo`, this extension omits its current-checklist context and removes its own stale context blocks without changing stored snapshots or tool policy. Restoring the active tool restores normal checklist context. Unavailable checklist operations are not a workspace-ownership or acceptance gate: they do not, by themselves, block other authorized work.
+
 Pi may reject duplicate static tool registrations itself. At runtime this package fails closed when a **different effective** `todo` definition is publicly visible, checking actual parameters and source provenance, not just instructions. Public discovery cannot enumerate definitions excluded by a host allowlist (including `tools: []`), or definitions rejected/overridden before startup. This is not a guarantee to detect every hidden static collision. The human command remains available when the tool is excluded; no automatic aliases or renamed tools are created.
 
 Tool calls:

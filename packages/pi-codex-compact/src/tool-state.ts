@@ -1,4 +1,4 @@
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, types } from "node:util";
 import type { Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 
@@ -16,12 +16,130 @@ export function sameTools(previous: Tool[], current: Tool[]): boolean {
 }
 
 type PreparedTools = { sessionId: string; recorded: Tool[]; registry: Tool[] };
-type ObservedTools = PreparedTools & { accepted: boolean; wire: unknown[] };
+type WireDeclarations = {
+  tools: unknown[];
+  additionalTools: Array<{ type: "additional_tools"; role: "developer"; tools: unknown[] }>;
+};
+type ObservedTools = PreparedTools & { accepted: boolean; wire?: WireDeclarations };
 
-function wireTools(payload: unknown): unknown[] | undefined {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
-  const tools = "tools" in payload ? payload.tools : [];
-  return Array.isArray(tools) ? tools : undefined;
+function record(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || types.isProxy(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+// Never invoke accessors or retain ordinary input content while inspecting the
+// declaration surface. Unsupported/exotic values are rejected by the caller.
+function field(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor) {
+    if (key in value) throw new Error("Inherited wire field");
+    return undefined;
+  }
+  if (!descriptor.enumerable || !("value" in descriptor)) throw new Error("Unsupported wire field");
+  return descriptor.value;
+}
+
+function rejectJsonOverride(value: object): void {
+  for (let current: object | null = value; current; current = Object.getPrototypeOf(current)) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, "toJSON");
+    if (!descriptor) continue;
+    if (!("value" in descriptor) || typeof descriptor.value === "function") {
+      throw new Error("Unsupported wire serialization override");
+    }
+    // Non-callable data shadows any inherited hook without changing JSON.
+    return;
+  }
+}
+
+function arrayItems(value: unknown): unknown[] {
+  if (!Array.isArray(value) || types.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error("Unsupported wire array");
+  }
+  rejectJsonOverride(value);
+  const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+  // Dense, ordinary arrays only: no holes, extra properties or own iterators.
+  if (typeof length !== "number" || Reflect.ownKeys(value).length !== length + 1) {
+    throw new Error("Unsupported wire array properties");
+  }
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error("Unsupported wire array index");
+    items.push(descriptor.value);
+  }
+  return items;
+}
+
+function checkWireValue(value: unknown, ancestors = new Set<object>()): void {
+  if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number" && Number.isFinite(value)) return;
+  if (
+    typeof value !== "object" ||
+    types.isProxy(value) ||
+    (!Array.isArray(value) && !record(value)) ||
+    ancestors.has(value)
+  ) {
+    throw new Error("Unsupported wire metadata");
+  }
+  ancestors.add(value);
+  rejectJsonOverride(value);
+  if (Array.isArray(value)) {
+    for (const item of arrayItems(value)) checkWireValue(item, ancestors);
+  } else {
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (typeof key !== "string" || !descriptor || !("value" in descriptor)) {
+        throw new Error("Unsupported wire property");
+      }
+      // Non-enumerable data (such as schema-builder annotations) is not sent
+      // on the JSON wire and structuredClone intentionally omits it.
+      if (descriptor.enumerable) checkWireValue(descriptor.value, ancestors);
+    }
+  }
+  ancestors.delete(value);
+}
+
+function freezeWireValue(value: object): void {
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") freezeWireValue(child);
+  }
+  Object.freeze(value);
+}
+
+function wireDeclarations(payload: unknown): WireDeclarations | undefined {
+  if (!record(payload)) return undefined;
+  rejectJsonOverride(payload);
+  const tools = "tools" in payload ? field(payload, "tools") : [];
+  if (!Array.isArray(tools)) return undefined;
+  const input = "input" in payload ? field(payload, "input") : [];
+  if (!Array.isArray(input)) return undefined;
+  const additionalTools: WireDeclarations["additionalTools"] = [];
+  for (const item of arrayItems(input)) {
+    if (!record(item)) return undefined;
+    // Inspect only the declaration envelope, never ordinary nested content.
+    rejectJsonOverride(item);
+    const type = field(item, "type");
+    if (type === "additional_tools") {
+      const group = field(item, "tools");
+      if (
+        field(item, "role") !== "developer" ||
+        !Array.isArray(group) ||
+        arrayItems(group).length === 0 ||
+        Reflect.ownKeys(item).length !== 3
+      )
+        return undefined;
+      checkWireValue(item);
+      additionalTools.push({ type, role: "developer", tools: group });
+    } else if (type === "tool_search_call" || type === "tool_search_output" || "tools" in item) {
+      return undefined;
+    }
+  }
+  const surface = { tools, additionalTools };
+  checkWireValue(surface);
+  const snapshot = structuredClone(surface);
+  freezeWireValue(snapshot);
+  return snapshot;
 }
 
 function matchesDeclarations(recorded: Tool[], wire: unknown[]): boolean {
@@ -58,23 +176,24 @@ export class ToolStateTracker {
 
   observe(owner: object, sessionId: string, recorded: Tool[], registry: Tool[], payload: unknown): void {
     const prepared = this.prepared.get(owner);
-    if (
-      !prepared ||
-      prepared.sessionId !== sessionId ||
-      !sameTools(prepared.recorded, recorded) ||
-      !sameTools(prepared.registry, registry)
-    ) {
-      return;
+    if (!prepared || prepared.sessionId !== sessionId) return;
+    try {
+      if (!sameTools(prepared.recorded, recorded) || !sameTools(prepared.registry, registry)) return;
+      // Flatten ONLY for eligibility. Remote serialization must reproduce the
+      // original body tools and ordered additive groups, including all metadata.
+      const withoutDescriptions = (tools: Tool[]) => tools.map((tool) => ({ ...tool, description: "" }));
+      const wire = wireDeclarations(payload);
+      const effective = wire && [...wire.tools, ...wire.additionalTools.flatMap((group) => group.tools)];
+      const accepted =
+        !!effective &&
+        matchesDeclarations(recorded, effective) &&
+        sameTools(withoutDescriptions(recorded), withoutDescriptions(registry));
+      this.observed.set(owner, { ...prepared, accepted, wire: accepted ? wire : undefined });
+    } catch {
+      // A malformed/exotic callback must not escape into hook recovery or leave
+      // earlier accepted evidence authorizing this request.
+      this.observed.set(owner, { ...prepared, accepted: false });
     }
-    // Description rewrites are allowed only at the prepared boundary. Hidden,
-    // missing, duplicate, or rewritten wire declarations cannot prove equality.
-    const withoutDescriptions = (tools: Tool[]) => tools.map((tool) => ({ ...tool, description: "" }));
-    const wire = wireTools(payload);
-    const accepted =
-      !!wire &&
-      matchesDeclarations(recorded, wire) &&
-      sameTools(withoutDescriptions(recorded), withoutDescriptions(registry));
-    this.observed.set(owner, structuredClone({ ...prepared, accepted, wire: wire ?? [] }));
   }
 
   matches(owner: object, sessionId: string, recorded: Tool[], registry: Tool[]): boolean {
@@ -85,10 +204,16 @@ export class ToolStateTracker {
 
   payloadValidator(owner: object, sessionId: string): ((payload: unknown) => boolean) | undefined {
     const observed = this.observed.get(owner);
-    if (!observed || observed.sessionId !== sessionId || !observed.accepted) return undefined;
-    const expected = structuredClone(observed.wire);
+    if (!observed || observed.sessionId !== sessionId || !observed.accepted || !observed.wire) return undefined;
+    const expected = observed.wire;
     // Preserve provider-specific schema normalization and sampling metadata
     // without reimplementing its serializer. Freeze evidence for this request.
-    return (payload) => isDeepStrictEqual(expected, wireTools(payload));
+    return (payload) => {
+      try {
+        return isDeepStrictEqual(expected, wireDeclarations(payload));
+      } catch {
+        return false;
+      }
+    };
   }
 }

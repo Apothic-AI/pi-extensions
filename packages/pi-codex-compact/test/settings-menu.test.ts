@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMenuScreen } from "@narumitw/pi-tui-kit";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import {
   type CodexCompactSettingsRuntime,
   type CodexCompactSettingsState,
@@ -199,6 +200,71 @@ for (const retirement of ["abort", "navigation"] as const) {
     else current = false;
     compactOptions.onError(new Error("https://USER_CANARY:PASS_CANARY@failure.test/?token=TOKEN_CANARY"));
     assert.deepEqual(notifications, []);
+  });
+}
+
+for (const outcome of [
+  "SDK cancellation",
+  "unknown failure",
+  "lookalike",
+  "getter",
+  "hostile descriptor",
+  "interrupted agent abort",
+  "session replacement",
+  "throwing UI",
+] as const) {
+  test(`manual callback keeps cancellation and failure distinct: ${outcome}`, async () => {
+    const memory = memoryRuntime();
+    const caller = new AbortController();
+    let sessionId = "source-session";
+    let compactOptions: { onError?: (error: Error) => void } | undefined;
+    let reads = 0;
+    const { ctx, notifications } = createMockContext({
+      mode: "tui",
+      signal: caller.signal,
+      sessionManager: { getSessionId: () => sessionId },
+      select: async (_title: string, options: string[]) => options.find((option) => option.startsWith("Compact now")),
+      compact: (options: { onError?: (error: Error) => void }) => {
+        compactOptions = options;
+      },
+    });
+    await showCodexCompactMenu(memory.runtime, ctx, { signal: new AbortController().signal, isCurrent: () => true });
+    assert.ok(compactOptions?.onError);
+    if (outcome === "interrupted agent abort") caller.abort(new Error("synthetic-private-reason"));
+    if (outcome === "session replacement") sessionId = "replacement-session";
+    if (outcome === "throwing UI")
+      vi.spyOn((ctx as ExtensionCommandContext).ui, "notify").mockImplementation(() => {
+        throw new Error("synthetic-private-error");
+      });
+    const error =
+      outcome === "SDK cancellation"
+        ? new Error("Compaction cancelled")
+        : outcome === "lookalike"
+          ? new Error("Compaction cancelled: synthetic-private-error")
+          : new Error("synthetic-private-error");
+    if (outcome === "getter")
+      Object.defineProperty(error, "message", {
+        get: () => {
+          reads++;
+          return "Compaction cancelled";
+        },
+      });
+    const delivered =
+      outcome === "hostile descriptor"
+        ? new Proxy(error, {
+            getOwnPropertyDescriptor() {
+              throw new Error("synthetic-private-error");
+            },
+          })
+        : error;
+    assert.doesNotThrow(() => compactOptions?.onError?.(delivered));
+    assert.equal(reads, 0);
+    assert.deepEqual(
+      notifications,
+      ["unknown failure", "lookalike", "getter", "hostile descriptor", "interrupted agent abort"].includes(outcome)
+        ? [{ message: "Compaction failed.", level: "error" }]
+        : [],
+    );
   });
 }
 

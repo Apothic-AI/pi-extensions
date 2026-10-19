@@ -78,6 +78,36 @@ test("validates versioned details and rejects malformed or unbounded persisted d
   assert.doesNotMatch(JSON.stringify(details), /token|authorization|header/i);
 });
 
+test("parsing malformed deep details never throws", () => {
+  const details = checkpoint();
+  const nested: unknown = JSON.parse(`${"[".repeat(20_000)}0${"]".repeat(20_000)}`);
+  assert.equal(
+    parseCheckpointDetails({ ...details, replacementHistory: [{ role: "user", content: nested }, opaque] }),
+    undefined,
+  );
+});
+
+test("checkpoint validation rejects unsupported values without weakening byte or retry provenance checks", () => {
+  const details = checkpoint();
+  const cycle: Record<string, unknown> = {};
+  cycle.self = cycle;
+  const nested: unknown = JSON.parse(`${"[".repeat(20_000)}0${"]".repeat(20_000)}`);
+  for (const value of [
+    { ...details, replacementHistory: [{ value: cycle }, opaque] },
+    { ...details, replacementHistory: [{ value: 1n }, opaque] },
+    { ...details, replacementHistory: [{ text: "x".repeat(8 * 1024 * 1024) }, opaque] },
+    { ...details, uncloneable: () => {} },
+    { ...details, retryTrimmedTail: { role: "assistant", stopReason: "error", content: nested } },
+    Object.defineProperty({ ...details }, "kind", {
+      get() {
+        throw new Error("synthetic-private-value");
+      },
+    }),
+  ])
+    assert.equal(parseCheckpointDetails(value), undefined);
+  assert.deepEqual(parseCheckpointDetails(details), details);
+});
+
 test("projects only an exact summary and kept suffix while preserving unrelated context", () => {
   const before = user("before", 0);
   const kept = user("kept", 2);

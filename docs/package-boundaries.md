@@ -57,6 +57,35 @@ bindings, managed child dispatch, execution policy, budgets and durable journal
 facts stay parent-owned. A helper returning a value is not proof that accepted
 native operations or descendant execution frames are quiescent.
 
+## Choosing capabilities
+
+Separate responsibilities do not mean every extension should be enabled:
+
+- Use one main-session continuation controller per task. Goal owns objective
+  completion; Ralph owns explicit file-backed iterations. Ralph follow-ups are
+  not Goal-owned automatic responses; budgets and stop/completion states remain
+  independent. Neither controller's budget is a cap on the whole combination.
+  Goal with a finite Workflow preserves a clearer
+  objective/orchestration/execution hierarchy.
+- Todo is a manually maintained checklist, not evidence that Workflow tasks
+  executed. Avoid maintaining the same progress independently in Todo, Ralph
+  task files and Workflow state.
+- Usage aggregates persisted tokens/costs; Analytics derives operational
+  metrics; Stamp annotates transcript records; Worktime measures current active
+  spans. Their values are not additive and they do not require each other.
+- Recall saves curated excerpts; Recap provides temporary model-generated
+  orientation; Sessions navigates history and transfers reviewed summaries.
+  Native `/resume`, `/tree` and `/copy` may suffice without any of them.
+- Statusline is a presentation preference, not a prerequisite for extension
+  statuses: Pi's native footer also renders status keys. Keep one footer owner
+  and one effective owner for each editor shortcut or external state reporter.
+- Prefix and Welcome are optional presentation choices; Herdr State is useful
+  only with its corresponding external integration. Provider guidance and
+  priority-tier selection are useful only when their specific behavior is wanted.
+
+Libraries are dependencies, never independently enabled extensions. Experimental
+packages remain deliberate opt-ins, not part of a default catalogue.
+
 ## Background processes
 
 `pi-background` owns its local shell process groups, bounded in-memory logs,
@@ -147,15 +176,10 @@ backends or unknown execution capabilities; they are not an OS sandbox.
 ## Shared third-party surfaces
 
 `@narumitw/pi-tui-kit` is a shared rendering surface, not an ordinary
-dependency. Nine packages draw with it into the same terminal, inside one host
-process, so the version they agree on is part of how the extensions look and
-behave together rather than an implementation detail of each.
-
-That makes divergent ranges a real defect, and a quiet one. Declared at three
-separate floors (`^0.54.0`, `^0.51.0`, `^0.49.1`), the lockfile resolved three
-copies — 0.54.0, 0.51.0 and 0.49.3 — installed side by side. Nothing fails at
-install; it surfaces later as a theme that renders one way in one extension and
-another way in the next.
+dependency. Packages draw with it into the same terminal inside one host
+process, so its agreed version is part of their combined behavior. Divergent
+ranges can install separate copies without an install error and produce
+inconsistent rendering or theme behavior.
 
 The rule is therefore **one declared range per shared dependency**, enforced by
 `bun run check:shared-deps` (included in `bun run check`) over `dependencies`

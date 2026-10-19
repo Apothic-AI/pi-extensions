@@ -84,16 +84,10 @@ Full detail lives in each package's README —
 [`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling. For the tested Pi **1.0.4** host baseline, package
-coverage, and current upstream references, see [the Pi 1.0 compatibility review](docs/pi-1.0-compatibility.md).
-The [0.99.1](docs/pi-0.99-compatibility.md) and [0.87.1](docs/pi-0.87-compatibility.md)
-reviews remain historical baselines. Host-provided peers use `"*"` for module
-ownership, not as a claim that every Pi version is supported. See the
-[background ecosystem review](docs/background-ecosystem-review.md) for process
-ownership and notification boundaries, and the
-[whole-extension hardening review](docs/extension-hardening-review.md) for
-repository-wide remediation, independently adopted community patterns, and
-explicit deployment/qualification limits.
+FleetView, and scheduling. The tested development host is **Pi 1.0.4**.
+Host-provided peers use `"*"` for module ownership, not as a claim that every Pi
+version is supported. See [compatibility and verification](docs/compatibility.md)
+for current host contracts and integration limits.
 
 ---
 
@@ -247,11 +241,10 @@ packages are packed or published only when intentionally selected.
 See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 [`AGENTS.md`](AGENTS.md) for the repository's authoring rules.
 
-## Reference reviews
+## Documentation
 
-- [Task and status navigation](docs/status-navigation.md): shell-job overview/logs, selectable owner detail views, and compact Fleet presentation.
-
-- [October extension refresh](docs/extension-refresh-2026-10.md): current upstream deltas, all-package role choices, additive candidates, experimental risks, and selective remediation.
-- [Community extension survey](docs/community-extension-survey.md): Todo/checklist alternatives, project task ledgers, and additive plugin patterns with primary-source links and compatibility caveats.
-- [Task and human-control acceptance ledger](docs/task-human-controls.md): implementation scope, verified evidence and remaining release gates; not a publication claim.
-- [Workflow and subagent UI synchronization](docs/workflow-ui-upstream-sync.md): selective upstream adoption, interactive ownership and verification boundaries.
+- [Package boundaries](docs/package-boundaries.md): runtime ownership, persistence and shared contracts.
+- [Compatibility and verification](docs/compatibility.md): tested host, dependency ownership and integration limits.
+- [Design decisions](docs/open-decisions.md): isolation, deferred imports, orchestration and resource admission.
+- [Task and status navigation](docs/status-navigation.md): shell-job views, status-owner actions and the UI protocol.
+- [Release guide](docs/releasing.md): independent versioning, publication and recovery.

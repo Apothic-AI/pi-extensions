@@ -102,6 +102,17 @@ function markerMessage(checkpointId: string, timestamp: number): AgentMessage {
 }
 
 export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails | undefined {
+  try {
+    return validateCheckpointDetails(value);
+  } catch {
+    // Persisted JSON can exceed serializer/fingerprint/clone recursion limits;
+    // unsupported runtime values can also throw. Never let malformed details
+    // escape a hook and accidentally permit native compaction of opaque history.
+    return undefined;
+  }
+}
+
+function validateCheckpointDetails(value: unknown): CodexCheckpointDetails | undefined {
   if (!isObject(value)) return undefined;
   if (
     value.kind !== CHECKPOINT_KIND ||

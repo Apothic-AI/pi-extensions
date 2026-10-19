@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 export interface WorktreeInfo {
   /** Absolute path to the worktree directory (the copied repo's root). */
@@ -63,6 +63,10 @@ export interface WorktreeCleanupResult {
   cleanupDiagnostic?: string;
   /** Remediation shell commands if cleanup failed. */
   recoveryCommands?: readonly string[] | string[];
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 /**
@@ -119,12 +123,15 @@ export function cleanupWorktree(
   worktree: WorktreeInfo,
   agentDescription: string,
 ): WorktreeCleanupResult {
-  if (!existsSync(worktree.path)) {
-    return { hasChanges: false, cleanupSucceeded: true };
-  }
-
   let hasChanges = false;
+  let preservedBranch: string | undefined;
   try {
+    if (!existsSync(worktree.path)) {
+      // A vanished directory can still have recoverable detached HEAD/index
+      // state. Only an already-deregistered checkout is a confirmed no-op.
+      removeWorktree(cwd, worktree.path);
+      return { hasChanges: false, cleanupSucceeded: true };
+    }
     // Check for uncommitted changes in the worktree
     const status = execFileSync("git", ["status", "--porcelain"], {
       cwd: worktree.path,
@@ -179,6 +186,7 @@ export function cleanupWorktree(
     }
     // Update branch name in worktree info for the caller
     worktree.branch = branchName;
+    preservedBranch = branchName;
 
     // Remove the worktree (branch persists in main repo)
     removeWorktree(cwd, worktree.path);
@@ -190,17 +198,19 @@ export function cleanupWorktree(
       cleanupSucceeded: true,
     };
   } catch (error) {
-    // Best effort cleanup on error
-    try { removeWorktree(cwd, worktree.path); } catch { /* ignore */ }
+    // Preservation failed or removal was refused. Keep the checkout and Git
+    // registration as recovery references; never remove unpreserved work here.
     return {
       hasChanges,
+      ...(preservedBranch ? { branch: preservedBranch } : {}),
       path: worktree.path,
       cleanupSucceeded: false,
       cleanupDiagnostic: error instanceof Error ? error.message : String(error),
       recoveryCommands: [
-        `git -C ${JSON.stringify(cwd)} worktree remove --force ${JSON.stringify(worktree.path)}`,
-        `git -C ${JSON.stringify(cwd)} worktree prune`,
-        `rm -rf -- ${JSON.stringify(worktree.path)}`,
+        `git -C ${shellQuote(cwd)} worktree list --porcelain`,
+        `git -C ${shellQuote(worktree.path)} status --short`,
+        `git -C ${shellQuote(worktree.path)} log -5 --oneline`,
+        "# Inspect and copy the checkout (including untracked files) to a safe location before repairing Git or retrying cleanup.",
       ],
     };
   }
@@ -217,21 +227,59 @@ export async function cleanupWorktreeAsync(
   return cleanupWorktree(cwd, worktree, agentDescription);
 }
 
+function worktreeRegistration(cwd: string, worktreePath: string): string[] | undefined {
+  // Git reports canonical paths (e.g. /private/var on macOS). Resolve the
+  // parent so verification also works after the directory has disappeared.
+  const canonicalPath = join(realpathSync(dirname(worktreePath)), basename(worktreePath));
+  return execFileSync("git", ["worktree", "list", "--porcelain", "-z"], {
+    cwd,
+    stdio: "pipe",
+    timeout: 5000,
+  }).toString().split("\0\0").map((record) => record.split("\0")).find((fields) =>
+    fields.some((field) => field.startsWith("worktree ") && [canonicalPath, resolve(worktreePath)].includes(field.slice(9))),
+  );
+}
+
 /**
- * Force-remove a worktree.
+ * Protect observed missing-checkout metadata, even while execution is pinned.
+ * Only inspects registration and establishes a Git recovery lock; never stages,
+ * commits, removes, or unlocks anything. Lock failures propagate to the owner.
  */
+export function protectMissingWorktree(cwd: string, worktreePath: string): string | undefined {
+  if (existsSync(worktreePath)) return undefined;
+  const registered = worktreeRegistration(cwd, worktreePath);
+  if (!registered) return undefined;
+  // A Git-owned lock survives manager/session replacement. Preserve existing
+  // locks and never automatically unlock them, including after repair/retry.
+  if (!registered.some((field) => field === "locked" || field.startsWith("locked "))) {
+    try {
+      execFileSync("git", ["worktree", "lock", "--reason", "pi-subagents: missing checkout retained for HEAD/index recovery", worktreePath], {
+        cwd,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+    } catch (error) {
+      throw new Error(`Missing worktree recovery registration could not be locked for ${worktreePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return `Worktree checkout is missing; its Git registration remains locked for HEAD/index recovery: ${worktreePath}`;
+}
+
+/** Remove a preserved/unchanged checkout and positively verify deregistration. */
 function removeWorktree(cwd: string, worktreePath: string): void {
-  try {
+  const recoveryDiagnostic = protectMissingWorktree(cwd, worktreePath);
+  if (recoveryDiagnostic) throw new Error(recoveryDiagnostic);
+  if (worktreeRegistration(cwd, worktreePath) || existsSync(worktreePath)) {
+    // One --force permits a preserved dirty checkout, but does not override a
+    // Git worktree lock. Propagate refusal rather than pretending prune fixed it.
     execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
       cwd,
       stdio: "pipe",
       timeout: 10000,
     });
-  } catch {
-    // If git worktree remove fails, try pruning
-    try {
-      execFileSync("git", ["worktree", "prune"], { cwd, stdio: "pipe", timeout: 5000 });
-    } catch { /* ignore */ }
+  }
+  if (existsSync(worktreePath) || worktreeRegistration(cwd, worktreePath)) {
+    throw new Error(`Worktree removal was not confirmed for ${worktreePath}`);
   }
 }
 
