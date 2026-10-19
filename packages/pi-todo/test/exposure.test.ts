@@ -14,8 +14,9 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import todo from "../src/extension.js";
+import { CONTEXT_TYPE } from "../src/state.js";
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -171,6 +172,46 @@ describe("factory registration and effective public exposure", () => {
         `TODO_EXPOSURE=${JSON.stringify(restrict ? ["read"] : ["read", "write", "todo"])}`,
       );
     }
+  });
+  it.each([{ tools: [] }, { tools: ["read"] }])(
+    "does not inject checklist authority when todo is excluded: $tools",
+    async ({ tools }) => {
+      const f = await fixture({ tools });
+      const branch = structuredClone(f.session.sessionManager.getBranch());
+      const context = await f.session.extensionRunner.emitContext([
+        { role: "custom", customType: CONTEXT_TYPE, content: "stale checklist", display: false, timestamp: 0 },
+        { role: "user", content: "Continue the authorized implementation.", timestamp: 1 },
+      ]);
+      expect(context).toEqual([{ role: "user", content: "Continue the authorized implementation.", timestamp: 1 }]);
+      expect(f.session.getActiveToolNames()).toEqual(tools);
+      expect(f.session.sessionManager.getBranch()).toEqual(branch);
+      expect(f.errors).toEqual([]);
+    },
+  );
+  it("stops injecting checklist context after the active tool policy removes todo", async () => {
+    const f = await fixture();
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("todo", { action: "add", baseRevision: 0, title: "Existing task" }), {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage("Tracked."),
+    ]);
+    await f.session.prompt("Track one task.");
+    expect(JSON.stringify(await f.session.extensionRunner.emitContext([]))).toContain("Existing task");
+    const branch = structuredClone(f.session.sessionManager.getBranch());
+    f.api.setActiveTools(["read"]);
+    expect(await f.session.extensionRunner.emitContext([])).toEqual([]);
+    expect(f.session.getActiveToolNames()).toEqual(["read"]);
+    expect(f.session.sessionManager.getBranch()).toEqual(branch);
+    const probe = vi.fn(() => fauxAssistantMessage("Continuing the authorized work."));
+    f.faux.setResponses([probe]);
+    await f.session.prompt("Continue the implementation without changing the checklist.");
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(probe.mock.calls)).not.toContain("Current session/branch checklist");
+    expect(f.session.getActiveToolNames()).toEqual(["read"]);
+    f.api.setActiveTools(["read", "todo"]);
+    expect(JSON.stringify(await f.session.extensionRunner.emitContext([]))).toContain("Existing task");
+    expect(f.errors).toEqual([]);
   });
   it("resolves defaultTools +todo before session_start", async () => {
     const f = await fixture({ defaultTools: ["+todo"] });

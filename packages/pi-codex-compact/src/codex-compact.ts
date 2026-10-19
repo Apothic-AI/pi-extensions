@@ -25,6 +25,18 @@ import {
   parseCheckpointDetails,
   projectCheckpointContext,
 } from "./checkpoint.js";
+import {
+  type CompactionCancellationCode,
+  type CompactionFailure,
+  type CompactionFailureCode,
+  compactionAbortError,
+  compactionError,
+  compactionFailure,
+  failureFrom,
+  formatCompactionCancellation,
+  formatCompactionFailure,
+} from "./failure.js";
+import { PreparationBranchFence } from "./preparation-branch.js";
 import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 import {
@@ -170,14 +182,14 @@ function sessionStateMatchesRequest(
   messages: AgentMessage[],
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  expectedLeafId: string | null,
+  sourceBranch: PreparationBranchFence,
   toolState: ToolStateTracker,
 ): boolean {
   if (!transcriptMatchesLiveState(messages, pi, ctx, toolState)) return false;
-  if (!piCodingAgentCompat.buildSessionProjection) return true;
   const branch = ctx.sessionManager.getBranch();
-  const currentLeafId = ctx.sessionManager.getLeafId?.() ?? branch.at(-1)?.id ?? null;
-  if (currentLeafId !== expectedLeafId) return false;
+  const currentLeafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
+  if (!sourceBranch.matches(branch, currentLeafId)) return false;
+  if (!piCodingAgentCompat.buildSessionProjection) return true;
   const latest = buildSessionContext(branch, currentLeafId).messages;
   return transcriptMatchesLiveState(latest, pi, ctx, toolState);
 }
@@ -192,23 +204,73 @@ function projectedCurrentMessages(
   const prior = parseCheckpointDetails(compaction?.details);
   if (!prior) {
     if (isOpaqueCompaction(compaction)) {
-      throw new Error("The active opaque checkpoint is malformed");
+      throw compactionError("checkpoint_malformed");
     }
     return { messages: session.messages, transcript: session.messages };
   }
   if (prior.modelId !== model.id) {
-    throw new Error("The active opaque checkpoint belongs to a different Codex model");
+    throw compactionError("checkpoint_incompatible");
   }
   const projected = projectCheckpointContext(session.messages, prior, "full");
   if (!projected) {
-    throw new Error("The previous opaque checkpoint could not be projected safely");
+    throw compactionError("checkpoint_projection_failed");
   }
   return { messages: projected, transcript: session.messages, prior };
 }
 
-function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings): void {
+function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings, failure: CompactionFailure): void {
   if (!ctx.hasUI || !settings.notifyOnFallback) return;
-  ctx.ui.notify("Codex remote compaction failed; using Pi compaction.", "warning");
+  try {
+    ctx.ui.notify(
+      `Codex remote compaction failed; using Pi compaction. ${formatCompactionFailure(failure)}`,
+      "warning",
+    );
+  } catch {
+    // Diagnostic UI is best effort and must not alter the fallback decision.
+  }
+}
+
+function setCompactionStatus(ctx: ExtensionContext, value: string | undefined): void {
+  try {
+    ctx.ui.setStatus(STATUS_KEY, value);
+  } catch {
+    // Progress UI must not override a compaction outcome, especially cancellation.
+  }
+}
+
+function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailure): { cancel: true } {
+  try {
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `Compaction cancelled to preserve the existing opaque checkpoint. ${formatCompactionFailure(failure)}${
+          failure.code === "checkpoint_incompatible"
+            ? " Retry with its original Codex model or recover a pre-compaction branch."
+            : failure.code === "checkpoint_malformed" || failure.code === "checkpoint_projection_failed"
+              ? " Recover a pre-compaction branch if the checkpoint cannot be replayed safely."
+              : ""
+        }`,
+        "warning",
+      );
+    }
+  } catch {
+    // Pi may swallow hook exceptions and continue with native compaction.
+    // Notification is best effort; the cancellation result must always survive.
+  }
+  return { cancel: true };
+}
+
+function cancelPreparation(ctx: ExtensionContext, code: CompactionCancellationCode, opaque: boolean): { cancel: true } {
+  try {
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `${opaque ? "Compaction cancelled to preserve the existing opaque checkpoint." : "Compaction cancelled."} ${formatCompactionCancellation(code)}`,
+        "warning",
+      );
+    }
+  } catch {
+    // Cancellation must remain effective even if its best-effort diagnostic fails.
+  }
+  return { cancel: true };
 }
 
 function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: AbortSignal): boolean {
@@ -223,21 +285,29 @@ async function awaitCompactionAuth(
 ) {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let onAbort = () => {};
+  let timedOut = false;
   try {
-    if (signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
+    if (signal.aborted) throw compactionAbortError();
     const remainingMs = deadline - performance.now();
-    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
+    if (remainingMs <= 0) {
+      timedOut = true;
+      throw compactionError("authentication_timeout");
+    }
     const interrupted = new Promise<never>((_resolve, reject) => {
-      onAbort = () => reject(new DOMException("Compaction aborted", "AbortError"));
+      onAbort = () => reject(compactionAbortError());
       signal.addEventListener("abort", onAbort, { once: true });
-      timeout = setTimeout(() => reject(new Error("OpenAI Codex compaction deadline exceeded")), remainingMs);
+      timeout = setTimeout(() => {
+        timedOut = true;
+        reject(compactionError("authentication_timeout"));
+      }, remainingMs);
     });
     // Race only our wait. Pi owns token refresh and persistence, which must be
     // allowed to finish after cancellation. Promise.race observes late rejection.
     return await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(model), interrupted]);
   } catch {
     // Authentication errors and abort reasons can contain credentials.
-    throw new Error("OpenAI Codex authentication failed");
+    if (signal.aborted) throw compactionAbortError();
+    throw compactionError(timedOut ? "authentication_timeout" : "authentication_failed");
   } finally {
     clearTimeout(timeout);
     signal.removeEventListener("abort", onAbort);
@@ -254,39 +324,81 @@ async function compactRemotely(
   fetch?: typeof globalThis.fetch,
 ) {
   const model = ctx.model;
-  if (!settings.enabled || !isSupportedModel(model)) return undefined;
+  if (!settings.enabled) return undefined;
+  if (event.signal.aborted || ownerSignal.aborted) return { cancel: true };
+  // Protect only the effective boundary, never a historical checkpoint already
+  // superseded by native compaction. Unsupported routes cannot decode opaque
+  // history either: cancel before consent/auth rather than summarize its marker.
+  const compaction = activeCompaction(event.branchEntries);
+  const prior = parseCheckpointDetails(compaction?.details);
+  if (isOpaqueCompaction(compaction) && (!prior || !isCheckpointCompatible(prior, model))) {
+    return cancelOpaqueCompaction(ctx, compactionFailure(prior ? "checkpoint_incompatible" : "checkpoint_malformed"));
+  }
+  if (!isSupportedModel(model)) return undefined;
   const signal = AbortSignal.any([event.signal, ownerSignal]);
   const sessionId = ctx.sessionManager.getSessionId();
-  const sourceBranch = JSON.stringify(event.branchEntries.map((entry) => entry.id));
-  const sourceLeafId = event.branchEntries.at(-1)?.id ?? null;
+  const sourceBranch = new PreparationBranchFence(event.branchEntries);
   const sourceModel = JSON.stringify([model.provider, model.api, model.id, model.baseUrl]);
-  const isCurrent = () =>
-    sessionStillOwned(ctx, sessionId, signal) &&
-    JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) === sourceModel &&
-    JSON.stringify(ctx.sessionManager.getBranch().map((entry) => entry.id)) === sourceBranch &&
-    (ctx.sessionManager.getLeafId?.() ?? ctx.sessionManager.getBranch().at(-1)?.id ?? null) === sourceLeafId;
-  if (!isCurrent()) return { cancel: true };
+  const isOwned = () => sessionStillOwned(ctx, sessionId, signal);
+  const isCurrent = () => {
+    if (
+      !isOwned() ||
+      JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) !== sourceModel
+    ) {
+      return false;
+    }
+    const branch = ctx.sessionManager.getBranch();
+    const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
+    return sourceBranch.matches(branch, leafId);
+  };
+  const cancelInvalidatedPreparation = () => {
+    // Explicit abort and retired session/reload owners must not notify through
+    // stale UI. Same-owner branch/model invalidation is a local cancellation.
+    if (!isOwned()) return { cancel: true as const };
+    const modelChanged =
+      JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) !== sourceModel;
+    return cancelPreparation(
+      ctx,
+      modelChanged ? "preparation_model_changed" : "preparation_branch_changed",
+      isOpaqueCompaction(compaction),
+    );
+  };
+  if (!isCurrent()) return cancelInvalidatedPreparation();
   // Native compaction also bypasses request-local filters. Lack of consent must
   // cancel, not fall through to a native summary of the same canonical history.
-  if (settings.allowCanonicalHistory !== true && !(await authorizeCanonicalHistory(ctx, signal))) {
-    return { cancel: true };
+  if (settings.allowCanonicalHistory !== true) {
+    const canAsk = ctx.mode === "tui" && ctx.hasUI;
+    const authorized = await authorizeCanonicalHistory(ctx, signal);
+    if (!isCurrent()) return cancelInvalidatedPreparation();
+    if (!authorized) {
+      return cancelPreparation(
+        ctx,
+        canAsk ? "canonical_consent_denied" : "canonical_consent_required",
+        isOpaqueCompaction(compaction),
+      );
+    }
   }
-  if (!isCurrent()) return { cancel: true };
+  if (!isCurrent()) return cancelInvalidatedPreparation();
   const deadline = performance.now() + settings.requestTimeoutMs;
-  if (ctx.mode === "tui" && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction…");
+  if (ctx.mode === "tui" && ctx.hasUI) setCompactionStatus(ctx, "Codex remote compaction…");
+  let phase: CompactionFailureCode = "authentication_failed";
   try {
     const auth = await awaitCompactionAuth(ctx, model, signal, deadline);
-    if (!isCurrent()) return { cancel: true };
+    if (!isCurrent()) return cancelInvalidatedPreparation();
     if (!auth.ok || !auth.apiKey) {
-      throw new Error("OpenAI Codex OAuth token is unavailable");
+      throw compactionError("credentials_unavailable");
     }
+    phase = "provider_unavailable";
     const provider = ctx.modelRegistry.getProvider(model.provider);
-    if (!provider) throw new Error("OpenAI Codex provider is unavailable");
+    if (!provider) throw compactionError("provider_unavailable");
     const requestModel = { ...model, baseUrl: auth.baseUrl ?? model.baseUrl };
+    phase = "checkpoint_projection_failed";
     const current = projectedCurrentMessages(event, model);
-    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId, toolState)) {
-      throw new Error("Live prompt or tools differ from the persisted transcript");
+    phase = "loadout_mismatch";
+    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState)) {
+      throw compactionError("loadout_mismatch");
     }
+    phase = "payload_rejected";
     const requestTools = structuredClone(activeTools(pi));
     const context: Context = {
       systemPrompt: ctx.getSystemPrompt(),
@@ -294,7 +406,8 @@ async function compactRemotely(
       tools: requestTools,
     };
     const remainingMs = deadline - performance.now();
-    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
+    if (remainingMs <= 0) throw compactionError("remote_timeout");
+    phase = "remote_provider_error";
     const response = await requestRemoteCompaction({
       provider,
       model: requestModel,
@@ -315,15 +428,17 @@ async function compactRemotely(
       maxRetries: settings.maxRetries,
       fetch,
     });
-    if (!isCurrent()) return { cancel: true };
+    if (!isCurrent()) return cancelInvalidatedPreparation();
+    phase = "state_divergence";
     // appendCompaction will snapshot the session's resolved system/tool state;
     // never persist a checkpoint for a request that became stale while in flight.
     if (
-      !sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId, toolState) ||
+      !sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) ||
       (piCodingAgentCompat.buildSessionProjection && !sameTools(requestTools, activeTools(pi)))
     ) {
-      throw new Error("Live prompt, tools, or session branch changed during remote compaction");
+      throw compactionError("state_divergence");
     }
+    phase = "local_compaction_failed";
     const replacementHistory = buildReplacementHistory(response.promptInput, response.item, {
       tokenBudget: settings.replacementTokenBudget,
     });
@@ -344,28 +459,22 @@ async function compactRemotely(
         details,
       },
     };
-  } catch {
+  } catch (error) {
     if (!isCurrent()) {
-      return { cancel: true };
+      return cancelInvalidatedPreparation();
     }
     // Native preparation sees only this boundary's portability warning, not
     // the opaque history. Falling through would replace it with a lossy native
     // summary. Historical checkpoints superseded by a native boundary do not
     // block fallback; current malformed/incompatible opaque boundaries do.
     if (isOpaqueCompaction(activeCompaction(event.branchEntries))) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          "Codex remote compaction failed; cancelled to preserve the existing opaque checkpoint. Retry with its original Codex model or recover a pre-compaction branch.",
-          "warning",
-        );
-      }
-      return { cancel: true };
+      return cancelOpaqueCompaction(ctx, failureFrom(error, phase));
     }
-    notifyFailure(ctx, settings);
+    notifyFailure(ctx, settings, failureFrom(error, phase));
     return undefined;
   } finally {
     if (!ownerSignal.aborted && ctx.mode === "tui" && ctx.hasUI && ctx.sessionManager.getSessionId() === sessionId) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      setCompactionStatus(ctx, undefined);
     }
   }
 }
@@ -549,7 +658,7 @@ export function createCodexCompactExtension(
       providerWarnings.add(key);
       if (ctx.hasUI) {
         ctx.ui.notify(
-          "The active Codex checkpoint cannot replay on this model; Pi will expose only its fallback marker and retained recent messages.",
+          "The active Codex checkpoint cannot replay on this model; ordinary requests expose only its fallback marker and retained recent messages. Compaction is cancelled while this opaque checkpoint is active to preserve older history.",
           "warning",
         );
       }

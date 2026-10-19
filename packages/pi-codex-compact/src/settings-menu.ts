@@ -205,14 +205,41 @@ export async function showCodexCompactMenu(
     },
   );
   if (!compactRequested || owner.signal.aborted || !owner.isCurrent()) return;
+  const sessionId = ctx.sessionManager.getSessionId();
+  // ctx.signal belongs to the interrupted agent turn, not this compaction:
+  // SDK compact() intentionally aborts that turn before starting its own work.
   ctx.compact({
-    onError: () => {
-      if (!owner.signal.aborted && owner.isCurrent()) {
-        // Native provider errors can echo credentials and destinations.
+    onError: (error) => {
+      try {
+        if (
+          owner.signal.aborted ||
+          !owner.isCurrent() ||
+          ctx.sessionManager.getSessionId() !== sessionId ||
+          isSdkCompactionCancellation(error)
+        )
+          return;
+        // Unknown native/provider failures stay failures, but their text never
+        // leaves this boundary. A cancelled hook already owns its safe warning.
         ctx.ui.notify("Compaction failed.", "error");
+      } catch {
+        // Late/stale ownership checks and unavailable UI are best effort only.
       }
     },
   });
+}
+
+function isSdkCompactionCancellation(error: unknown): boolean {
+  // Pi's SDK uses this exact Error sentinel for hook cancellation and caller
+  // abort. Match only its own data property; never invoke arbitrary getters or
+  // parse provider messages for cancellation-like words.
+  try {
+    return (
+      error instanceof Error && Object.getOwnPropertyDescriptor(error, "message")?.value === "Compaction cancelled"
+    );
+  } catch {
+    // Uninspectable errors are still unknown failures, never cancellation.
+    return false;
+  }
 }
 
 function compactMenuStatus(ctx: ExtensionCommandContext): CompactMenuStatus {

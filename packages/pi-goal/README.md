@@ -38,7 +38,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 
 ## Install
 
-The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-1.0-compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
+The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
 
 ```bash
 pi install npm:@signalridge/pi-goal

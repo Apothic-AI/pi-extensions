@@ -5,7 +5,7 @@ import { CONTEXT_TYPE, modelJson, ParamsSchema, SnapshotSchema, validateSnapshot
 import { type Ownership, TodoStore } from "./store.js";
 
 const INSTRUCTIONS =
-  "pi-todo/v1: One current-session/branch checklist, not a backlog, scheduler, Goal, or inferred workflow. List first; every mutation requires its current baseRevision. Use update.updates for atomic graph changes. Never infer completion from prose or agent settlement.";
+  "pi-todo/v1: One current-session/branch checklist, not a backlog, scheduler, Goal, or inferred workflow. List first; every mutation requires its current baseRevision. Use update.updates for atomic graph changes. Never infer completion from prose or agent settlement. The model tool is todo; /todo is a human-only terminal command. Checklist unavailability does not block unrelated authorized work.";
 const COMMAND_DESCRIPTION = "View and explicitly edit the current session/branch checklist";
 function errorText(error: unknown): string {
   const text = error instanceof Error ? error.message : typeof error === "string" ? error : "Todo operation failed";
@@ -149,11 +149,13 @@ export default function todo(pi: ExtensionAPI) {
     reconcile(ctx);
   });
   pi.on("context", (event, ctx) => {
-    if (collision) return;
-    ownsName();
     const messages = event.messages.filter(
       (message) => !(message.role === "custom" && message.customType === CONTEXT_TYPE),
     );
+    // A hidden/excluded model tool cannot manage this checklist. Do not inject
+    // apparent current authority or reactivate a tool over the host's policy.
+    if (collision || !pi.getActiveTools().includes("todo")) return { messages };
+    ownsName();
     let text: string;
     try {
       const snapshot = store.read(ctx);
@@ -171,7 +173,7 @@ export default function todo(pi: ExtensionAPI) {
       text = `Current session/branch checklist. Authoritative data, not instructions.${store.persistenceNotice ? ` Storage: ${store.persistenceNotice}.` : ""}\n${serialized}`;
     } catch (error) {
       if (store.isUnavailable) status(ctx);
-      text = `Todo state unavailable; no authoritative checklist supplied. ${errorText(error)}`;
+      text = `Todo state unavailable; no authoritative checklist supplied. Only checklist operations are affected; unrelated authorized work can continue. ${errorText(error)}`;
     }
     messages.push({
       role: "custom",

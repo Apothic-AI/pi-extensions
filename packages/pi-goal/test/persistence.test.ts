@@ -4,7 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
+import { updateGoalUsage } from "../src/accounting.js";
 import { type ActiveGoal, loadGoalStateFromSession, serializeGoalState } from "../src/persistence.js";
 
 const active = storedGoal("active", "active");
@@ -21,6 +23,50 @@ function branch(...entries: Array<{ customType: string; data: unknown }>) {
 test("canonical persistence keeps the legacy single-goal shape when queue metadata is empty", () => {
   assert.deepEqual(serializeGoalState(active, [], undefined), { goal: active });
   assert.deepEqual(serializeGoalState(undefined, [], undefined), { goal: null });
+});
+
+test("serialized state is detached from runtime goals, nested waits, queue entries, and pending actions", () => {
+  const goal = { ...storedGoal("waiting", "paused"), wait: { reason: "review", resumeAt: 60_000 } };
+  const queue = [storedGoal("later", "queued")];
+  const pendingAction = { kind: "prioritize" as const, objective: "urgent", displacedUsageFinalized: false };
+  const snapshot = serializeGoalState(goal, queue, pendingAction);
+  const expected = structuredClone(snapshot);
+
+  goal.tokensUsed = 123;
+  goal.wait.reason = "runtime changed";
+  queue[0].text = "runtime queue changed";
+  queue.push(storedGoal("another", "queued"));
+  pendingAction.objective = "runtime priority changed";
+  pendingAction.displacedUsageFinalized = true;
+  assert.deepEqual(snapshot, expected);
+
+  const runtimeState = structuredClone({ goal, queue, pendingAction });
+  assert.ok(snapshot.goal?.wait);
+  snapshot.goal.wait.reason = "snapshot changed";
+  assert.ok(snapshot.queue?.[0]);
+  snapshot.queue[0].text = "snapshot queue changed";
+  assert.deepEqual({ goal, queue, pendingAction }, runtimeState);
+});
+
+test("native session ancestors remain immutable across Goal accounting and safety-counter updates", () => {
+  const manager = SessionManager.inMemory();
+  const goal = storedGoal("running", "active");
+  manager.appendCustomEntry("goal-state", serializeGoalState(goal, [], undefined));
+  const originalPrefix = structuredClone(manager.getBranch());
+
+  updateGoalUsage(goal, { sessionManager: manager });
+  goal.automaticModelTurns += 1;
+  goal.iteration += 1;
+  goal.status = "paused";
+  goal.wait = { reason: "awaiting review", resumeAt: 60_000 };
+  assert.deepEqual(manager.getBranch(), originalPrefix, "runtime updates cannot rewrite an observer's owned prefix");
+
+  manager.appendCustomEntry("goal-state", serializeGoalState(goal, [], undefined));
+  const secondPrefix = structuredClone(manager.getBranch());
+  goal.tokensUsed += 10;
+  goal.wait.reason = "later runtime change";
+  assert.deepEqual(manager.getBranch(), secondPrefix);
+  assert.deepEqual(manager.getBranch().slice(0, originalPrefix.length), originalPrefix);
 });
 
 test("canonical persistence restores queue and pending prioritize safely", () => {

@@ -16,7 +16,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
-import { parseCheckpointDetails } from "../src/checkpoint.js";
+import { createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import type { JsonObject } from "../src/protocol.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
@@ -87,6 +87,8 @@ async function fixture(
   let remoteFailed = false;
   let forceRemoteFailure = false;
   let menuClosed = false;
+  let holdOrdinary: (() => void) | undefined;
+  let ordinaryCancellations = 0;
   const fetch: typeof globalThis.fetch = async (url, init) => {
     const body = init?.body;
     assert.ok(typeof body === "string" || body instanceof Uint8Array);
@@ -99,6 +101,21 @@ async function fixture(
       if (policy === "manual-failure") assert.equal(menuClosed, true, "manual menu closes before remote dispatch");
       remoteFailed = true;
       return new Response('{"error":{"message":"Offline failure"}}', { status: 400 });
+    }
+    if (!compact && holdOrdinary) {
+      const started = holdOrdinary;
+      holdOrdinary = undefined;
+      return new Response(
+        new ReadableStream({
+          start() {
+            started();
+          },
+          cancel() {
+            ordinaryCancellations++;
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
     }
     if (remoteFailed && policy === "manual-failure") {
       assert.equal(menuClosed, true, "native summarization also runs after menu close");
@@ -133,6 +150,10 @@ async function fixture(
       streamSimple: (m, c, o) => actual.streamSimple(m, c, { ...o, transport: "sse", fetch: o?.fetch ?? fetch }),
     };
     runtime.registerNativeProvider(provider);
+    // A different provider using the same offline serializer is intentionally
+    // unsupported by the extension, but remains usable by Pi native compaction.
+    const unsupportedModel = { ...model, provider: "offline-other" };
+    runtime.registerNativeProvider({ ...provider, id: unsupportedModel.provider, getModels: () => [unsupportedModel] });
     const compactSettings = createCodexCompactSettingsRuntime(join(directory, "pi-codex-compact.json"));
     if (policy === "persistent" || policy === "fallback" || policy === "manual-failure")
       await compactSettings.update({ allowCanonicalHistory: true, maxRetries: 0 });
@@ -210,11 +231,20 @@ async function fixture(
       manager,
       requests,
       compactSettings,
+      settingsManager,
+      ui,
+      unsupportedModel,
       failRemote: () => {
         forceRemoteFailure = true;
       },
       notifications: mock.notifications,
       menuClosed: () => menuClosed,
+      holdNextOrdinary: () => {
+        const started = Promise.withResolvers<void>();
+        holdOrdinary = started.resolve;
+        return started.promise;
+      },
+      ordinaryCancellations: () => ordinaryCancellations,
       filterCalls: () => filterCalls,
       confirmations: () => confirmations,
       authResolutions: () => authResolutions,
@@ -339,6 +369,211 @@ for (const notifyOnFallback of [true, false]) {
   });
 }
 
+for (const boundary of ["opaque", "malformed", "missing details", "none", "superseded", "disabled"] as const) {
+  test(`SDK unsupported-provider manual compaction: ${boundary}`, async () => {
+    const f = await fixture("context", false, "persistent");
+    try {
+      await f.session.prompt("Public task");
+      const firstKept = f.manager.getBranch().find((entry) => entry.type === "message")?.id;
+      assert.ok(firstKept);
+      if (boundary !== "none") {
+        const details = createCheckpointDetails({
+          modelId: model.id,
+          checkpointId: "sdk-safety-checkpoint",
+          replacementHistory: [{ type: "compaction", encrypted_content: "older-opaque" }],
+          keptMessages: [],
+        });
+        f.manager.appendCompaction(
+          fallbackSummary(details.checkpointId),
+          firstKept,
+          100,
+          boundary === "malformed"
+            ? { ...details, replacementHistory: [] }
+            : boundary === "missing details"
+              ? undefined
+              : details,
+        );
+        f.manager.appendMessage({ role: "user", content: "Retained recent task", timestamp: 3 });
+        if (boundary === "superseded") {
+          // The historical opaque entry is retained in raw history, not active.
+          f.manager.appendCompaction("Readable native summary", firstKept, 100);
+        }
+      }
+      if (boundary === "disabled") await f.compactSettings.update({ enabled: false });
+      else await f.compactSettings.update({ allowCanonicalHistory: false });
+      assert.equal(await f.session.setModel(f.unsupportedModel), undefined);
+      const before = f.manager.getEntries();
+      const leaf = f.manager.getLeafId();
+      const requests = f.requests.length;
+      const auth = f.authResolutions();
+      if (boundary === "opaque" || boundary === "malformed" || boundary === "missing details") {
+        // Retry through the installed SDK's real manual compaction entry point.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await assert.rejects(f.session.compact(), /cancel/i);
+          assert.equal(f.requests.length, requests, "neither native nor remote provider dispatch");
+          assert.equal(f.authResolutions(), auth, "cancel before credential resolution");
+          assert.deepEqual(f.manager.getEntries(), before, "no append or checkpoint supersession");
+          assert.equal(f.manager.getLeafId(), leaf);
+        }
+      } else {
+        const result = await f.session.compact();
+        assert.equal(parseCheckpointDetails(result.details), undefined);
+        // Pi may summarize both history and a split-turn prefix.
+        assert.equal(
+          f.requests.length,
+          requests + (boundary === "none" ? 1 : 2),
+          "native compaction remains available",
+        );
+        assert.equal(f.manager.getEntries().length, before.length + 1);
+        assert.notEqual(f.manager.getLeafId(), leaf);
+        for (const request of f.requests.slice(requests)) {
+          assert.equal(
+            request.payload.input.some((item: JsonObject) => item.type === "compaction_trigger"),
+            false,
+          );
+        }
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test("SDK rejects malformed deep opaque details before auth, native dispatch, or append", async () => {
+  const f = await fixture("context", false, "persistent");
+  try {
+    await f.session.prompt("Public task");
+    await f.session.bindExtensions({ mode: "tui", uiContext: f.ui });
+    const keptId = f.manager.getBranch().find((entry) => entry.type === "message")?.id;
+    assert.ok(keptId);
+    const details = createCheckpointDetails({
+      modelId: model.id,
+      checkpointId: "sdk-deep-checkpoint",
+      replacementHistory: [{ type: "compaction", encrypted_content: "offline-opaque" }],
+      keptMessages: [],
+    });
+    // This is valid JSON, but JSON.stringify/structuredClone cannot process its
+    // depth. In-memory SDK entries let us exercise the real swallowed-hook seam.
+    const nested: unknown = JSON.parse(`${"[".repeat(20_000)}0${"]".repeat(20_000)}`);
+    f.manager.appendCompaction(fallbackSummary(details.checkpointId), keptId, 100, {
+      ...details,
+      replacementHistory: [{ role: "user", content: nested }, ...details.replacementHistory],
+    });
+    f.manager.appendMessage({ role: "user", content: "Recent offline request. ".repeat(100), timestamp: 3 });
+    const before = f.manager.getEntries();
+    const leaf = f.manager.getLeafId();
+    const auth = f.authResolutions();
+    const requests = f.requests.length;
+    f.notifications.length = 0;
+    await assert.rejects(f.session.compact(), /^Error: Compaction cancelled$/);
+    assert.equal(f.authResolutions(), auth, "malformed opaque gate must precede credentials");
+    assert.equal(f.requests.length, requests, "neither remote nor native summaries may dispatch");
+    assert.deepEqual(f.manager.getEntries(), before, "no checkpoint append or supersession");
+    assert.equal(f.manager.getLeafId(), leaf);
+    assert.equal(f.notifications.length, 1);
+    assert.match(f.notifications[0].message, /\[checkpoint_malformed\]/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const route of ["unsupported", "remote failure"] as const) {
+  test(`SDK throwing cancellation notification cannot enable native compaction: ${route}`, async () => {
+    const f = await fixture("context", false, "persistent");
+    try {
+      await f.session.prompt("Public task");
+      const first = await f.session.compact();
+      assert.ok(parseCheckpointDetails(first.details));
+      await f.session.prompt("Continue after the opaque checkpoint.");
+      if (route === "unsupported") await f.session.setModel(f.unsupportedModel);
+      else f.failRemote();
+      const notify = vi.spyOn(f.ui, "notify").mockImplementation(() => {
+        throw new Error("Offline UI unavailable");
+      });
+      await f.session.bindExtensions({ mode: "tui", uiContext: f.ui });
+      const before = f.manager.getEntries();
+      const requests = f.requests.length;
+      const auth = f.authResolutions();
+      await assert.rejects(f.session.compact(), /cancel/i);
+      assert.equal(notify.mock.calls.length, 1);
+      assert.equal(f.requests.length, requests + (route === "unsupported" ? 0 : 1));
+      if (route === "unsupported") assert.equal(f.authResolutions(), auth);
+      assert.deepEqual(f.manager.getEntries(), before, "notification failure cannot supersede the checkpoint");
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+for (const phase of ["start", "final"] as const) {
+  test(`SDK throwing ${phase} progress status cannot enable native compaction`, async () => {
+    const f = await fixture("context", false, "persistent");
+    try {
+      await f.session.prompt("Public task");
+      const first = await f.session.compact();
+      assert.ok(parseCheckpointDetails(first.details));
+      await f.session.prompt("Continue after the opaque checkpoint.");
+      f.failRemote();
+      const status = vi.spyOn(f.ui, "setStatus").mockImplementation((_key, value) => {
+        if ((phase === "start") === (value !== undefined)) throw new Error("Offline status unavailable");
+      });
+      await f.session.bindExtensions({ mode: "tui", uiContext: f.ui });
+      const before = f.manager.getEntries();
+      const requests = f.requests.length;
+      await assert.rejects(f.session.compact(), /cancel/i);
+      assert.deepEqual(
+        status.mock.calls.map(([key, value]) => [key, value]),
+        [
+          ["codex-compact", "Codex remote compaction…"],
+          ["codex-compact", undefined],
+        ],
+      );
+      assert.equal(f.requests.length, requests + 1, "only the failing remote request, never a native summary");
+      assert.deepEqual(f.manager.getEntries(), before, "progress UI failure cannot supersede the checkpoint");
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test("SDK threshold compaction cancels on an incompatible opaque provider without blocking the ordinary request", async () => {
+  const f = await fixture("context", false, "persistent");
+  try {
+    await f.session.prompt("Public task");
+    const first = await f.session.compact();
+    assert.ok(parseCheckpointDetails(first.details));
+    await f.session.setModel(f.unsupportedModel);
+    await f.session.prompt("Recent task after the checkpoint. ".repeat(100));
+    f.settingsManager.applyOverrides({ compaction: { enabled: true, reserveTokens: 99_999, keepRecentTokens: 6 } });
+    const before = f.manager.getEntries().filter((entry) => entry.type === "compaction");
+    const attempts: string[] = [];
+    const unsubscribe = f.session.subscribe((event) => {
+      if (event.type === "compaction_start") attempts.push(event.reason);
+    });
+    const requests = f.requests.length;
+    try {
+      await f.session.prompt("Continue with an ordinary unsupported-provider request.");
+    } finally {
+      unsubscribe();
+    }
+    assert.ok(attempts.includes("threshold"), "exercise Pi's automatic entrypoint, not a fabricated hook reason");
+    assert.equal(f.requests.length, requests + 1, "only the ordinary request dispatches, no native summary");
+    assert.deepEqual(
+      f.manager.getEntries().filter((entry) => entry.type === "compaction"),
+      before,
+    );
+    assert.match(JSON.stringify(f.requests.at(-1)?.payload), /stores the older history opaquely/);
+    assert.equal(
+      f.requests
+        .at(-1)
+        ?.payload.input.some((item: JsonObject) => item.type === "compaction" || item.type === "compaction_trigger"),
+      false,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
 for (const delivery of ["current", "after-navigation"] as const) {
   test(`SDK manual menu remote/native failure: credential-free ${delivery} delivery`, async () => {
     const f = await fixture("context", false, "manual-failure");
@@ -385,13 +620,139 @@ for (const delivery of ["current", "after-navigation"] as const) {
         /USER_CANARY|PASS_CANARY|TOKEN_CANARY|HEADER_CANARY|failure\.test|Authorization|Bearer/,
       );
       assert.deepEqual(f.notifications, [
-        { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+        {
+          message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
+          level: "warning",
+        },
         ...(delivery === "current" ? [{ message: "Compaction failed.", level: "error" }] : []),
       ]);
     } finally {
       f.cleanup();
     }
   });
+}
+
+test("SDK Compact now during streaming reports a genuine native failure after aborting the old agent turn", async () => {
+  const f = await fixture("context", false, "manual-failure");
+  try {
+    await f.session.prompt("Public task");
+    const started = f.holdNextOrdinary();
+    const ordinary = f.session.prompt("Keep this ordinary offline request open.");
+    await started;
+    const oldAgentSignal = f.session.agent.signal;
+    assert.ok(oldAgentSignal);
+    assert.equal(f.session.isStreaming, true);
+    assert.equal(oldAgentSignal.aborted, false);
+    const requests = f.requests.length;
+    f.notifications.length = 0;
+    const compact = f.session.compact.bind(f.session);
+    const dispatched = vi.spyOn(f.session, "compact").mockImplementation(async (instructions) => {
+      // Observe, but do not replace, SDK abort -> hook -> native summarizer.
+      try {
+        return await compact(instructions);
+      } catch (error) {
+        assert.equal(oldAgentSignal.aborted, true, "native compact intentionally aborts the active agent turn");
+        assert.ok(error instanceof Error && error.message.includes(NATIVE_ERROR));
+        throw error;
+      }
+    });
+    await f.session.prompt("/codex-compact");
+    assert.equal(f.menuClosed(), true);
+    assert.equal(dispatched.mock.calls.length, 1);
+    await assert.rejects(dispatched.mock.results[0].value, /USER_CANARY/);
+    await ordinary;
+    assert.equal(f.ordinaryCancellations(), 1, "the real provider cancels the interrupted ordinary response body");
+    assert.equal(f.requests.length, requests + 2, "both real remote and native summarizers run after abort");
+    assert.equal(
+      f.manager.getEntries().some((entry) => entry.type === "compaction"),
+      false,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(f.notifications),
+      /USER_CANARY|PASS_CANARY|TOKEN_CANARY|HEADER_CANARY|failure\.test|Authorization|Bearer/,
+    );
+    assert.deepEqual(f.notifications, [
+      {
+        message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
+        level: "warning",
+      },
+      { message: "Compaction failed.", level: "error" },
+    ]);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const decision of ["denial", "abort", "replacement"] as const) {
+  for (const throwsUI of [false, true]) {
+    test(`SDK Compact now menu preserves ${decision} cancellation (throwing UI ${throwsUI})`, async () => {
+      const answer = Promise.withResolvers<boolean>();
+      const shown = Promise.withResolvers<void>();
+      const f = await fixture(
+        "context",
+        false,
+        decision === "abort" ? "once" : "decline",
+        decision === "abort"
+          ? () => {
+              shown.resolve();
+              return answer.promise;
+            }
+          : undefined,
+      );
+      try {
+        await f.session.prompt("Public task");
+        const before = f.manager.getEntries();
+        const requests = f.requests.length;
+        const auth = f.authResolutions();
+        f.notifications.length = 0;
+        const notify = vi.spyOn(f.ui, "notify");
+        if (throwsUI)
+          notify.mockImplementation(() => {
+            throw new Error(NATIVE_ERROR);
+          });
+        await f.session.bindExtensions({ mode: "tui", uiContext: f.ui });
+        const compact = f.session.compact.bind(f.session);
+        const dispatched = vi.spyOn(f.session, "compact").mockImplementation(async (instructions) => {
+          try {
+            return await compact(instructions);
+          } catch (error) {
+            if (decision === "replacement") {
+              await f.session.reload();
+              notify.mockClear();
+              f.notifications.length = 0;
+            }
+            throw error;
+          }
+        });
+        await f.session.prompt("/codex-compact");
+        assert.equal(f.menuClosed(), true);
+        assert.equal(dispatched.mock.calls.length, 1);
+        const cancelled = assert.rejects(dispatched.mock.results[0].value, /^Error: Compaction cancelled$/);
+        if (decision === "abort") {
+          await shown.promise;
+          f.session.abortCompaction();
+          answer.resolve(true);
+        }
+        await cancelled;
+        assert.equal(f.authResolutions(), auth);
+        assert.equal(f.requests.length, requests, "menu cancellation dispatches no remote/native summary");
+        assert.deepEqual(f.manager.getEntries(), before);
+        assert.deepEqual(
+          notify.mock.calls.map(([message, level]) => ({ message, level })),
+          decision === "denial"
+            ? [
+                {
+                  message: "Compaction cancelled. [canonical_consent_denied] Canonical history was not authorized.",
+                  level: "warning",
+                },
+              ]
+            : [],
+        );
+      } finally {
+        f.cleanup();
+      }
+    });
+  }
 }
 
 for (const change of ["abort", "branch", "reload"] as const) {

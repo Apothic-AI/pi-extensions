@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
-import { type SessionBeforeCompactEvent, SessionManager } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, type SessionBeforeCompactEvent, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { CANONICAL_HISTORY_NOTICE } from "../src/authorization.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
@@ -156,7 +156,20 @@ for (const mode of ["tui", "rpc", "print"] as const) {
         f.session.getBranch().some((entry) => entry.type === "compaction"),
         false,
       );
-      assert.deepEqual(f.notifications, []);
+      assert.deepEqual(
+        f.notifications,
+        mode === "print"
+          ? []
+          : [
+              {
+                message:
+                  mode === "tui"
+                    ? "Compaction cancelled. [canonical_consent_denied] Canonical history was not authorized."
+                    : "Compaction cancelled. [canonical_consent_required] Canonical-history authorization is required.",
+                level: "warning",
+              },
+            ],
+      );
       assert.equal(f.dialogs.length, mode === "tui" ? 1 : 0);
       assert.doesNotMatch(
         JSON.stringify(f.dialogs),
@@ -213,6 +226,24 @@ for (const change of ["abort", "branch", "tree", "reload", "shutdown", "uncertai
       assert.equal(f.authCalls(), 0);
       assert.equal(f.requests.length, 0);
       assert.equal(f.runtime.get().settings.allowCanonicalHistory, false);
+      if (change === "branch") {
+        assert.deepEqual(f.notifications, [
+          {
+            message:
+              "Compaction cancelled. [preparation_branch_changed] The active branch changed after compaction preparation.",
+            level: "warning",
+          },
+        ]);
+      } else if (change === "uncertain" || change === "throw") {
+        assert.deepEqual(f.notifications, [
+          {
+            message: "Compaction cancelled. [canonical_consent_denied] Canonical history was not authorized.",
+            level: "warning",
+          },
+        ]);
+      } else {
+        assert.deepEqual(f.notifications, [], "aborted/retired owners cannot deliver a stale notification");
+      }
       assert.doesNotMatch(JSON.stringify(f.notifications), /HEADER_SECRET|SECRET_ABORT_REASON/);
     } finally {
       await f.cleanup();
@@ -255,7 +286,10 @@ test("transport failure permits native fallback only after canonical consent", a
     assert.equal(await f.compact(), undefined);
     assert.equal(f.requests.length, 1);
     assert.deepEqual(f.notifications, [
-      { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+      {
+        message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
+        level: "warning",
+      },
     ]);
     assert.doesNotMatch(JSON.stringify(f.notifications), /HEADER_SECRET|ENV_SECRET|authorized-destination/);
   } finally {
@@ -292,7 +326,13 @@ for (const stage of ["authentication", "before transport"] as const) {
       }
       assert.deepEqual(await pending, { cancel: true });
       assert.equal(f.requests.length, 0);
-      assert.deepEqual(f.notifications, []);
+      assert.deepEqual(f.notifications, [
+        {
+          message:
+            "Compaction cancelled. [preparation_branch_changed] The active branch changed after compaction preparation.",
+          level: "warning",
+        },
+      ]);
       assert.equal(
         f.session.getBranch().some((entry) => entry.type === "compaction"),
         false,
@@ -329,6 +369,96 @@ test("authorized destination userinfo and query secrets never enter notification
   }
 });
 
+for (const throwsUI of [false, true]) {
+  test(`same-owner model invalidation during authentication is a safe cancellation (throwing UI ${throwsUI})`, async () => {
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const f = await fixture({
+      allowed: true,
+      beforeAuth: () => {
+        started.resolve();
+        return release.promise;
+      },
+    });
+    try {
+      const notify = vi.spyOn((f.ctx as ExtensionContext).ui, "notify");
+      if (throwsUI)
+        notify.mockImplementation(() => {
+          throw new Error("HEADER_SECRET");
+        });
+      const pending = f.compact();
+      await started.promise;
+      (f.ctx as ExtensionContext).model = {
+        ...model,
+        id: "MODEL_ID_SECRET",
+        baseUrl: "https://USER_SECRET:PASS_SECRET@example.test/?key=KEY_SECRET",
+      };
+      release.resolve();
+      assert.deepEqual(await pending, { cancel: true });
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.authCalls(), 1);
+      assert.equal(notify.mock.calls.length, 1);
+      assert.equal(
+        notify.mock.calls[0][0],
+        "Compaction cancelled. [preparation_model_changed] The active model changed after compaction preparation.",
+      );
+      assert.doesNotMatch(
+        JSON.stringify(notify.mock.calls),
+        /MODEL_ID_SECRET|USER_SECRET|PASS_SECRET|KEY_SECRET|HEADER_SECRET/,
+      );
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+for (const change of ["abort", "session", "reload", "shutdown"] as const) {
+  test(`authentication continuation cannot notify a cancelled or retired owner: ${change}`, async () => {
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const f = await fixture({
+      allowed: true,
+      beforeAuth: () => {
+        started.resolve();
+        return release.promise;
+      },
+    });
+    try {
+      const pending = f.compact();
+      await started.promise;
+      if (change === "abort") f.controller.abort(new Error("SECRET_ABORT_REASON"));
+      if (change === "session") vi.spyOn(f.session, "getSessionId").mockReturnValue("SECRET_OTHER_SESSION");
+      if (change === "reload") await f.mock.events.get("session_start")?.[0]({ reason: "reload" }, f.ctx);
+      if (change === "shutdown") await f.mock.events.get("session_shutdown")?.[0]({ reason: "exit" }, f.ctx);
+      release.resolve();
+      assert.deepEqual(await pending, { cancel: true });
+      assert.equal(f.requests.length, 0);
+      assert.deepEqual(f.notifications, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+test("throwing consent cancellation diagnostics cannot enable compaction", async () => {
+  const f = await fixture({ confirm: async () => false });
+  try {
+    const notify = vi.spyOn((f.ctx as ExtensionContext).ui, "notify").mockImplementation(() => {
+      throw new Error("HEADER_SECRET");
+    });
+    assert.deepEqual(await f.compact(), { cancel: true });
+    assert.equal(f.authCalls(), 0);
+    assert.equal(f.requests.length, 0);
+    assert.equal(notify.mock.calls.length, 1);
+    assert.equal(
+      notify.mock.calls[0][0],
+      "Compaction cancelled. [canonical_consent_denied] Canonical history was not authorized.",
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("confirmation timeout cancels and dismisses its owned dialog; late acceptance cannot dispatch", async () => {
   const answer = Promise.withResolvers<unknown>();
   const shown = Promise.withResolvers<void>();
@@ -349,6 +479,12 @@ test("confirmation timeout cancels and dismisses its owned dialog; late acceptan
     await vi.advanceTimersByTimeAsync(0);
     assert.equal(f.authCalls(), 0);
     assert.equal(f.requests.length, 0);
+    assert.deepEqual(f.notifications, [
+      {
+        message: "Compaction cancelled. [canonical_consent_denied] Canonical history was not authorized.",
+        level: "warning",
+      },
+    ]);
     assert.equal(vi.getTimerCount(), 0);
   } finally {
     vi.useRealTimers();

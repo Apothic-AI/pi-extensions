@@ -6,6 +6,7 @@ import {
   CodexCompactionProtocolError,
   collectCompactionSse,
   hasCheckpointMarker,
+  MAX_SSE_BYTES,
   prepareRemoteCompactionPayload,
   rewriteCheckpointMarker,
 } from "../src/protocol.js";
@@ -68,6 +69,14 @@ test("terminal response validates item count even when the source stays open", a
   await assert.rejects(collectCompactionSse(stream), /returned 0 distinct/);
   assert.equal(cancellations, 1);
 }, 1000);
+
+test("bounded million-item completed output does not depend on JavaScript argument limits", async () => {
+  const item = { type: "compaction", encrypted_content: "opaque" };
+  const text = `data: {"type":"response.completed","response":{"output":[${"{},".repeat(1_000_000)}${JSON.stringify(item)}]}}\n\n`;
+  assert.ok(Buffer.byteLength(text) < MAX_SSE_BYTES);
+  const result = await collectCompactionSse(fragmentedStream(text, text.length));
+  assert.deepEqual(result.item, item);
+});
 
 test("joins multiline data fields and ignores unrelated events", async () => {
   const outputItem = JSON.stringify({

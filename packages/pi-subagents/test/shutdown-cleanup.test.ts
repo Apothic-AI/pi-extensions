@@ -395,7 +395,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
       const failures = await manager.dispose();
       expect(cleanupOrder).toEqual([childPath, siblingPath, childPath]);
-      expect(vi.mocked(pruneWorktrees)).toHaveBeenCalled();
+      // Global orphan pruning is deferred across all targets while any
+      // unresolved worktree reference remains, including a pinned ancestor.
+      expect(vi.mocked(pruneWorktrees)).not.toHaveBeenCalled();
       expect(failures).toHaveLength(2);
       expect(failures[0]).toMatchObject({
         path: childPath,
@@ -408,6 +410,10 @@ describe("AgentManager synchronous shutdown cleanup", () => {
         repoRoot: baseRepo,
         reason: expect.stringContaining("pinned"),
       });
+      expect(failures[1]!.recoveryCommands.join("\n")).toContain("worktree list --porcelain");
+      expect(failures[1]!.recoveryCommands.join("\n")).toContain("status --short");
+      expect(failures[1]!.recoveryCommands.join("\n")).toContain("copy the checkout");
+      expect(failures[1]!.recoveryCommands.join("\n")).not.toMatch(/rm -rf|worktree remove|worktree prune/);
       expect(Object.isFrozen(failures)).toBe(true);
       expect(Object.isFrozen(failures[0])).toBe(true);
       expect(Object.isFrozen(failures[0]!.recoveryCommands)).toBe(true);
