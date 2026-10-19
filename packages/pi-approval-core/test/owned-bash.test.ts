@@ -28,7 +28,17 @@ function ops(shellPath?: string) {
     shellPath,
   });
 }
+function validPid(pid: number) {
+  return Number.isSafeInteger(pid) && pid > 1 && pid <= 2_147_483_647;
+}
+async function fixturePid(cwd: string, name: string) {
+  const text = (await readFile(join(cwd, name), "utf8")).trim();
+  const pid = Number(text);
+  if (!/^[1-9]\d*$/.test(text) || !validPid(pid)) throw new Error(`${name}: fixture PID is not ready`);
+  return pid;
+}
 function alive(pid: number) {
+  if (!validPid(pid)) throw new Error("Refusing to probe an invalid fixture PID");
   try {
     process.kill(pid, 0);
     return true;
@@ -38,10 +48,36 @@ function alive(pid: number) {
 }
 async function gone(cwd: string) {
   for (const name of ["shell.pid", "descendant.pid"]) {
-    const pid = Number(await readFile(join(cwd, name), "utf8"));
+    const pid = await fixturePid(cwd, name);
     await vi.waitFor(() => expect(alive(pid), `${name} ${pid} leaked`).toBe(false), { timeout: 2000 });
   }
 }
+// Publish complete PID files before making the process tree observable to the host.
+const trackedProcesses =
+  "printf '%s' $$ > shell.pid.tmp; mv shell.pid.tmp shell.pid; sleep 30 & printf '%s' $! > descendant.pid.tmp; mv descendant.pid.tmp descendant.pid; ";
+it.each(["", " \n", "0", "1", "-1", "12partial", "1e3", "2147483648"])(
+  "B: an incomplete or invalid PID file is not process readiness: %j",
+  async (text) => {
+    const cwd = await directory();
+    await writeFile(join(cwd, "descendant.pid"), text);
+    expect(existsSync(join(cwd, "descendant.pid"))).toBe(true);
+    await expect(fixturePid(cwd, "descendant.pid")).rejects.toThrow("fixture PID is not ready");
+  },
+);
+it("B: a complete fixture PID is readable, but invalid PIDs never probe the host group", async () => {
+  const cwd = await directory();
+  await writeFile(join(cwd, "shell.pid"), `${process.pid}\n`);
+  expect(await fixturePid(cwd, "shell.pid")).toBe(process.pid);
+  const kill = vi.spyOn(process, "kill");
+  try {
+    for (const pid of [0, 1, -1, Number.NaN, 2_147_483_648]) {
+      expect(() => alive(pid)).toThrow("invalid fixture PID");
+    }
+    expect(kill).not.toHaveBeenCalled();
+  } finally {
+    kill.mockRestore();
+  }
+});
 it("B: abort before dispatch creates no marker and installs no abort listener", async () => {
   const cwd = await directory();
   const abort = new AbortController();
@@ -58,22 +94,22 @@ it.each(["abort", "timeout", "output-error"])(
     const cwd = await directory();
     const abort = new AbortController();
     const before = ["SIGTERM", "SIGHUP", "SIGINT", "exit"].map((name) => process.listenerCount(name));
-    const running = ops().exec(
-      "printf '%s' $$ > shell.pid; sleep 30 & printf '%s' $! > descendant.pid; printf ready; wait",
-      cwd,
-      {
-        signal: abort.signal,
-        timeout: mode === "timeout" ? 0.1 : undefined,
-        onData: () => {
-          if (mode === "output-error") throw new Error("owned callback failure");
-        },
+    const running = ops().exec(`${trackedProcesses}printf ready; wait`, cwd, {
+      signal: abort.signal,
+      timeout: mode === "timeout" ? 0.5 : undefined,
+      onData: () => {
+        if (mode === "output-error") throw new Error("owned callback failure");
       },
-    );
+    });
     const result = running.then(
       () => "completed",
       (error: unknown) => String(error),
     );
-    await vi.waitFor(() => expect(existsSync(join(cwd, "descendant.pid"))).toBe(true));
+    // File creation can precede its write; never abort based on existence alone.
+    await vi.waitFor(async () => {
+      await fixturePid(cwd, "shell.pid");
+      await fixturePid(cwd, "descendant.pid");
+    });
     if (mode === "abort") abort.abort();
     expect(await result).toContain(
       mode === "abort" ? "aborted" : mode === "timeout" ? "timeout:" : "owned callback failure",
@@ -86,13 +122,7 @@ it.each(["abort", "timeout", "output-error"])(
 it("B: normal exit reclaims descendants holding inherited output pipes", async () => {
   const cwd = await directory();
   const start = performance.now();
-  expect(
-    await ops().exec(
-      "printf '%s' $$ > shell.pid; sleep 30 & printf '%s' $! > descendant.pid; printf output; exit 7",
-      cwd,
-      { onData() {} },
-    ),
-  ).toEqual({ exitCode: 7 });
+  expect(await ops().exec(`${trackedProcesses}printf output; exit 7`, cwd, { onData() {} })).toEqual({ exitCode: 7 });
   expect(performance.now() - start).toBeLessThan(1500);
   await gone(cwd);
 });
@@ -140,7 +170,7 @@ it("B: escaped inherited pipes are bounded without signalling a released PID", a
         onData() {},
       }),
     ).toEqual({ exitCode: 0 });
-    escaped = Number(await readFile(join(cwd, "escaped.pid"), "utf8"));
+    escaped = await fixturePid(cwd, "escaped.pid");
     expect(alive(escaped)).toBe(true); // deliberately outside the owned group
     expect(performance.now() - start).toBeLessThan(1500);
     expect(getEventListeners(abort.signal, "abort")).toHaveLength(0);
@@ -150,9 +180,9 @@ it("B: escaped inherited pipes are bounded without signalling a released PID", a
     kill.mockRestore();
   } finally {
     // The fixture owns this deliberately escaped 30-second child, not the backend.
-    const pid = escaped ?? Number(await readFile(join(cwd, "escaped.pid"), "utf8").catch(() => "0"));
-    if (pid > 0 && alive(pid)) process.kill(-pid, "SIGKILL");
-    if (pid > 0) await vi.waitFor(() => expect(alive(pid)).toBe(false));
+    const pid = escaped ?? (await fixturePid(cwd, "escaped.pid").catch(() => undefined));
+    if (pid !== undefined && alive(pid)) process.kill(-pid, "SIGKILL");
+    if (pid !== undefined) await vi.waitFor(() => expect(alive(pid)).toBe(false));
   }
 });
 it("B: supervisor transports stdin commands with configured arguments", async () => {
