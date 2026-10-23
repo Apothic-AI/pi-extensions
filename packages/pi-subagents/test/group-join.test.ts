@@ -137,6 +137,22 @@ describe("GroupJoinManager", () => {
     expect(deliver).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the original member while subsequent attempts pass through independently", () => {
+    const deliver = vi.fn();
+    const mgr = new GroupJoinManager(deliver);
+    mgr.registerGroup("g", ["a", "b"]);
+    const first = makeRecord("a", { result: "FIRST" });
+    const second = makeRecord("a", { result: "SECOND", resultConsumed: true });
+    expect(mgr.onAgentComplete(first)).toBe("held");
+    expect(mgr.onAgentComplete(second)).toBe("pass");
+    expect(deliver).not.toHaveBeenCalled();
+    expect(mgr.isGrouped("a")).toBe(true);
+    expect(mgr.onAgentComplete(makeRecord("b"))).toBe("delivered");
+    expect(deliver.mock.calls[0][0]).toEqual([first, expect.objectContaining({ id: "b" })]);
+    expect(deliver.mock.calls[0][0]).not.toContain(second);
+    expect(mgr.isGrouped("a")).toBe(false);
+  });
+
   it("dispose() clears pending timers so a partial delivery never fires post-dispose", () => {
     const deliver = vi.fn();
     const mgr = new GroupJoinManager(deliver, 30_000);

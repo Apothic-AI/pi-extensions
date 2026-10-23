@@ -8,6 +8,8 @@ It only reads PR metadata for the current branch. It counts comments and reviews
 
 It is intentionally ambient: no slash command, no custom tool, no widget, and no comment injection.
 
+Hyperlink capability handling is selectively ported from [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions/commit/36a5ad5149d890b03803c9fa971b875656dcf4e4): PR numbers use OSC 8 links only when Pi reports hyperlink support and the URL passes validation; otherwise they remain plain text. Local monitoring, cancellation and expiry safeguards are retained.
+
 ## Features
 
 - Automatically shows compact PR status in Pi's statusline.

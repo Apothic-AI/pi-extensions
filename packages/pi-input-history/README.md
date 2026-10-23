@@ -58,6 +58,10 @@ History stores the original leading/trailing whitespace and multiline text. All 
 - **Deduplication** — no duplicate entries across sessions.
 - **Current session awareness** — merges live branch history with cached cross-session history.
 
+## Selective upstream compatibility
+
+The native fallback editor's embedded working-status layout is selectively ported from [ouzhenkun/pi-input-history](https://github.com/ouzhenkun/pi-input-history/commit/5824bd6ff04de6545e02acd8537fd869aa9f16a6). An inherited editor factory is left unchanged, including when composed with an input-prefix editor. Draft-preserving startup and history safeguards remain local; configurable shortcuts and highlight replacement are not included in this port.
+
 ## Acknowledgments
 
 The Ctrl+R reverse search component is inspired by [pi-readline-search](https://github.com/mrshu/pi-readline-search) by [@mrshu](https://github.com/mrshu).

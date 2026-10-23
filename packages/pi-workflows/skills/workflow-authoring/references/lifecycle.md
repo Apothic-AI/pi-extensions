@@ -8,7 +8,7 @@ Bound the work where the work is decided: graph tasks, fan-out items, loop round
 
 That pool is typically small — 4 slots unless the host was configured otherwise — so assume a wide fan-out runs in waves, not all at once. This does not change how wide to make it: the agents all run either way, and the reason to split work is coverage rather than wall-clock. It does mean a script should not promise the user a fast answer because it fanned out, and should not add a checkpoint or a progress phase that only makes sense if everything starts together.
 
-Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does not carry budgets. `N` is a token allowance, not a call or round count: size it for the intended agent work instead of copying a small iteration limit. Token and phase budgets are soft pre-call gates. Spend lands after agents finish, so concurrent work can overshoot. A phase budget gates later calls in that phase; it neither reserves tokens nor cancels active calls. `budget.spent()` and `budget.remaining()` include nested work.
+Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does not carry budgets. `N` is a token allowance, not a call or round count: size it for the intended agent work instead of copying a small iteration limit. Token and phase budgets are soft pre-dispatch gates, rechecked after acquiring runtime capacity and before every provider-agent attempt (including empty-output retries and schema repairs). Queued calls keep their captured phase allowance, not an earlier budget approval or a later phase rebase. Spend lands after agents finish, so concurrent work can overshoot; these gates are not hard token or cost caps. Phase allowances remain frame-local; a phase budget neither reserves tokens nor cancels active calls. `budget.spent()` and `budget.remaining()` include shared nested run spend.
 
 ## Checkpoints
 
@@ -29,6 +29,8 @@ Always retain `{ id, status, result }` or an equivalent ledger for each intended
 Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live. Stable lexical call ordering, prompts, labels, routing options, and inputs therefore matter. Retry chains can cascade after an upstream miss. A nested workflow is cached as one parent call; an unchanged child replays its complete result, while a changed or interrupted child runs live in a generation-scoped namespace.
 
 Only a call that finishes with a real result is journaled. A call whose every attempt was recoverable (including one that only ever produced `AGENT_EMPTY_OUTPUT`) contributes no journal entry, so resuming that run reruns exactly that call and everything lexically after it live; the earlier, already-succeeded prefix still replays from cache. Schema repair retries include the concrete validation errors in the next prompt.
+
+Terminal status, final results, waiters and background notifications wait for the exact accepted terminal transition's journal append receipt, as well as existing owned-cleanup fences. This is an append guarantee, not an fsync guarantee. Transient append rejection retains the immutable transition for bounded retries. Exhaustion never reports success: a receipted persistence failure may settle the run; otherwise terminal publication remains pending. Stop or branch replacement invalidates a queued success.
 
 The runtime blocks common accidental nondeterminism, but this is not a security boundary. Pass timestamps, randomness, and external decisions through `args`.
 

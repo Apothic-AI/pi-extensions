@@ -1,6 +1,7 @@
 import { type FSWatcher, readFileSync, watch } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExecResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getCapabilities } from "@earendil-works/pi-tui";
 import { executableAvailable } from "./executable.js";
 
 export type ReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "UNKNOWN";
@@ -673,7 +674,7 @@ function clearExpiryTimer(branchWatch: BranchWatchState) {
 
 export function formatLinkedStatus(status: PullRequestStatus): string {
   const text = formatCompactStatus(status);
-  if (!status.url) return text;
+  if (!status.url || !getCapabilities().hyperlinks) return text;
   const label = `#${status.number}`;
   return text.replace(label, osc8Link(status.url, label));
 }

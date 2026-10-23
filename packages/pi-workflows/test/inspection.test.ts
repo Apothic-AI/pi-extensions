@@ -659,13 +659,15 @@ describe("workflow inspection", () => {
     const { engine, entries, sessionEntries, setRejectAppend } = harness();
     let blocked = true;
     setRejectAppend((event) => blocked && event.kind === "workflow_transition" && event.status === "completed");
-    const started = await engine.start(`${META} return "done";`);
-    const removing = engine.control("rm", started.runId);
-    await Promise.resolve();
-    expect(engine.getRun(started.runId)).toBeDefined();
+    const started = await engine.start(`${META} return "done";`, { background: true });
+    await expect.poll(() => engine.getState(started.runId)?.pendingTerminal).toBeDefined();
+    expect(engine.getRun(started.runId)?.status).toBe("running");
+    await expect(engine.control("rm", started.runId)).rejects.toThrow(/running/);
     expect(entries.some((entry) => entry.kind === "run_removed")).toBe(false);
     blocked = false;
-    await removing;
+    await engine.waitFor(started.runId);
+    await engine.getState(started.runId)?.execution;
+    await engine.control("rm", started.runId);
     expect(entries.at(-1)?.kind).toBe("run_removed");
     const completion = entries.findIndex(
       (entry) => entry.kind === "workflow_transition" && entry.status === "completed",

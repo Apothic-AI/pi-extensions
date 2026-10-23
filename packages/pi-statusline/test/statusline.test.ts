@@ -436,7 +436,10 @@ test("statusline renders PR context inline only when a branch is available", asy
 
     branch = "feature";
     statuses.set("github-pr", "PR #123: checks failing (2), approved, 5 comments");
-    assert.match(footer.render(300).slice(1).join(" "), /PR/);
+    const plainLines = footer.render(300);
+    assert.ok(plainLines[0]?.includes("feature (#123 · 2 failing)"));
+    assert.equal(plainLines.length, 1);
+    assert.equal((plainLines.join(" ").match(/#123/gu) ?? []).length, 1);
   } finally {
     footer.dispose();
   }

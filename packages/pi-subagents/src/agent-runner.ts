@@ -35,6 +35,7 @@ import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from 
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
+  INTERNAL_RESOLVED_ISOLATED,
   type InternalAgentConfigOverride,
   type ParentPolicySnapshot,
 } from "./internal-run.js";
@@ -689,6 +690,8 @@ export interface RunOptions {
   readonly [INTERNAL_AGENT_CONFIG_OVERRIDE]?: InternalAgentConfigOverride;
   /** Parent model/thinking captured when a managed spawn was allocated. */
   readonly [INTERNAL_PARENT_POLICY_SNAPSHOT]?: ParentPolicySnapshot;
+  /** Manager-issued resolved isolation; public spawn options cannot issue it. */
+  readonly [INTERNAL_RESOLVED_ISOLATED]?: boolean;
   /**
    * Reopen an existing conversation from this session file instead of starting
    * a new one. Package-internal: the only issuer is the `@handle` mention
@@ -1065,7 +1068,9 @@ export async function runAgent(
   // Resolve extensions/skills: isolated or the package-internal generation
   // override forces both off. The latter also prevents a custom general-purpose
   // definition from widening this one trusted no-tool run.
-  const isolated = options.isolated || internalOverride?.isolated === true;
+  const isolated = internalOverride
+    ? internalOverride.isolated
+    : options[INTERNAL_RESOLVED_ISOLATED] ?? agentConfig?.isolated ?? options.isolated ?? false;
   const extensions = isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
@@ -1495,8 +1500,7 @@ export async function runAgent(
     ? agentTierResolution.thinkingLevel
     : options.thinkingLevel ?? agentConfig?.thinking;
 
-  if (agentTierSnapshot) {
-    const { configuredModel, source } = agentTierSnapshot;
+  {
     const scopeVerdict = checkModelScope({
       model,
       cwd: projectTrust.cwd,
@@ -1505,9 +1509,11 @@ export async function runAgent(
       // scopeModels polices a tier chosen per dispatch, by the host model or by
       // a workflow script alike; a tier from the agent file or the configured
       // default is standing config and only warns.
-      callerSupplied: source === "call",
+      callerSupplied: agentTierSnapshot ? agentTierSnapshot.source === "call" : options.model != null,
       agentLabel: agentConfig?.displayName ?? type,
-      modelInput: configuredModel === "inherit" ? undefined : configuredModel,
+      modelInput: agentTierSnapshot
+        ? agentTierSnapshot.configuredModel === "inherit" ? undefined : agentTierSnapshot.configuredModel
+        : undefined,
     });
     if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
     if (scopeVerdict.kind === "warn" && ctx.hasUI) ctx.ui.notify(scopeVerdict.message, "warning");

@@ -122,7 +122,9 @@ export default function (pi: ExtensionAPI) {
     // expanded text. When I/O finishes, seed existing instances, never replace them.
     const prevComponentFactory = ctx.ui.getEditorComponent();
     installEditor(ctx.ui, (tui, theme, keybindings) => {
-      const editor = prevComponentFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+      const editor =
+        prevComponentFactory?.(tui, theme, keybindings) ??
+        new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
       if (generation === loadGeneration && !editors.has(editor)) {
         editors.add(editor);
         const pending = () => scanPending && generation === loadGeneration;

@@ -62,7 +62,13 @@ This is not a wall-clock deadline for legitimate agent awaits, and never polls a
 model. Cancellation/failure closes the actual owned helper through TERM, KILL
 escalation after 250ms, and a bounded 1.5-second close wait. Managed children must
 still settle exact-owner cleanup before terminal publication or resumability; a
-cleanup failure is fenced, not claimed as success. A returned value closes new
+cleanup failure is fenced, not claimed as success. Terminal status, final results,
+waiters and background notifications also wait for the exact accepted terminal
+transition's journal append to succeed (an append receipt, not an fsync guarantee).
+A transient append rejection retains the immutable transition for bounded retries.
+Exhaustion never reports success: a receipted persistence failure may settle the run;
+otherwise terminal publication remains pending. Stop or branch replacement
+invalidates a queued success. A returned value closes new
 root-call admission but drains every accepted native operation and nested frame
 before success; callbacks needed by those operations remain available. Infinite
 awaits in forgotten helpers still require cancellation. Ignored native RPC promises
@@ -162,6 +168,14 @@ user's own LLM and run on the user's own machine.
   runs are headless and take the declared `default`.
 - `phase(title, { budget })`, `log(message)`, `args`, `cwd`, `process.cwd()`,
   `budget` (`{ total, spent(), remaining() }`).
+
+Run and phase token budgets are soft pre-dispatch gates: they recheck completed
+spend after acquiring runtime capacity and before every provider-agent attempt,
+including empty-output retries and schema repairs. Queued calls do not retain an
+earlier budget approval. Attempts already running can overshoot; this is not a
+hard token or cost cap. Nested live calls share run spend, while phase allowances
+remain frame-local and queued calls keep their captured phase allowance. Journal
+replay neither re-executes nor charges completed calls.
 
 ### Resume
 

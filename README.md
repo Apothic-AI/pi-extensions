@@ -244,6 +244,8 @@ See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 ## Documentation
 
 - [Package boundaries](docs/package-boundaries.md): runtime ownership, persistence and shared contracts.
+- [Extension portfolio](docs/extension-portfolio.md): each capability's value, alternatives and conditional use.
+- [Upstream review, 2026-10-23](docs/upstream-review-2026-10-23.md): pinned sources, selective ports and deferred candidates.
 - [Compatibility and verification](docs/compatibility.md): tested host, dependency ownership and integration limits.
 - [Design decisions](docs/open-decisions.md): isolation, deferred imports, orchestration and resource admission.
 - [Task and status navigation](docs/status-navigation.md): shell-job views, status-owner actions and the UI protocol.

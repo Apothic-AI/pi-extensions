@@ -6,6 +6,10 @@
 right-aligned timestamp after each user and assistant message in the interactive transcript. Opt-in
 settings can add response timing, assistant provenance and usage, or tool duration and outcome.
 
+## Selective upstream compatibility
+
+Formatter caching and environment refresh are adapted from narumiruna/pi-extensions commits [`bae6fea4`](https://github.com/narumiruna/pi-extensions/commit/bae6fea402b26006e9daaac3799f29274dd77bcd) and [`0b1e77d2`](https://github.com/narumiruna/pi-extensions/commit/0b1e77d2ce972c2fcefde142020be48fb43e4eb6). At most 32 date/time formatters are retained by effective locale, time zone and formatting options. Explicit environment changes and `TZ`/locale environment-variable changes are observed on the next render; OS-default changes without environment changes are checked on render at most once a minute, without a timer. Component output is deliberately not memoized, so width, theme and settings continue to be evaluated on every render. This is a bounded-construction optimization, not a measured speedup claim; entry versions and timing semantics are unchanged.
+
 ## Features
 
 - Shows each message's recorded creation time on a dim, right-aligned transcript row.

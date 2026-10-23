@@ -57,6 +57,8 @@ The container-first FleetView and bounded drill-down patterns are independently 
 
 Resume-budget and shutdown parity fixes selectively adapt upstream work at [`d7c9ec0`](https://github.com/tintinweb/pi-subagents/commit/d7c9ec0b027b91c7ab9da0fa5f4ae203474a5bdf), [`ca93a52`](https://github.com/tintinweb/pi-subagents/commit/ca93a5247e72e7053fcd10bea7125d6c4205f949) (unreleased after the 0.22 tag), and [`83be963`](https://github.com/tintinweb/pi-subagents/commit/83be963a969eb359af29cbbb4d4af2d01748bfb5) (released in 0.22). They retain this fork's manager-owned sessions, resource budgets, activity accounting, and protocol v4; the integrated upstream engine is not imported.
 
+Three bounded parity fixes selectively adapt upstream [`fc1ddb3`](https://github.com/tintinweb/pi-subagents/commit/fc1ddb3f0bb289232fd531607b7cbe4c7e4c5f6f) / [`bb7d208`](https://github.com/tintinweb/pi-subagents/commit/bb7d2082235a61169c30d6e05de370cba95da62d) (definition isolation on ordinary RPC/registry spawns, including explicit false/off), [`084d177`](https://github.com/tintinweb/pi-subagents/commit/084d177cfa71a9ce75da5dc69c505b4adbef32b4) (final no-tier model scope), and [`2f8dd3a`](https://github.com/tintinweb/pi-subagents/commit/2f8dd3a3a16fcbad7a5105cbfacb1b722fe04c24) (completion-notification snapshots before delayed delivery). Managed requests retain their request-first filesystem-isolation policy; internal zero-tool generation remains authoritative. Tier resolution still owns the winning model policy, and consumed completions cannot suppress a later resumed attempt. These are selective fixes, not an upstream steering outbox import: protocol v4, approvals, ownership, raw-history refusal, followUp delivery, and smart grouping remain local contracts.
+
 The opt-in parent clarification broker is locally implemented. It uses the existing main session, not an upstream LLM arbitrator, cloned parent history, private UI automation, or an additional Agent per question. Permission gates remain human-owned.
 
 ## Lint policy
@@ -296,7 +298,7 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `ask_tools` | — | Comma-separated tools whose first call requires human approval. Approval permits later calls to that tool across resumed turns of the current in-memory child. It is not persisted: reopening an evicted child from disk or restarting Pi asks again. Without an interactive approver, calls are blocked |
-| `isolation` | — | Set to `worktree` to run in an isolated git worktree |
+| `isolation` | — | `worktree` runs in an isolated git worktree; explicit `off` locks ordinary invocations to no worktree |
 | `tier` | none | This agent's default model tier, by name, from `agentTiers.profiles`. A tier passed at the call site overrides it. When set, it wins over `model`/`thinking` below — see [Model tiers](#model-tiers) |
 | ~~`model`~~ | — | **Removed.** An agent no longer chooses its own model; use `tier`. A file that still has it loads normally, with a warning naming it — the line simply has no effect |
 | ~~`thinking`~~ | — | **Removed**, same as `model` above |

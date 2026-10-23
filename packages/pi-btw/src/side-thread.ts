@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   Api,
   AssistantMessage,
@@ -41,13 +42,15 @@ export type SideThreadTurn =
     };
 
 export interface SideThread {
+  /** Provider routing identity, independent of the parent session. Lazily assigned for legacy callers. */
+  id?: string;
   turns: SideThreadTurn[];
   /** A parent-history request binds all later side messages to this physical destination. */
   parentHistoryRecipient?: Pick<Model<Api>, "provider" | "id" | "api" | "baseUrl">;
 }
 
 export function createSideThread(): SideThread {
-  return { turns: [] };
+  return { id: randomUUID(), turns: [] };
 }
 
 export function canSendSideThreadToModel(thread: SideThread, model: Model<Api>): boolean {
@@ -135,10 +138,11 @@ export async function completeSideThreadTurn({
     const parentContext = prepareContext?.() ?? "";
     if (parentContext === false) return { kind: "aborted" };
     if (parentContext) bindSideThreadToModel(thread, requestModel);
+    thread.id ??= randomUUID();
     const response = await completeSimple(
       requestModel,
       { systemPrompt: SYSTEM_PROMPT, messages: buildSideThreadMessages(thread, question, parentContext) },
-      buildStreamOptions(auth, thinkingLevel, signal),
+      { ...buildStreamOptions(auth, thinkingLevel, signal), sessionId: thread.id },
     );
     if (signal?.aborted || !isCurrent() || response?.stopReason === "aborted") return { kind: "aborted" };
     if (!isAssistantMessage(response)) {
@@ -186,7 +190,7 @@ export async function completeSideQuestion({
       systemPrompt: SYSTEM_PROMPT,
       messages: [createUserMessage(buildUserPrompt(question, conversationContext))],
     },
-    buildStreamOptions(auth, thinkingLevel, signal),
+    { ...buildStreamOptions(auth, thinkingLevel, signal), sessionId: randomUUID() },
   );
 }
 

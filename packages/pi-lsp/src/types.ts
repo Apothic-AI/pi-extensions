@@ -4,6 +4,8 @@ export interface ServerCommand {
 }
 
 export interface StatusContext {
+  mode?: string;
+  statusOwner?: object;
   sessionManager?: { getSessionId: () => string | undefined };
   ui: { setStatus: (key: string, value: string | undefined) => void };
 }

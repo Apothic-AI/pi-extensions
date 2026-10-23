@@ -284,6 +284,24 @@ compute fresh edits. Preview and no-op results do not write or require this fina
 This is not filesystem locking or an atomic compare-and-swap: an external writer can
 still race the final check and descriptor write.
 
+## Cancellation and shutdown
+
+Both tools own their complete invocation, including every diagnostics route and queued fix.
+Tool cancellation and session shutdown abort the active client, prevent subsequent routes and
+protocol steps after cancellation is observed, and reject changed writes before they start.
+Session replacement and reload retire the old scope without cancelling a newer session's work.
+Shutdown awaits accepted invocations, including initialization and server cleanup; a fix waiting
+for Pi's mutation queue must still reach its queued callback before it can finish cancellation.
+There is no separate whole-invocation shutdown deadline. Request timeouts and the bounded
+process-close attempts described above still apply. Unconfirmed child closure reports a tool
+cleanup error and retains the runner lease rather than claiming the process was reaped.
+
+Cancellation is cooperative at await/route boundaries; synchronous file writes cannot be
+interrupted. A completed write is not rolled back if cancellation arrives during later cleanup.
+This does not cancel another tool's queued work, lock out external writers, or manage server
+descendants. Status updates are TUI-only, session-owned, and best effort: an unavailable or
+retired UI cannot bypass resource cleanup or replace the original operation error.
+
 ## Command
 
 ```text
@@ -301,11 +319,14 @@ packages/pi-lsp/
 │   ├── adapters.ts
 │   ├── command.ts
 │   ├── client-leases.ts
+│   ├── document-key.ts
 │   ├── files.ts
 │   ├── lsp-client.ts
 │   ├── pi-lsp.ts
 │   ├── routes.ts
 │   ├── runner.ts
+│   ├── session-lifecycle.ts
+│   ├── status.ts
 │   ├── text-edits.ts
 │   └── types.ts
 ├── README.md
@@ -313,6 +334,17 @@ packages/pi-lsp/
 ├── tsconfig.json
 └── package.json
 ```
+
+## Selective upstream provenance
+
+The equivalent-file-URI diagnostic keys selectively adapt
+[narumiruna/pi-extensions c23e6047759f6eb628eccf7395cac97a1fa4d47e](https://github.com/narumiruna/pi-extensions/commit/c23e6047759f6eb628eccf7395cac97a1fa4d47e).
+The whole-invocation session cancellation selectively adapts
+[756e1e2939eaf149fb4568a505117c3a8fbdf707](https://github.com/narumiruna/pi-extensions/commit/756e1e2939eaf149fb4568a505117c3a8fbdf707).
+These are bounded adaptations, not wholesale replacements: file keys normalize drive letters
+independently of the host OS while preserving escaped filename characters and non-file URI
+identity; lifecycle handling retains this package's client leases, bounded close confirmation,
+mutation queue/freshness checks, concurrent status ownership, and output limits.
 
 ## License
 

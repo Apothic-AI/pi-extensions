@@ -1700,29 +1700,34 @@ export async function runWorkflow<T = unknown>(
     // Reserve a real dispatch synchronously — no await occurs between this
     // check and the increments, so a parallel() burst cannot overshoot the cap.
     if (shared.physicalAgentCount >= maxAgents) throw agentLimitError();
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-    // Per-phase soft sub-budget gate: warns once at ~80%, throws at 100%.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
+    // Capture this frame's phase allowance at lexical admission. A later phase
+    // change/rebase must not donate a fresh allowance to queued work or retries.
+    const phaseBudget = assignedPhase ? state.phaseBudgets.get(assignedPhase) : undefined;
+    const checkBudget = () => {
+      if (budget.total !== null && budget.remaining() <= 0) {
+        throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+          recoverable: false,
+        });
+      }
+      // Soft gate: completed spend is shared, but active calls reserve no tokens.
+      if (phaseBudget) {
+        const phaseSpent = shared.spent - phaseBudget.startSpent;
+        if (phaseSpent >= phaseBudget.budget) {
           throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            `phase "${assignedPhase}" token sub-budget exhausted (${phaseBudget.budget})`,
             WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
             { recoverable: false },
           );
         }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        if (!phaseBudget.warned && phaseSpent >= phaseBudget.budget * 0.8) {
+          phaseBudget.warned = true;
+          log(
+            `phase "${assignedPhase}" at ${Math.round((phaseSpent / phaseBudget.budget) * 100)}% of its token sub-budget`,
+          );
         }
       }
-    }
+    };
+    checkBudget();
     shared.agentCount++;
     frameAgentCount++;
     shared.physicalAgentCount++;
@@ -1737,6 +1742,7 @@ export async function runWorkflow<T = unknown>(
       await Promise.resolve();
       throwIfAborted();
       if (batch?.cancelled) throw agentLimitError();
+      checkBudget();
 
       const timeout =
         agentOptions.timeoutMs !== undefined ? normalizeAgentTimeout(agentOptions.timeoutMs) : agentTimeoutMs;
@@ -1787,6 +1793,9 @@ export async function runWorkflow<T = unknown>(
 
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          // Outside the attempt catch: a rejected admission is not a provider
+          // attempt and must not be charged an estimated failure or retried.
+          checkBudget();
           usage = undefined;
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;

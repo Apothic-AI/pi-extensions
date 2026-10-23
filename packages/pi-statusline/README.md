@@ -12,6 +12,10 @@ gpt-5.6-sol · think max · main                         ctx 42%
 
 There are no persistent branch icons, emoji, powerline blocks, hard-coded backgrounds, or ornamental per-segment symbols in the default profile. A single dim `·` separator is used between text fields. Normal metadata is muted; accent and warning/error colors are reserved for current or abnormal state.
 
+## Selective upstream compatibility
+
+Terminal-capability handling is selectively ported from [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions/commit/36a5ad5149d890b03803c9fa971b875656dcf4e4). Optional powerline palettes and separators follow Pi's live truecolor capability, falling back to ANSI 256 colors. Theme-native colors remain owned by Pi. PR context accepts both linked and strict plain `PR #123:` statuses, displaying each PR once. Local quiet defaults, sanitation, width fitting, settings and lifecycle safeguards remain unchanged.
+
 ## Install
 
 ```bash
