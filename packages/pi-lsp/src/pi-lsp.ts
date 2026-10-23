@@ -5,6 +5,7 @@ import { commandExists, commandPathValue } from "./command.js";
 import { resolveRoot } from "./files.js";
 import { selectDiagnosticRoutes, selectFixRoute } from "./routes.js";
 import { DEFAULT_FILE_LIMIT, runDiagnostics, runFix, textResult } from "./runner.js";
+import { LspSessionScope } from "./session-lifecycle.js";
 import { resetStatus } from "./status.js";
 
 const STATUS_KEY = "lsp";
@@ -64,6 +65,7 @@ const lspDiagnosticsTool = defineTool({
     );
     const results = [];
     for (const route of routes) {
+      signal?.throwIfAborted();
       const result = await runDiagnostics(
         route.adapter,
         { root, paths: params.paths, limit: params.limit, files: route.files },
@@ -73,6 +75,7 @@ const lspDiagnosticsTool = defineTool({
         STATUS_KEY,
         false, // Bound the complete aggregate once, not each server section.
       );
+      signal?.throwIfAborted();
       results.push({ route, result });
     }
 
@@ -135,8 +138,32 @@ const lspFixTool = defineTool({
 });
 
 export default function lsp(pi: ExtensionAPI) {
-  pi.registerTool(lspDiagnosticsTool);
-  pi.registerTool(lspFixTool);
+  const sessions = new WeakMap<object, LspSessionScope>();
+  const newScope = (key: object) => {
+    const scope: LspSessionScope = new LspSessionScope(() => sessions.get(key) === scope, sessions.get(key));
+    sessions.set(key, scope);
+    return scope;
+  };
+  const sessionFor = (key: object) => sessions.get(key) ?? newScope(key);
+
+  pi.registerTool({
+    ...lspDiagnosticsTool,
+    execute(id, params, signal, onUpdate, ctx) {
+      const scope = sessionFor(ctx.sessionManager ?? ctx);
+      return scope.run(signal, (ownedSignal) =>
+        lspDiagnosticsTool.execute(id, params, ownedSignal, onUpdate, scope.context(ctx)),
+      );
+    },
+  });
+  pi.registerTool({
+    ...lspFixTool,
+    execute(id, params, signal, onUpdate, ctx) {
+      const scope = sessionFor(ctx.sessionManager ?? ctx);
+      return scope.run(signal, (ownedSignal) =>
+        lspFixTool.execute(id, params, ownedSignal, onUpdate, scope.context(ctx)),
+      );
+    },
+  });
 
   pi.registerCommand("lsp", {
     description: "Show shared LSP extension configuration",
@@ -154,19 +181,32 @@ export default function lsp(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => {
-    resetStatus(ctx, STATUS_KEY);
+  pi.on("session_start", async (_event, ctx) => {
+    const key = ctx.sessionManager ?? ctx;
+    const previous = sessions.get(key);
+    // Install the replacement before abort listeners can reenter session_start.
+    const scope = newScope(key);
+    resetStatus(scope.context(ctx), STATUS_KEY);
+    const drained = scope.drainPrevious();
+    if (previous) resetStatus(previous.context(ctx, true), STATUS_KEY);
+    await drained;
+    if (!scope.isOpen()) return;
     try {
       loadRuntime(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
       const notice = consumeLspConfigNotice();
-      if (notice) ctx.ui.notify(notice, "warning");
+      if (notice && scope.isOpen() && ctx.hasUI) scope.context(ctx).ui.notify(notice, "warning");
     } catch (error) {
-      ctx.ui.notify(`LSP config ignored: ${formatError(error)}`, "warning");
+      if (scope.isOpen() && ctx.hasUI) {
+        scope.context(ctx).ui.notify(`LSP config ignored: ${formatError(error)}`, "warning");
+      }
     }
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
-    resetStatus(ctx, STATUS_KEY);
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const scope = sessionFor(ctx.sessionManager ?? ctx);
+    const drained = scope.close();
+    resetStatus(scope.context(ctx, true), STATUS_KEY);
+    await drained;
   });
 }
 

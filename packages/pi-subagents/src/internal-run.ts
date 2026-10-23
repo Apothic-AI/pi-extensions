@@ -39,6 +39,11 @@ export interface ParentPolicySnapshot {
 
 export const INTERNAL_PARENT_POLICY_SNAPSHOT = Symbol("pi-subagents.internal-parent-policy-snapshot");
 
+/** Manager-issued isolation after ordinary, branch-local, or managed admission.
+ * Never forwarded from public SpawnOptions; direct runner calls resolve definition policy.
+ */
+export const INTERNAL_RESOLVED_ISOLATED = Symbol("pi-subagents.internal-resolved-isolated");
+
 /** Branch-local frontmatter only; never accepts another run/config capability. */
 export type ResumeBudgetPolicy = Pick<AgentConfig, "maxTurns">;
 export const INTERNAL_RESUME_BUDGET_POLICY = Symbol("pi-subagents.internal-resume-budget-policy");

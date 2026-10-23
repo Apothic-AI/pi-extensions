@@ -245,6 +245,8 @@ export interface ScriptRunState {
   >;
   /** Journal retry bookkeeping. */
   pendingJournal: Set<string>;
+  /** Exact terminal append still awaiting its receipt; not a published run status. */
+  pendingTerminal?: object;
   /** Whether a lifecycle suspension is in effect (branch change). */
   lifecycleSuspended: boolean;
 }
@@ -490,6 +492,8 @@ export class WorkflowEngine {
     const epoch = this.branchEpoch;
     if (
       !this.isCurrentState(state, generation, epoch) ||
+      !isTerminalWorkflow(state.run.status) ||
+      state.pendingTerminal !== undefined ||
       state.pendingCleanup.size > 0 ||
       this.terminalNotified.has(state)
     )
@@ -519,6 +523,7 @@ export class WorkflowEngine {
           state.pendingSpawns.size > 0 ||
           state.agentWaiters.size > 0 ||
           state.pendingJournal.size > 0 ||
+          state.pendingTerminal !== undefined ||
           state.pendingCleanup.size > 0 ||
           state.activeExecutionGenerations.size > 0 ||
           state.stopOperation !== undefined ||
@@ -1111,8 +1116,11 @@ export class WorkflowEngine {
       if (!(error instanceof WorkflowWaitAbortedError)) throw error;
       // Foreground cancellation owns execution, not just this waiter. Do not
       // advertise resumability until runtime children and checkpoint UI unwind.
+      // A failed receipt can outlive execution; retire it before aborting too.
+      state.pendingTerminal = undefined;
       state.controller.abort();
       await this.drainExecution(state, execution);
+      this.recoverInterruptedExecution(state, generation, epoch);
       const current = this.runs.get(runId)?.run ?? run;
       return { runId: current.runId, status: current.status, background: false, waitAborted: true };
     }
@@ -1274,8 +1282,10 @@ export class WorkflowEngine {
       return { runId, status: settled.status, background: false };
     } catch (error: unknown) {
       if (!(error instanceof WorkflowWaitAbortedError)) throw error;
+      state.pendingTerminal = undefined;
       state.controller.abort();
       await this.drainExecution(state, execution);
+      this.recoverInterruptedExecution(state, generation, epoch);
       return { runId, status: run.status, background: false, waitAborted: true };
     }
   }
@@ -1297,6 +1307,8 @@ export class WorkflowEngine {
     if (action === "get") return { action, run: this.summary(run, true) };
     if (action === "pause") {
       if (run.status === "running") {
+        const generation = state.executionGeneration;
+        const epoch = this.branchEpoch;
         this.setWorkflowStatus(run, "pausing");
         this.reconcilePendingSpawns(state);
         // Abort the script execution; the run settles as interrupted and can be
@@ -1304,6 +1316,7 @@ export class WorkflowEngine {
         // the runtime's abort signal via the dispatch waiters.
         state.controller.abort();
         await this.drainExecution(state, state.execution);
+        this.recoverInterruptedExecution(state, generation, epoch);
       } else if (run.status !== "paused" && run.status !== "interrupted") {
         throw new Error(`cannot pause workflow in state ${run.status}`);
       }
@@ -1381,7 +1394,15 @@ export class WorkflowEngine {
   }
 
   private settleWaiters(runId: string, run: ScriptRun): void {
-    if (this.runs.get(runId)?.run !== run || this.hasPendingCleanup(runId)) return;
+    const state = this.runs.get(runId);
+    if (
+      state?.run !== run ||
+      !this.isCurrentState(state, state.executionGeneration, this.branchEpoch) ||
+      state.pendingTerminal !== undefined ||
+      this.hasPendingCleanup(runId) ||
+      (!isTerminalWorkflow(run.status) && run.status !== "paused" && run.status !== "interrupted")
+    )
+      return;
     const all = this.waiters.get(runId);
     if (!all) return;
     for (const waiter of [...all]) {
@@ -1395,6 +1416,43 @@ export class WorkflowEngine {
   }
 
   // ── execution ──────────────────────────────────────────────────────────────
+
+  private recoverInterruptedExecution(state: ScriptRunState, generation: number, epoch: number): void {
+    const run = state.run;
+    const current = () =>
+      this.runs.get(run.runId) === state &&
+      state.executionGeneration === generation &&
+      this.branchEpoch === epoch &&
+      !this.disposed &&
+      !state.stopOperation &&
+      (run.status === "running" || run.status === "pausing");
+    if (!current()) return;
+    // Cancellation takes ownership before interruption is visible. An abandoned
+    // completed/failed receipt must neither publish later nor block old waiters.
+    state.pendingTerminal = undefined;
+    const timestamp = Date.now();
+    const recovery: RunRecoveryEvent = {
+      kind: "run_recovery",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      status: "interrupted",
+      branchGeneration: this.recoveryBranchGeneration,
+      rotations: [],
+      recoveryId: deriveRecoveryId({ runId: run.runId, rotations: [], timestamp }),
+      timestamp,
+    };
+    this.persist(run.runId, "abort-recovery", () => this.write(recovery));
+    if (!current()) return;
+    run.status = "interrupted";
+    run.updatedAt = timestamp;
+    // A pending failed receipt can outlive execute(). In that case there is no
+    // finally left to publish interruption or settle pre-existing waiters.
+    if (!state.activeExecutionGenerations.has(generation)) {
+      state.presentation.settle(run.status);
+      this.notifyInspection(state);
+      this.settleWaiters(run.runId, run);
+    }
+  }
 
   private async execute(
     state: ScriptRunState,
@@ -1579,7 +1637,13 @@ export class WorkflowEngine {
       const run = live?.run;
       if (run && isSameBranch() && !isTerminalWorkflow(run.status)) {
         this.setWorkflowStatus(run, "completed", undefined, undefined, result.result);
-        live.result = result.result;
+        // Keep execution ownership until this newly accepted terminal fact has
+        // its receipt too. Pause/stop may invalidate it while retries drain.
+        await this.drainJournal(runId);
+        if (!isCurrent() || executionSignal.aborted || run.status !== "completed")
+          throw new WorkflowError("workflow execution aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+            recoverable: true,
+          });
       }
       return result;
     } catch (error: unknown) {
@@ -1593,20 +1657,7 @@ export class WorkflowEngine {
           this.cleanupAgents(runId);
           this.scheduleProviderResume(runId, workflowError.resetHint);
         } else if (workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED && executionSignal.aborted) {
-          this.persist(runId, "abort-recovery", () =>
-            this.write({
-              kind: "run_recovery",
-              schemaVersion: JOURNAL_SCHEMA_VERSION,
-              runId,
-              status: "interrupted",
-              branchGeneration: this.recoveryBranchGeneration,
-              rotations: [],
-              recoveryId: deriveRecoveryId({ runId, rotations: [], timestamp: Date.now() }),
-              timestamp: Date.now(),
-            }),
-          );
-          run.status = "interrupted";
-          run.updatedAt = Date.now();
+          this.recoverInterruptedExecution(state, generation, epoch);
         } else {
           this.cleanupAgents(runId);
           this.setWorkflowStatus(run, "failed", message);
@@ -2382,6 +2433,7 @@ export class WorkflowEngine {
     const epoch = this.branchEpoch;
     if (!this.isCurrentState(state, generation, epoch)) return;
     if (run.nonResumable && run.status === "stopped") return;
+    state.pendingTerminal = undefined;
     run.nonResumable = true;
     const blockedNodeIds = Object.keys(run.callStatus).filter((nodeId) => run.callStatus[nodeId] !== "completed");
     for (const nodeId of blockedNodeIds) run.callStatus[nodeId] = "stopped";
@@ -2573,9 +2625,9 @@ export class WorkflowEngine {
   /**
    * A Pi lifecycle event is delivered once. If its durable append is transiently
    * unavailable, retain the mutation in memory and retry the append with
-   * backoff without requiring the peer to re-emit. The in-memory run state is
-   * authoritative; the journal is best-effort with bounded retries, and a run
-   * whose appends keep failing is marked blocked (reported once, not spammed).
+   * backoff without requiring the peer to re-emit. Most in-memory facts can
+   * lead the journal; terminal transitions instead publish inside their exact
+   * append's receipt callback. Exhausted retries mark the journal blocked.
    */
   private scheduleJournalRetry(runId: string, key: string, mutation: () => void): void {
     // Every accepted fact has its own slot, including later retry generations
@@ -2660,10 +2712,8 @@ export class WorkflowEngine {
   }
 
   private write(event: JournalEvent): void {
-    // The in-memory mutation is applied by the caller BEFORE calling write;
-    // here we only persist. A transient failure schedules a retry of this exact
-    // append. Terminal bookkeeping already happened, so a retry that never
-    // succeeds degrades to a warning rather than corrupting run state.
+    // Only append here. persist turns rejection into a retry of this exact
+    // fact; receipt-gated callers publish only after write returns successfully.
     try {
       this.journal.append(event);
     } catch (error: unknown) {
@@ -2675,9 +2725,9 @@ export class WorkflowEngine {
   }
 
   /**
-   * Persist one journal event with bounded retry. The caller applies the
-   * in-memory mutation itself; `persist` only makes the append durable and, on
-   * a transient failure, schedules a retry of the exact same append.
+   * Persist one journal event with bounded retry. The caller owns in-memory
+   * publication; terminal transitions do it inside mutation after write returns.
+   * A transient failure schedules a retry of the exact same accepted append.
    */
   private persist(runId: string, key: string, mutation: () => void): void {
     const acceptedState = this.runs.get(runId);
@@ -2768,36 +2818,53 @@ export class WorkflowEngine {
     const generation = state?.executionGeneration ?? 0;
     const epoch = this.branchEpoch;
     if (!state || state.run !== run || !this.isCurrentState(state, generation, epoch)) return;
-    // Validate and isolate terminal values before best-effort persistence or any
-    // status mutation. A bad result must still be able to transition the run to failed.
+    // Capture once: retries must append the exact accepted transition, not a
+    // newly timestamped status or a result still owned by the runtime.
     const durableFinalResult = finalResult === undefined ? undefined : cloneWorkflowResult(finalResult);
     const runFinalResult = finalResult === undefined ? undefined : cloneWorkflowResult(finalResult);
     const timestamp = Date.now();
-    this.persist(run.runId, `transition:${status}`, () =>
-      this.write({
-        kind: "workflow_transition",
-        schemaVersion: JOURNAL_SCHEMA_VERSION,
-        runId: run.runId,
-        status,
-        ...(error !== undefined ? { error } : {}),
-        ...(durableFinalResult !== undefined ? { finalResult: durableFinalResult } : {}),
-        ...(terminalIntent !== undefined ? { terminalIntent } : {}),
-        timestamp,
-      }),
-    );
-    if (!this.isCurrentState(state, generation, epoch)) return;
-    run.status = status;
-    if (status === "running") run.error = undefined;
-    if (error !== undefined) run.error = error;
-    if (runFinalResult !== undefined) run.finalResult = runFinalResult;
-    if (terminalIntent !== undefined) run.terminalIntent = terminalIntent;
-    run.updatedAt = timestamp;
-    this.notifyInspection(state);
-    if (!this.isCurrentState(state, generation, epoch)) return;
-    if (isTerminalWorkflow(status)) {
-      state.bufferedTerminals.clear();
-      this.notifyTerminal(state);
-    }
+    const event: JournalEvent = {
+      kind: "workflow_transition",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      status,
+      ...(error !== undefined ? { error } : {}),
+      ...(durableFinalResult !== undefined ? { finalResult: durableFinalResult } : {}),
+      ...(terminalIntent !== undefined ? { terminalIntent } : {}),
+      timestamp,
+    };
+    const terminal = isTerminalWorkflow(status);
+    const intent = terminal ? {} : undefined;
+    // Stop/pause takes ownership synchronously, invalidating any queued success.
+    state.pendingTerminal = intent;
+    const current = () =>
+      this.isCurrentState(state, generation, epoch) &&
+      (!terminal || (state.pendingTerminal === intent && (status !== "completed" || !state.controller.signal.aborted)));
+    const publish = () => {
+      if (!current()) return;
+      state.pendingTerminal = undefined;
+      run.status = status;
+      if (status === "running") run.error = undefined;
+      if (error !== undefined) run.error = error;
+      if (runFinalResult !== undefined) run.finalResult = runFinalResult;
+      if (status === "completed") state.result = runFinalResult;
+      if (terminalIntent !== undefined) run.terminalIntent = terminalIntent;
+      run.updatedAt = timestamp;
+      this.notifyInspection(state);
+      if (!this.isCurrentState(state, generation, epoch)) return;
+      if (terminal) {
+        state.bufferedTerminals.clear();
+        this.notifyTerminal(state);
+      }
+    };
+    this.persist(run.runId, `transition:${status}`, () => {
+      if (!current()) return;
+      this.write(event);
+      // write throws on append rejection inside persist, including its retries.
+      // Only a receipt from this exact append may publish terminal state/result.
+      if (terminal) publish();
+    });
+    if (!terminal) publish();
   }
 
   // ── restore / summary ──────────────────────────────────────────────────────

@@ -20,8 +20,8 @@ const COMPATIBLE_STATUS_ICON_KEYS: Readonly<Record<string, string>> = {
   pisync: "sync",
 };
 const EMPTY_EXTENSION_STATUS_ICON_ALIASES: ExtensionStatusIconAliasMap = new Map();
-function extensionStatusSeparator(config: StatuslineConfig, theme: Theme): string {
-  return powerlineExtensionSeparator(theme, config.palettePreset);
+function extensionStatusSeparator(config: StatuslineConfig, theme: Theme, trueColor: boolean): string {
+  return powerlineExtensionSeparator(theme, config.palettePreset, trueColor);
 }
 
 export function formatExtensionStatuses(
@@ -30,8 +30,9 @@ export function formatExtensionStatuses(
   config: StatuslineConfig,
   runtime: ExtensionStatusRuntime,
   hiddenKeys: ReadonlySet<string> = new Set(),
+  trueColor = true,
 ): string {
-  const separator = extensionStatusSeparator(config, theme);
+  const separator = extensionStatusSeparator(config, theme, trueColor);
   const visibleStatuses = [
     ...formatDuplicateExtensionStatus(runtime, theme),
     ...[...statuses.entries()]

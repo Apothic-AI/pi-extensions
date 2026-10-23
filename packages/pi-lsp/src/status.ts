@@ -4,7 +4,12 @@ import type { StatusContext } from "./types.js";
 const sessions = new Map<string | object, Map<string, Map<symbol, string>>>();
 
 function sessionIdentity(ctx: StatusContext): string | object {
-  return ctx.sessionManager?.getSessionId() ?? ctx.ui;
+  try {
+    return ctx.statusOwner ?? ctx.sessionManager?.getSessionId() ?? ctx.ui;
+  } catch {
+    // Runner-only contexts can lack a session owner and have an unavailable UI.
+    return ctx;
+  }
 }
 
 export function resetStatus(ctx: StatusContext, key: string): void {
@@ -12,7 +17,7 @@ export function resetStatus(ctx: StatusContext, key: string): void {
   const keys = sessions.get(identity);
   keys?.delete(key);
   if (keys?.size === 0) sessions.delete(identity);
-  ctx.ui.setStatus(key, undefined);
+  publishStatus(ctx, key, undefined);
 }
 
 export function beginStatus(ctx: StatusContext, key: string, label: string): () => void {
@@ -37,13 +42,20 @@ export function beginStatus(ctx: StatusContext, key: string, label: string): () 
       keys.delete(key);
       if (keys.size === 0) sessions.delete(identity);
     }
-    ctx.ui.setStatus(key, remaining);
+    publishStatus(ctx, key, remaining);
   };
-  try {
-    ctx.ui.setStatus(key, label);
-  } catch (error) {
-    finish();
-    throw error;
-  }
+  publishStatus(ctx, key, label);
   return finish;
+}
+
+function publishStatus(ctx: StatusContext, key: string, value: string | undefined) {
+  try {
+    // Undefined mode supports runner-only contexts; host tool contexts always
+    // declare a mode, and only TUI status is meaningful there.
+    if (ctx.mode !== undefined && ctx.mode !== "tui") return;
+    ctx.ui.setStatus(key, value);
+  } catch {
+    // A stale SDK getter or unavailable UI must never bypass client cleanup or
+    // replace an operation's original result/error.
+  }
 }

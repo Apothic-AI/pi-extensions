@@ -35,12 +35,13 @@ import {
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
+  INTERNAL_RESOLVED_ISOLATED,
   INTERNAL_RESUME_BUDGET_POLICY,
   type InternalAgentConfigOverride,
   type ParentPolicySnapshot,
   type ResumeBudgetPolicy,
 } from "./internal-run.js";
-import { resolveMaxTurns } from "./invocation-config.js";
+import { resolveAgentInvocationConfig, resolveMaxTurns } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
 import {
   assertParentModelRuntimeAvailable,
@@ -1790,11 +1791,6 @@ export class AgentManager {
     if (options.supervisorQuestions !== undefined && typeof options.supervisorQuestions !== "boolean" && options.supervisorQuestions !== "parent") {
       throw new Error('supervisorQuestions must be boolean or "parent".');
     }
-    if (options.supervisorQuestions === "parent" &&
-        (options.isBackground !== true || options.parentAgentId !== undefined || options.resumeSessionFile ||
-          options.isolated || getAgentConfig(type)?.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
-      throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
-    }
     // Covers top-level, nested, managed, and queued spawns before allocating a
     // record, consuming a branch budget, or creating an isolation worktree.
     assertNoRawInheritance(
@@ -1833,6 +1829,24 @@ export class AgentManager {
       typeof options.rootSessionId !== "string"
     ) {
       throw new Error("rootSessionId must be a string");
+    }
+    // Resolve ordinary definition policy before queue admission/worktree allocation.
+    // Managed policy was already resolved by its request-first wrapper; internal
+    // generation overrides must never inherit a definition's worktree setting.
+    if (internalOverride) {
+      options = { ...options, isolated: internalOverride.isolated, isolation: internalOverride.isolation };
+    } else if (!owner && options.parentAgentId === undefined) {
+      // Nested tools already resolved against their branch-local registry.
+      const policy = resolveAgentInvocationConfig(getAgentConfig(type), {
+        isolated: options.isolated,
+        isolation: options.isolation,
+      });
+      options = { ...options, isolated: policy.isolated, isolation: policy.isolation };
+    }
+    if (options.supervisorQuestions === "parent" &&
+        (options.isBackground !== true || options.parentAgentId !== undefined || options.resumeSessionFile ||
+          options.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
+      throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
     }
     // Admission must be synchronous and shape-only: a child can select another
     // model after this point, but no unsupported host may receive an ID, branch
@@ -2466,6 +2480,9 @@ export class AgentManager {
         model: options.model,
         maxTurns: options.maxTurns,
         isolated: internalOverride?.isolated ?? options.isolated,
+        // Issue provenance here, never copy a caller's symbol. Nested tools
+        // resolved branch-local policy; managed calls resolved their own policy.
+        [INTERNAL_RESOLVED_ISOLATED]: options.isolated ?? getAgentConfig(type)?.isolated ?? false,
         inheritContext:
           internalOverride?.inheritContext ?? options.inheritContext,
         ...(internalOverride

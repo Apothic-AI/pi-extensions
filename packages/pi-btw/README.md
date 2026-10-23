@@ -6,6 +6,10 @@
 
 Use it when you want to ask a temporary question, inspect context, or get a short explanation while keeping the primary coding task focused.
 
+## Selective upstream compatibility
+
+Per-thread provider routing identity is selectively ported from [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions/commit/81be3f7250b26bfd4d51ab20d193b5edae70e688). Each in-memory side thread owns an independent UUID passed as the provider session ID across follow-ups and resume; one-off side-question helpers get a new ID per call. The parent session ID and parent-history persistence are not used. Local privacy, destination binding, auth/header routing, cost reporting and fullscreen UI behavior remain unchanged.
+
 ## Features
 
 - Adds a `/btw` menu for starting or resuming an in-memory side thread or changing pi-btw settings.

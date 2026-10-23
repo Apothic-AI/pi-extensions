@@ -63,6 +63,9 @@ export class GroupJoinManager {
     const group = this.groups.get(groupId);
     if (!group || group.delivered) return 'pass';
 
+    // Membership belongs to the first completion, not every later resume of
+    // the same agent ID. Subsequent attempts notify independently.
+    if (group.completedRecords.has(record.id)) return 'pass';
     group.completedRecords.set(record.id, record);
 
     // All done — deliver immediately

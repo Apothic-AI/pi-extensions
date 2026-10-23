@@ -764,71 +764,100 @@ function activateRootRuntime(
     }
   }
 
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (notificationsRetired || record.resultConsumed) return; // re-check at send time
+  // Completion payloads belong to an attempt, not the mutable record reused by
+  // resume. Capture before batch/group holding and before activity is deleted.
+  interface CompletionNudge {
+    key: string;
+    record: AgentRecord;
+    activity?: AgentActivity;
+    isCurrent: () => boolean;
+    consumed: boolean;
+    individual: string;
+    grouped: string;
+    individualDetails: NotificationDetails;
+    groupedDetails: NotificationDetails;
+  }
+  const completionNudges = new WeakMap<AgentRecord, CompletionNudge>();
+  let completionSequence = 0;
 
-    const notification = formatTaskNotification(record, 500);
-    const footer = record.outputFile
-      ? `\nFull transcript available at: ${record.outputFile}`
-      : "";
-
-    pi.sendMessage<NotificationDetails>(
-      {
-        customType: "subagent-notification",
-        content: notification + footer,
-        display: true,
-        details: buildNotificationDetails(
-          record,
-          500,
-          agentActivity.get(record.id),
-        ),
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+  function captureCompletionNudge(record: AgentRecord): CompletionNudge {
+    const snapshot = { ...record, lifetimeUsage: { ...record.lifetimeUsage } };
+    const activity = agentActivity.get(record.id);
+    const rootCurrent = rootUiFence();
+    const completion: CompletionNudge = {
+      key: `completion:${record.id}:${++completionSequence}`,
+      record: snapshot,
+      activity,
+      isCurrent: () => !notificationsRetired && rootCurrent() && !record.detached,
+      consumed: record.resultConsumed === true,
+      individual: formatTaskNotification(snapshot, 500) + (snapshot.outputFile
+        ? `\nFull transcript available at: ${snapshot.outputFile}` : ""),
+      grouped: formatTaskNotification(snapshot, 300),
+      individualDetails: buildNotificationDetails(snapshot, 500, activity),
+      groupedDetails: buildNotificationDetails(snapshot, 300, activity),
+    };
+    completionNudges.set(record, completion);
+    completionNudges.set(snapshot, completion);
+    return completion;
   }
 
-  function sendIndividualNudge(record: AgentRecord) {
+  function finishCompletionActivity(completion: CompletionNudge) {
+    const { record, activity } = completion;
+    // A group may finish after this member resumed: never delete its new tracker.
+    if (agentActivity.get(record.id) !== activity) return;
     agentActivity.delete(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+  }
+
+  // ---- Individual nudge helper (async join mode) ----
+  function sendIndividualNudge(record: AgentRecord) {
+    const completion = completionNudges.get(record);
+    if (!completion) return;
+    finishCompletionActivity(completion);
+    scheduleNudge(completion.key, () => {
+      if (!completion.isCurrent() || completion.consumed) return;
+      pi.sendMessage<NotificationDetails>(
+        {
+          customType: "subagent-notification",
+          content: completion.individual,
+          display: true,
+          details: completion.individualDetails,
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    });
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager((records, partial) => {
     if (notificationsRetired) return;
-    for (const r of records) {
-      agentActivity.delete(r.id);
-      fleet.onAgentFinished(r.id);
-    }
+    const completions = records.flatMap(record => {
+      const completion = completionNudges.get(record);
+      return completion ? [completion] : [];
+    });
+    for (const completion of completions) finishCompletionActivity(completion);
 
-    const groupKey = `group:${records.map((r) => r.id).join(",")}`;
+    const groupKey = `group:${completions.map(completion => completion.key).join(",")}`;
     scheduleNudge(groupKey, () => {
-      // Re-check at send time
-      const unconsumed = records.filter((r) => !r.resultConsumed);
+      // Recheck retirement and consumption of these exact completions only.
+      const unconsumed = completions.filter(completion => completion.isCurrent() && !completion.consumed);
       if (unconsumed.length === 0) {
         fleet.update();
         return;
       }
 
       const notifications = unconsumed
-        .map((r) => formatTaskNotification(r, 300))
+        .map(completion => completion.grouped)
         .join("\n\n");
       const label = partial
         ? `${unconsumed.length} agent(s) finished (partial — others still running)`
         : `${unconsumed.length} agent(s) finished`;
 
       const [first, ...rest] = unconsumed;
-      const details = buildNotificationDetails(
-        first,
-        300,
-        agentActivity.get(first.id),
-      );
-      if (rest.length > 0) {
-        details.others = rest.map((r) =>
-          buildNotificationDetails(r, 300, agentActivity.get(r.id)),
-        );
-      }
+      const details = {
+        ...first.groupedDetails,
+        ...(rest.length > 0 ? { others: rest.map(completion => completion.groupedDetails) } : {}),
+      };
 
       pi.sendMessage<NotificationDetails>(
         {
@@ -994,6 +1023,8 @@ function activateRootRuntime(
     (record) => {
       if (!record.detached) recordSessionUsage(record);
       const activity = agentActivity.get(record.id);
+      const completion = !record.parentAgentId && !record.detached && !record.owner
+        ? captureCompletionNudge(record) : undefined;
       if (activity) activityRetirements.get(activity)?.();
       // Nested children report only through their owning parent's scoped tools.
       // Keep them out of top-level lifecycle, transcript, notification, and UI channels.
@@ -1055,23 +1086,18 @@ function activateRootRuntime(
         return;
       }
 
-      // Skip notification if result was already consumed via get_subagent_result
-      if (record.resultConsumed) {
-        agentActivity.delete(record.id);
-        fleet.onAgentFinished(record.id);
-        return;
-      }
-
-      // If this agent is pending batch finalization (debounce window still open),
-      // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-      if (currentBatchAgents.some((a) => a.id === record.id)) {
+      // Retain EVERY attempt during debounce, not just the latest record lookup.
+      // Consumed first attempts still satisfy their original group membership.
+      const pendingBatch = currentBatchAgents.find((a) => a.id === record.id);
+      if (pendingBatch) {
+        pendingBatch.completions.push(completion!);
         fleet.update();
         return;
       }
 
-      const result = groupJoin.onAgentComplete(record);
+      const result = groupJoin.onAgentComplete(completion!.record);
       if (result === "pass") {
-        sendIndividualNudge(record);
+        sendIndividualNudge(completion!.record);
       }
       // 'held' → do nothing, group will fire later
       // 'delivered' → group callback already fired
@@ -2108,7 +2134,7 @@ function activateRootRuntime(
   // Uses a debounced timer: each new agent resets the 100ms window so that all
   // parallel tool calls (which may be dispatched across multiple microtasks by the
   // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
+  let currentBatchAgents: { id: string; joinMode: JoinMode; completions: CompletionNudge[] }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
 
@@ -2129,22 +2155,19 @@ function activateRootRuntime(
       // Retroactively process agents that already completed during the debounce window.
       // Their onComplete fired but was deferred (agent was in currentBatchAgents),
       // so we feed them into the group now.
-      for (const id of ids) {
+      for (const { id, completions } of smartAgents) {
         const record = manager.getRecordMutable(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
+        if (record) record.groupId = groupId;
+        for (const completion of completions) {
+          // Only the original completion occupies this member's group slot.
+          if (groupJoin.onAgentComplete(completion.record) === "pass") sendIndividualNudge(completion.record);
         }
       }
     } else {
       // No group formed — send individual nudges for any agents that completed
       // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecordMutable(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+      for (const { completions } of batchAgents) {
+        for (const completion of completions) sendIndividualNudge(completion.record);
       }
     }
   }
@@ -3016,8 +3039,8 @@ Terse command-style prompts produce shallow, generic work.
         });
         if (scopeVerdict.kind === "error")
           return textResult(scopeVerdict.message);
-        if (scopeVerdict.kind === "warn")
-          ctx.ui.notify(scopeVerdict.message, "warning");
+        // Standing-config warnings are emitted once by the runner after final
+        // resolution; forwarding a synthesized model would turn them into errors.
       }
 
       const thinking = resolvedConfig.thinking;
@@ -3329,7 +3352,8 @@ Terse command-style prompts produce shallow, generic work.
         // call as failed instead of returning a successful-looking text result.
         const spawnOptions: SpawnOptions = {
           description: params.description,
-          model: resolvedConfig.agentTierSelected ? undefined : model,
+          // Do not relabel an inherited/default model as an explicit override.
+          model: resolvedConfig.modelFromParams ? model : undefined,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -3375,7 +3399,7 @@ Terse command-style prompts produce shallow, generic work.
           // Foreground/no join mode or explicit async — not part of any batch
         } else {
           // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
+          currentBatchAgents.push({ id, joinMode, completions: [] });
           // Debounce: reset timer on each new agent so parallel tool calls
           // dispatched across multiple event loop ticks are captured together
           if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
@@ -3499,7 +3523,7 @@ Terse command-style prompts produce shallow, generic work.
           params.prompt,
           {
             description: params.description,
-            model: resolvedConfig.agentTierSelected ? undefined : model,
+            model: resolvedConfig.modelFromParams ? model : undefined,
             maxTurns: effectiveMaxTurns,
             isolated,
             inheritContext,
@@ -3693,7 +3717,11 @@ Terse command-style prompts produce shallow, generic work.
         // Mark result as consumed — suppresses the completion notification
         if (record.status !== "running" && record.status !== "queued") {
           record.resultConsumed = true;
-          cancelNudge(params.agent_id);
+          const completion = completionNudges.get(record);
+          if (completion && completion.record.promise === record.promise && completion.record.completedAt === record.completedAt) {
+            completion.consumed = true;
+            cancelNudge(completion.key);
+          }
         }
 
         // Verbose: include full conversation

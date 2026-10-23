@@ -56,6 +56,43 @@ interface ZonedParts {
   second: string;
 }
 
+// Bound arbitrary locale/time-zone combinations while retaining hot formatters.
+const FORMATTER_CACHE_LIMIT = 32;
+const DEFAULT_ENVIRONMENT_REFRESH_MS = 60_000;
+const formatterCache = new Map<string, Intl.DateTimeFormat>();
+let defaultEnvironment: { key: string; checkedAt: number; systemLocale: string; localTimeZone: string } | undefined;
+
+function resolveDefaultEnvironment(): StampFormatEnvironment {
+  const key = JSON.stringify([process.env.TZ, process.env.LC_ALL, process.env.LC_TIME, process.env.LANG]);
+  const now = Date.now();
+  const elapsed = defaultEnvironment ? now - defaultEnvironment.checkedAt : -1;
+  if (
+    !defaultEnvironment ||
+    defaultEnvironment.key !== key ||
+    elapsed < 0 ||
+    elapsed >= DEFAULT_ENVIRONMENT_REFRESH_MS
+  ) {
+    // OS defaults can change without a process-environment change. Probe at most
+    // once a minute; process-environment changes are observed on the next render.
+    const { locale, timeZone } = new Intl.DateTimeFormat().resolvedOptions();
+    defaultEnvironment = { key, checkedAt: now, systemLocale: locale, localTimeZone: timeZone };
+  }
+  return defaultEnvironment;
+}
+
+function cachedFormatter(locale: string | undefined, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = JSON.stringify([locale, options]);
+  let formatter = formatterCache.get(key);
+  if (formatter) formatterCache.delete(key);
+  else formatter = new Intl.DateTimeFormat(locale, options);
+  formatterCache.set(key, formatter);
+  if (formatterCache.size > FORMATTER_CACHE_LIMIT) {
+    const oldest = formatterCache.keys().next().value;
+    if (oldest !== undefined) formatterCache.delete(oldest);
+  }
+  return formatter;
+}
+
 export function canonicalizeLocale(value: string): string | undefined {
   if (value === "invariant" || value === "system") return value;
   try {
@@ -83,12 +120,17 @@ export function formatStampLabel(
 ): string | undefined {
   if (!isValidTimestamp(timestamp)) return undefined;
   try {
-    const timeZone = settings.timeZone === "local" ? environment.localTimeZone : settings.timeZone;
+    const needsDefaults =
+      (settings.timeZone === "local" && environment.localTimeZone === undefined) ||
+      (settings.locale === "system" && environment.systemLocale === undefined);
+    const defaults = needsDefaults ? resolveDefaultEnvironment() : {};
+    const timeZone =
+      settings.timeZone === "local" ? (environment.localTimeZone ?? defaults.localTimeZone) : settings.timeZone;
     const showDate = shouldShowDate(timestamp, previousTimestamp, settings.dateContext, timeZone);
     if (settings.locale === "invariant") {
       return formatInvariant(timestamp, showDate, settings, timeZone);
     }
-    const locale = settings.locale === "system" ? environment.systemLocale : settings.locale;
+    const locale = settings.locale === "system" ? (environment.systemLocale ?? defaults.systemLocale) : settings.locale;
     return formatLocalized(timestamp, showDate, settings, locale, timeZone);
   } catch {
     return undefined;
@@ -141,7 +183,7 @@ function formatLocalized(
   timeZone: string | undefined,
 ): string {
   const date = new Date(timestamp);
-  const time = new Intl.DateTimeFormat(locale, {
+  const time = cachedFormatter(locale, {
     calendar: "gregory",
     timeZone,
     hour: "2-digit",
@@ -150,7 +192,7 @@ function formatLocalized(
     hourCycle: settings.hourCycle === "24h" ? "h23" : "h12",
   }).format(date);
   if (!showDate) return time;
-  const formattedDate = new Intl.DateTimeFormat(locale, {
+  const formattedDate = cachedFormatter(locale, {
     calendar: "gregory",
     timeZone,
     dateStyle: "medium",
@@ -176,7 +218,7 @@ function dateKey(timestamp: number, timeZone: string | undefined): string {
 
 function zonedParts(timestamp: number, timeZone: string | undefined): ZonedParts {
   const values = new Map(
-    new Intl.DateTimeFormat("en-CA-u-ca-gregory-nu-latn", {
+    cachedFormatter("en-CA-u-ca-gregory-nu-latn", {
       calendar: "gregory",
       numberingSystem: "latn",
       timeZone,

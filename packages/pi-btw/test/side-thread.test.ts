@@ -43,6 +43,7 @@ import {
   buildFollowUpPrompt,
   buildSideThreadMessages,
   buildUserPrompt,
+  completeSideQuestion,
   completeSideThreadTurn,
   createSideThread,
   extractAssistantText,
@@ -197,6 +198,49 @@ async function captureOptedInRequest(sessionManager: unknown): Promise<string> {
   assert.equal(received.length, 1);
   return messageText(received[0]);
 }
+
+test("side provider identities are stable per thread, lazy for legacy literals, and independent per question", async () => {
+  const model = { provider: "test", id: "side" } as Model<Api>;
+  const ids: Array<string | undefined> = [];
+  const completeSimple = async (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+    ids.push(options?.sessionId);
+    return response("answer");
+  };
+  const first = createSideThread();
+  const second = createSideThread();
+  const legacy: SideThread = { turns: [] };
+  assert.ok(first.id);
+  assert.notEqual(first.id, second.id);
+  for (const thread of [first, first, second, legacy, legacy]) {
+    const result = await completeSideThreadTurn({
+      thread,
+      model,
+      question: "Q",
+      auth: {},
+      thinkingLevel: "off",
+      completeSimple,
+    });
+    assert.equal(result.kind, "answered");
+  }
+  assert.equal(ids[0], first.id);
+  assert.equal(ids[1], first.id);
+  assert.equal(ids[2], second.id);
+  assert.ok(legacy.id);
+  assert.equal(ids[3], legacy.id);
+  assert.equal(ids[4], legacy.id);
+  for (let i = 0; i < 2; i++) {
+    await completeSideQuestion({
+      model,
+      question: "Q",
+      conversationContext: "",
+      auth: {},
+      thinkingLevel: "off",
+      completeSimple,
+    });
+  }
+  assert.equal(new Set(ids).size, 5);
+  assert.ok(ids.every((id) => /^[0-9a-f-]{36}$/u.test(id ?? "")));
+});
 
 test("side thread shares parent history only in individually authorized requests", async () => {
   const thread = createSideThread();
@@ -935,7 +979,28 @@ test("Pi 0.99 virtual side question routes through the real registry to a faux p
     assert.equal(requests[0]?.context.messages[0]?.role, "system");
     assert.match(JSON.stringify(requests[0]?.context.messages), /Explain the side question/);
     assert.equal(requests[0]?.options?.reasoning, "low");
+    assert.ok(thread.id);
+    assert.equal(requests[0]?.options?.sessionId, thread.id);
     assert.equal(thread.turns.length, 1);
+    faux.setResponses([
+      (context, options, _state, model) => {
+        requests.push({ model, context, options });
+        return fauxAssistantMessage("follow-up answer");
+      },
+    ]);
+    const followUp = await completeSideThreadTurn({
+      thread,
+      question: "Continue the same side thread",
+      model: selected.model,
+      auth: selected.auth,
+      thinkingLevel: "high",
+      completeSimple: createModelRegistryCompleteSimple(registry),
+    });
+    assert.equal(followUp.kind, "answered");
+    assert.equal(requests[1]?.options?.sessionId, thread.id);
+    assert.equal(requests[1]?.options?.sessionId, requests[0]?.options?.sessionId);
+    assert.equal(requests[1]?.model.id, "physical");
+    assert.equal(thread.turns.length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -977,6 +1042,7 @@ test("provider bridge sends normalized prompt and tools to Pi 0.87 providers wit
   const controller = new AbortController();
   const options: SimpleStreamOptions = {
     apiKey: "resolved-key",
+    sessionId: "independent-side-thread",
     headers: { "x-auth": "resolved" },
     signal: controller.signal,
   };
@@ -1001,6 +1067,7 @@ test("provider bridge sends normalized prompt and tools to Pi 0.87 providers wit
   assert.equal(received.model, model);
   assert.equal(received.model.baseUrl, "https://resolved.example");
   assert.equal(received.options, options);
+  assert.equal(received.options?.sessionId, "independent-side-thread");
   assert.deepEqual(received.context.messages, [
     { role: "system", content: "Side instructions", toolsAdded: [tool], timestamp: 0 },
     ...context.messages,

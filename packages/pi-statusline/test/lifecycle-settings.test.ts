@@ -2,9 +2,65 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "vitest";
+import { getCapabilities } from "@earendil-works/pi-tui";
+import { test, vi } from "vitest";
 import statusline from "../src/statusline.js";
 import { createMockContext, createMockPi } from "./support.js";
+
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-tui")>();
+  return { ...actual, getCapabilities: vi.fn(() => ({ ...actual.getCapabilities(), trueColor: true })) };
+});
+
+test("live footer rereads color capability for blocks and extension separators", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-statusline-capabilities-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const capabilities = getCapabilities();
+  process.env.PI_CODING_AGENT_DIR = root;
+  let footer: ReturnType<typeof createFooter> | undefined;
+  try {
+    writeFileSync(
+      join(root, "pi-statusline.json"),
+      JSON.stringify({ palettePreset: "tokyo-night", segments: ["model"] }),
+    );
+    const mock = createMockPi();
+    statusline(mock.pi);
+    const context = createMockContext({ mode: "tui", model: { id: "model", provider: "test" } });
+    await emit(mock.events, "session_start", {}, context.ctx);
+    footer = (context.footer as FooterFactory)(
+      { requestRender() {} },
+      { fg: (_color, text) => text, bold: (text) => text },
+      {
+        getGitBranch: () => null,
+        getExtensionStatuses: () =>
+          new Map([
+            ["one", "ready"],
+            ["two", "active"],
+          ]),
+        onBranchChange: () => () => undefined,
+      },
+    );
+    const rgb = footer.render(200);
+    assert.match(rgb[0] ?? "", /38;2;/u);
+    assert.match(rgb[1] ?? "", /38;2;/u);
+    vi.mocked(getCapabilities).mockReturnValue({ ...capabilities, trueColor: false });
+    const indexed = footer.render(200);
+    assert.match(indexed[0] ?? "", /38;5;/u);
+    assert.match(indexed[1] ?? "", /38;5;/u);
+    assert.doesNotMatch(indexed.join(""), /(?:38|48);2;/u);
+    vi.mocked(getCapabilities).mockReturnValue(capabilities);
+    assert.deepEqual(footer.render(200), rgb);
+    footer.dispose();
+    assert.deepEqual(footer.render(200), []);
+    await emit(mock.events, "session_shutdown", {}, context.ctx);
+  } finally {
+    footer?.dispose();
+    vi.mocked(getCapabilities).mockReturnValue(capabilities);
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function emit(
   events: ReadonlyMap<string, Array<(...args: unknown[]) => unknown>>,

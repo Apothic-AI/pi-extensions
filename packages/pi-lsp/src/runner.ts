@@ -34,6 +34,7 @@ export async function runDiagnostics(
   statusKey: string,
   boundOutput = true,
 ) {
+  throwIfAborted(signal, adapter);
   const root = resolveRoot(params.root);
   const command = adapter.defaultCommand;
   const files = params.files ?? collectSupportedFiles(adapter, root, params.paths, params.limit ?? DEFAULT_FILE_LIMIT);
@@ -50,15 +51,18 @@ export async function runDiagnostics(
   const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
   const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
 
   let finishStatus: (() => void) | undefined;
   let operationFailed = false;
   try {
+    throwIfAborted(signal, adapter);
     finishStatus = beginStatus(ctx, statusKey, `${adapter.name} diagnostics`);
     throwIfAborted(signal, adapter);
     await client.start();
     throwIfAborted(signal, adapter);
     await client.initialize(root);
+    throwIfAborted(signal, adapter);
 
     const openedFiles: Array<{ file: string; uri: string }> = [];
     try {
@@ -77,6 +81,7 @@ export async function runDiagnostics(
           diagnostics: await client.diagnostics(uri),
         })),
       );
+      throwIfAborted(signal, adapter);
       return textResult(
         formatDiagnostics(adapter, entries),
         { root, command, files: entries, summary: summarize(entries) },
@@ -89,13 +94,14 @@ export async function runDiagnostics(
     operationFailed = true;
     throw error;
   } finally {
-    signal?.removeEventListener("abort", abort);
     try {
       await shutdownClient(client, operationFailed);
     } finally {
+      signal?.removeEventListener("abort", abort);
       releaseWhenClosed();
       finishStatus?.();
     }
+    if (!operationFailed) throwIfAborted(signal, adapter);
   }
 }
 
@@ -107,6 +113,7 @@ export async function runFix(
   ctx: StatusContext,
   statusKey: string,
 ) {
+  throwIfAborted(signal, adapter);
   const root = resolveRoot(params.root);
   const file = resolveSupportedFile(adapter, root, params.path);
   const rootStat = statSync(root);
@@ -132,15 +139,17 @@ async function runFixWindow(
   const file = params.path;
   const actionKind = params.kind?.trim() || "source.fixAll";
 
-  assertFixWorkspace(adapter, root, workspace, file);
   throwIfAborted(signal, adapter);
+  assertFixWorkspace(adapter, root, workspace, file);
   const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
   const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
 
   let finishStatus: (() => void) | undefined;
   let operationFailed = false;
   try {
+    throwIfAborted(signal, adapter);
     finishStatus = beginStatus(ctx, statusKey, `${adapter.name} fix`);
     throwIfAborted(signal, adapter);
     await client.start();
@@ -166,8 +175,11 @@ async function runFixWindow(
     let newText: string;
     try {
       const diagnostics = await client.diagnostics(uri);
+      throwIfAborted(signal, adapter);
       const actions = await client.codeActions(uri, text, diagnostics, actionKind);
+      throwIfAborted(signal, adapter);
       resolvedActions = await client.resolveActions(actions);
+      throwIfAborted(signal, adapter);
       selectedActions = selectCodeActions(resolvedActions, actionKind);
       edits = selectedActions.flatMap((action) => collectWorkspaceEdits(action.edit, uri));
       if (hasOverlappingTextEdits(text, edits)) {
@@ -202,13 +214,14 @@ async function runFixWindow(
     operationFailed = true;
     throw error;
   } finally {
-    signal?.removeEventListener("abort", abort);
     try {
       await shutdownClient(client, operationFailed);
     } finally {
+      signal?.removeEventListener("abort", abort);
       releaseWhenClosed();
       finishStatus?.();
     }
+    if (!operationFailed) throwIfAborted(signal, adapter);
   }
 }
 

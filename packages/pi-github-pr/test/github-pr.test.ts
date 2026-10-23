@@ -5,6 +5,7 @@ import { type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
+import { getCapabilities } from "@earendil-works/pi-tui";
 import { afterAll, onTestFinished, test, vi } from "vitest";
 import githubPr, {
   formatCompactStatus,
@@ -21,6 +22,25 @@ import { createMockContext, createMockPi } from "./support.js";
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, watch: vi.fn(actual.watch) };
+});
+
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-tui")>();
+  return { ...actual, getCapabilities: vi.fn(() => ({ ...actual.getCapabilities(), hyperlinks: true })) };
+});
+
+test("formatLinkedStatus reads hyperlink capability on each call", () => {
+  const status = normalizeGhPrView(samplePr);
+  const supported = getCapabilities();
+  try {
+    assert.match(formatLinkedStatus(status), /\]8;;/u);
+    vi.mocked(getCapabilities).mockReturnValue({ ...supported, hyperlinks: false });
+    assert.equal(formatLinkedStatus(status), formatCompactStatus(status));
+    vi.mocked(getCapabilities).mockReturnValue(supported);
+    assert.match(formatLinkedStatus(status), /\]8;;/u);
+  } finally {
+    vi.mocked(getCapabilities).mockReturnValue(supported);
+  }
 });
 
 type ExecOptions = { cwd?: string; signal?: AbortSignal; timeout?: number };

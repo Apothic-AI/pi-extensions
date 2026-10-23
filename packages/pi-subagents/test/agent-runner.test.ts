@@ -1203,7 +1203,8 @@ function makeAgentConfig(overrides: Record<string, unknown> = {}) {
     promptMode: "replace" as const,
     inheritContext: false,
     runInBackground: false,
-    isolated: false,
+    // Omitted frontmatter allows per-run isolation; explicit false is policy.
+    isolated: undefined,
     ...overrides,
   };
 }

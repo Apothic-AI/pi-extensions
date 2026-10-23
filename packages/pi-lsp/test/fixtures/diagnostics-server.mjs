@@ -91,7 +91,8 @@ function handle(message) {
           scenario === "pull-strict-optional-params" ||
           scenario === "pull-empty-then-push" ||
           scenario === "pull-empty-after-push" ||
-          scenario === "pull-empty-only"
+          scenario === "pull-empty-only" ||
+          scenario === "pull-alternate-uri"
             ? {
                 diagnosticProvider: {
                   interFileDependencies: false,
@@ -113,6 +114,13 @@ function handle(message) {
     openedUris.push(uri);
     if (scenario === "diagnostic-once") {
       if (firstDiagnosticsRun) publish(uri, [diagnostic("old server diagnostic")]);
+      return;
+    }
+    if (scenario === "push-alternate-uri" || scenario === "pull-alternate-uri") {
+      const alternate = uri
+        .replace(/^file:\/\/\/([A-Za-z]):\//, (_match, drive) => `file:///${drive.toLowerCase()}%3A/`)
+        .replace(/-/g, "%2D");
+      publish(alternate, [diagnostic("alternate uri diagnostic")]);
       return;
     }
     if (scenario !== "push-silent" && scenario !== "push-silent-then-diagnostic") {
@@ -157,7 +165,10 @@ function handle(message) {
       return;
     }
     send(
-      scenario === "pull-empty-then-push" || scenario === "pull-empty-after-push" || scenario === "pull-empty-only"
+      scenario === "pull-empty-then-push" ||
+        scenario === "pull-empty-after-push" ||
+        scenario === "pull-empty-only" ||
+        scenario === "pull-alternate-uri"
         ? { jsonrpc: "2.0", id: message.id, result: { kind: "full", items: [] } }
         : {
             jsonrpc: "2.0",

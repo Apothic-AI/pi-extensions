@@ -280,7 +280,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         // source as "call" — which turns a scopeModels warning into a refusal
         // and blames the caller for a choice the agent file made.
         agentTier: invocation.requestedAgentTier,
-        model: invocation.agentTierSelected ? undefined : model,
+        // Inheritance is resolved by the runner, not an explicit model override.
+        model: invocation.modelFromParams ? model : undefined,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
