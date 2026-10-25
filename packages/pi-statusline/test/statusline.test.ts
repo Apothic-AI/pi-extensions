@@ -223,6 +223,7 @@ test("long idle periods and no-usage presets avoid full history copies without l
         return entries;
       },
       getLeafId: () => entries.at(-1)?.id ?? null,
+      getBranch: () => entries,
     },
   });
   const footerData = {
@@ -360,6 +361,7 @@ test("idle standalone usage updates the footer once across tree navigation and s
       mode: "tui",
       sessionManager: {
         getEntries: () => [{ ...warm, usage: { ...warm.usage, input: 7 } }],
+        getBranch: () => [],
         getLeafId: () => warm.id,
       },
     });

@@ -3,6 +3,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { getCapabilities, type TUI } from "@earendil-works/pi-tui";
 import { type CommandOwner, isOwnerCurrent } from "./command-owner.js";
 import { registerStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
+import { ContextConfidence } from "./context-confidence.js";
 import {
   buildExtensionStatusIconAliases,
   type ExtensionStatusIconAliasMap,
@@ -36,6 +37,10 @@ export default function statusline(pi: ExtensionAPI) {
   let activeTerminal: TerminalLifetime | undefined;
   let observedUsageLeafId: string | null = null;
   const footerUsage = new FooterUsageAccumulator();
+  const contextConfidence = new ContextConfidence();
+  let confidenceBranch: string[] = [];
+  let confidenceLeaf: string | null = null;
+  let confidenceBranchRetired = false;
   const runtime: RuntimeState = {
     turnCount: 0,
     activeTools: new Map(),
@@ -87,6 +92,37 @@ export default function statusline(pi: ExtensionAPI) {
   const ownsRuntime = (ctx: ExtensionContext) => {
     try {
       return ctx.sessionManager === activeSessionManager;
+    } catch {
+      return false;
+    }
+  };
+
+  const syncContextConfidence = () => {
+    runtime.contextUsageUnknown = contextConfidence.unknown;
+  };
+  const ownsContextConfidence = (ctx: ExtensionContext) => {
+    if (!ownsRuntime(ctx) || confidenceBranchRetired) return false;
+    try {
+      if (ctx.mode !== "tui" || !ctx.hasUI || ctx.ui !== activeGitStatusTarget?.ui) return false;
+      if (!isActiveGitStatusTarget(ctx.cwd, sessionGeneration)) return false;
+      const leaf = ctx.sessionManager.getLeafId();
+      if (leaf !== confidenceLeaf) {
+        // Navigation can replace the branch before session_tree is dispatched.
+        // Check only at evidence events after a leaf change, never while rendering.
+        const branch = ctx.sessionManager.getBranch().map((entry) => entry.id);
+        if (confidenceBranch.some((id, index) => branch[index] !== id)) {
+          confidenceBranchRetired = true;
+          contextConfidence.invalidate();
+          syncContextConfidence();
+          refresh();
+          return false;
+        }
+        confidenceBranch = branch;
+        confidenceLeaf = leaf;
+      }
+      contextConfidence.selectModel(ctx.model);
+      syncContextConfidence();
+      return true;
     } catch {
       return false;
     }
@@ -226,6 +262,12 @@ export default function statusline(pi: ExtensionAPI) {
     if (ctx.mode !== "tui" || !ctx.hasUI) return;
     const cwd = ctx.cwd;
     rebuildFooterUsage(ctx);
+    const branch = ctx.sessionManager.getBranch();
+    contextConfidence.rebuild(branch, ctx.model);
+    confidenceBranch = branch.map((entry) => entry.id);
+    confidenceLeaf = ctx.sessionManager.getLeafId();
+    confidenceBranchRetired = false;
+    syncContextConfidence();
     runtime.homeDir = homedir();
     previewPalettePreset = undefined;
     abortGitStatusRefresh("Statusline session context replaced");
@@ -439,13 +481,23 @@ export default function statusline(pi: ExtensionAPI) {
   pi.on("session_before_fork", () => closeCommandsBeforeNavigation());
 
   pi.on("session_tree", (_event, ctx) => {
+    if (!ownsRuntime(ctx)) return;
     installFooter(ctx);
     refresh();
   });
 
   pi.on("session_compact", (_event, ctx) => {
-    if (!ownsRuntime(ctx)) return;
+    if (!ownsContextConfidence(ctx)) return;
+    contextConfidence.invalidate();
+    syncContextConfidence();
     rebuildFooterUsage(ctx);
+    refresh();
+  });
+
+  pi.on("session_compact_failed", (_event, ctx) => {
+    if (!ownsContextConfidence(ctx)) return;
+    contextConfidence.invalidate();
+    syncContextConfidence();
     refresh();
   });
 
@@ -477,7 +529,10 @@ export default function statusline(pi: ExtensionAPI) {
     runtime.requestRender = undefined;
   });
 
-  pi.on("model_select", () => refresh());
+  pi.on("model_select", (_event, ctx) => {
+    if (!ownsContextConfidence(ctx)) return;
+    refresh();
+  });
 
   pi.on("thinking_level_select", (event) => {
     runtime.thinkingLevel = event.level;
@@ -525,8 +580,17 @@ export default function statusline(pi: ExtensionAPI) {
     refresh();
   });
 
+  pi.on("message_start", (event, ctx) => {
+    if (!ownsContextConfidence(ctx)) return;
+    contextConfidence.start(event.message);
+  });
+
   pi.on("message_end", (event, ctx) => {
     if (!ownsRuntime(ctx)) return;
+    if (ownsContextConfidence(ctx)) {
+      contextConfidence.finish(event.message);
+      syncContextConfidence();
+    }
     updateFooterUsage(event.message);
     refresh();
   });

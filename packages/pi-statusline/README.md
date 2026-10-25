@@ -98,7 +98,15 @@ Model ids, provider ids, active tool names, directory names, and Git branch name
 
 ## Lifecycle behavior
 
-The footer is installed only for TUI sessions. Git status is collected asynchronously and cached outside rendering, with stale cwd/branch results discarded. Usage totals are maintained by a runtime-owned incremental snapshot: rendering does not rescan session history; session replacement, branch/compaction boundaries rebuild it and message/turn events update it. Standalone usage entries (including cache warming) count toward historical tokens, cache, and cost. When tokens, cache, or cost is configured, the footer checks the session leaf every five seconds (including while idle), copying history only after the leaf changes and inspecting only entries appended since its last check. Presets without those segments skip the usage check. Context percentage still comes from `ctx.getContextUsage()`. Footer timers, branch listeners, pending Git work, command menus, and session ownership are cleaned up on footer disposal, session replacement, compaction, and shutdown. Context usage refreshes after `session_compact`.
+The footer is installed only for TUI sessions. Git status is collected asynchronously and cached outside rendering, with stale cwd/branch results discarded. Usage totals are maintained by a runtime-owned incremental snapshot: rendering does not rescan session history; session replacement, branch/compaction boundaries rebuild it and message/turn events update it. Standalone usage entries (including cache warming) count toward historical tokens, cache, and cost. When tokens, cache, or cost is configured, the footer checks the session leaf every five seconds (including while idle), copying history only after the leaf changes and inspecting only entries appended since its last check. Presets without those segments skip the usage check. Context percentage comes from `ctx.getContextUsage()`, subject to the display-confidence guard below. Footer timers, branch listeners, pending Git work, command menus, and session ownership are cleaned up on footer disposal, session replacement, compaction, and shutdown. Context usage refreshes after compaction events.
+
+### Context display confidence
+
+After an observed failed or aborted assistant response, or failed/cancelled compaction, the footer shows `ctx ?` instead of a potentially misleading percentage (optional powerline palettes retain their existing `?/window` form). Successful compaction also leaves context unknown until a fresh response establishes usage. Starting/ending/settling an agent run, queued/custom notifications, zero-usage responses, and standalone cache-warming usage do not restore confidence. Restoration requires a new successful, non-aborted/non-error assistant response with finite positive provider token usage for the current provider/API/model route; the normal public API percentage and colors then return unchanged. Model changes require fresh evidence rather than reusing the previous route's trust. Invalid/nonfinite percentages display as unknown; valid overflow percentages are never clamped.
+
+Confidence is rebuilt from the active session branch at startup/resume/reload and tree navigation, including raw failed assistant attempts even when excluded from model context. A later successful response can restore confidence, but a later compaction makes it unknown again. Abandoned branches do not supply confidence. Hosts/history fixtures without failure evidence keep the existing public API behavior. Rendering reads this event-maintained state without rescanning history.
+
+This is a truthful-display guard, not repaired token accounting: it does not reconstruct tokens, replace Pi's estimator, or repair upstream overflow recovery or compaction cancellation. An unknown display does not imply that compaction succeeded or that the next request will fit.
 
 Retained footer callbacks also check the live mode and UI eligibility before work: a headless rebind retires both clocks, branch subscriptions, and pending Git requests even while an earlier session handler is awaited. This resource-only cleanup neither clears a replacement footer nor renders or emits status/settings notifications through the retained UI.
 
@@ -114,6 +122,7 @@ packages/pi-statusline/
 │   ├── status-inspector.ts    # owned, read-only status navigation
 │   ├── status-actions.ts      # bounded owner-detail protocol consumer
 │   ├── render.ts              # data-to-segment projection
+│   ├── context-confidence.ts  # branch/model-owned context display confidence
 │   ├── powerline.ts           # restrained text and optional powerline renderers
 │   ├── settings.ts            # canonical/legacy loading and atomic saves
 │   ├── git-status.ts          # argv-based asynchronous Git status
@@ -127,7 +136,7 @@ packages/pi-statusline/
 
 ## Local divergence
 
-Signalridge maintains the modular port, canonical/legacy settings behavior, session-safe refresh cleanup, and the restrained text-first default appearance described above.
+Signalridge maintains the modular port, canonical/legacy settings behavior, session-safe refresh cleanup, context display-confidence guard, and the restrained text-first default appearance described above.
 
 ## License
 

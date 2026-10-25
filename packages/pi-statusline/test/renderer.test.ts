@@ -137,6 +137,65 @@ test("idle contextual activity rows collapse while explicit empty rows remain", 
   assert.deepEqual(explicitEmptyRows.split("\n"), ["", "sonnet-4", ""]);
 });
 
+test("context confidence preserves unknown forms, valid API percentages and colors across palettes", () => {
+  const footerData = {
+    getGitBranch: () => null,
+    getExtensionStatuses: () => new Map<string, string>(),
+    onBranchChange: () => () => undefined,
+    getAvailableProviderCount: () => 1,
+  };
+  const runtime: RuntimeState = {
+    turnCount: 0,
+    activeTools: new Map(),
+    isStreaming: false,
+    thinkingLevel: "off",
+    duplicateExtensions: [],
+    extensionStatusIconAliases: new Map(),
+  };
+  const colors: string[] = [];
+  const theme = {
+    fg: (color: string, text: string) => {
+      colors.push(color);
+      return text;
+    },
+    bold: (text: string) => text,
+  } as Theme;
+  let percent: unknown = 100.6;
+  const context = createMockContext({
+    getContextUsage: () => ({ percent, contextWindow: 921_000 }),
+  });
+  for (const palettePreset of [
+    "classic",
+    "tokyo-night",
+    "ocean",
+    "sunset",
+    "forest",
+    "candy",
+    "neon",
+    "mono",
+    "custom",
+  ] as const) {
+    const config = createDefaultConfig();
+    config.palettePreset = palettePreset;
+    config.segments = ["context"];
+    const render = () => plain(renderStatusline(200, context.ctx, footerData, theme, config, runtime));
+    const unknown = palettePreset === "classic" ? "ctx ?" : "?/921k";
+    runtime.contextUsageUnknown = true;
+    assert.ok(render().includes(unknown));
+    runtime.contextUsageUnknown = false;
+    for (const invalid of [null, undefined, Number.NaN, Infinity, -Infinity, -1, "44"]) {
+      percent = invalid;
+      assert.ok(render().includes(unknown), `${palettePreset}: ${String(invalid)}`);
+    }
+    percent = 100.6;
+    assert.ok(render().includes(palettePreset === "classic" ? "101%" : "100.6%"));
+    if (palettePreset === "classic") assert.ok(colors.includes("error"));
+    percent = 71.25;
+    assert.ok(render().includes(palettePreset === "classic" ? "71%" : "71.3%"));
+    if (palettePreset === "classic") assert.ok(colors.includes("warning"));
+  }
+});
+
 test("cwd uses Starship repository and three-component directory defaults", () => {
   const config = createDefaultConfig();
   config.segments = ["cwd"];

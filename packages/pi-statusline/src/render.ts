@@ -31,6 +31,7 @@ export interface RuntimeState extends ExtensionStatusRuntime {
   gitStatus?: GitStatusSummary;
   requestRender?: () => void;
   footerUsage?: FooterUsageSummary;
+  contextUsageUnknown?: boolean;
 }
 const GITHUB_PR_KEY = "github-pr";
 const GITHUB_PR_STATUS_KEYS = new Set([GITHUB_PR_KEY]);
@@ -148,15 +149,22 @@ function buildSegment(
     }
     case "context": {
       const usage = ctx.getContextUsage();
+      const percent =
+        !runtime.contextUsageUnknown &&
+        typeof usage?.percent === "number" &&
+        Number.isFinite(usage.percent) &&
+        usage.percent >= 0
+          ? usage.percent
+          : undefined;
       const percentage =
-        usage?.percent === null || usage?.percent === undefined
+        percent === undefined
           ? "?"
           : config.palettePreset === "classic"
-            ? `${Math.round(usage.percent)}%`
-            : `${usage.percent.toFixed(1)}%`;
+            ? `${Math.round(percent)}%`
+            : `${percent.toFixed(1)}%`;
       const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
       const value = config.palettePreset === "classic" ? percentage : `${percentage}/${formatCount(contextWindow)}`;
-      return segment(name, value, config, contextColor(usage?.percent), "runtime");
+      return segment(name, value, config, contextColor(percent), "runtime");
     }
     case "tokens": {
       const value =
@@ -240,7 +248,7 @@ function thinkingColor(level: ThinkingLevel): ThemeColor {
 }
 
 export function contextColor(percent: number | null | undefined): ThemeColor {
-  if (percent === null || percent === undefined) return "dim";
+  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0) return "dim";
   if (percent >= 90) return "error";
   if (percent >= 70) return "warning";
   return "muted";
