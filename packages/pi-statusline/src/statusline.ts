@@ -3,7 +3,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { getCapabilities, type TUI } from "@earendil-works/pi-tui";
 import { type CommandOwner, isOwnerCurrent } from "./command-owner.js";
 import { registerStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
-import { ContextConfidence } from "./context-confidence.js";
+import { CONTEXT_CONFIDENCE_ENTRY, CONTEXT_CONFIDENCE_UNKNOWN, ContextConfidence } from "./context-confidence.js";
 import {
   buildExtensionStatusIconAliases,
   type ExtensionStatusIconAliasMap,
@@ -38,7 +38,6 @@ export default function statusline(pi: ExtensionAPI) {
   let observedUsageLeafId: string | null = null;
   const footerUsage = new FooterUsageAccumulator();
   const contextConfidence = new ContextConfidence();
-  let confidenceBranch: string[] = [];
   let confidenceLeaf: string | null = null;
   let confidenceBranchRetired = false;
   const runtime: RuntimeState = {
@@ -100,6 +99,13 @@ export default function statusline(pi: ExtensionAPI) {
   const syncContextConfidence = () => {
     runtime.contextUsageUnknown = contextConfidence.unknown;
   };
+  const retireContextConfidence = () => {
+    confidenceBranchRetired = true;
+    contextConfidence.invalidate();
+    syncContextConfidence();
+    refresh();
+    return false;
+  };
   const ownsContextConfidence = (ctx: ExtensionContext) => {
     if (!ownsRuntime(ctx) || confidenceBranchRetired) return false;
     try {
@@ -108,23 +114,25 @@ export default function statusline(pi: ExtensionAPI) {
       const leaf = ctx.sessionManager.getLeafId();
       if (leaf !== confidenceLeaf) {
         // Navigation can replace the branch before session_tree is dispatched.
-        // Check only at evidence events after a leaf change, never while rendering.
-        const branch = ctx.sessionManager.getBranch().map((entry) => entry.id);
-        if (confidenceBranch.some((id, index) => branch[index] !== id)) {
-          confidenceBranchRetired = true;
-          contextConfidence.invalidate();
-          syncContextConfidence();
-          refresh();
-          return false;
+        // Walk only the new suffix, never rescan the full branch or render history.
+        let ancestor = leaf;
+        const visited = new Set<string>();
+        while (ancestor !== confidenceLeaf) {
+          if (ancestor === null || visited.has(ancestor)) return retireContextConfidence();
+          visited.add(ancestor);
+          const entry = ctx.sessionManager.getEntry(ancestor);
+          if (!entry || entry.id !== ancestor || (entry.parentId !== null && typeof entry.parentId !== "string")) {
+            return retireContextConfidence();
+          }
+          ancestor = entry.parentId;
         }
-        confidenceBranch = branch;
         confidenceLeaf = leaf;
       }
       contextConfidence.selectModel(ctx.model);
       syncContextConfidence();
       return true;
     } catch {
-      return false;
+      return retireContextConfidence();
     }
   };
 
@@ -264,7 +272,6 @@ export default function statusline(pi: ExtensionAPI) {
     rebuildFooterUsage(ctx);
     const branch = ctx.sessionManager.getBranch();
     contextConfidence.rebuild(branch, ctx.model);
-    confidenceBranch = branch.map((entry) => entry.id);
     confidenceLeaf = ctx.sessionManager.getLeafId();
     confidenceBranchRetired = false;
     syncContextConfidence();
@@ -498,7 +505,13 @@ export default function statusline(pi: ExtensionAPI) {
     if (!ownsContextConfidence(ctx)) return;
     contextConfidence.invalidate();
     syncContextConfidence();
-    refresh();
+    // Pi does not persist this event. Journal only our display latch, not the
+    // provider error or token history, on the currently owned session branch.
+    try {
+      pi.appendEntry(CONTEXT_CONFIDENCE_ENTRY, CONTEXT_CONFIDENCE_UNKNOWN);
+    } finally {
+      refresh();
+    }
   });
 
   pi.on("session_shutdown", (event, ctx) => {
@@ -581,13 +594,13 @@ export default function statusline(pi: ExtensionAPI) {
   });
 
   pi.on("message_start", (event, ctx) => {
-    if (!ownsContextConfidence(ctx)) return;
+    if (event.message.role !== "assistant" || !ownsContextConfidence(ctx)) return;
     contextConfidence.start(event.message);
   });
 
   pi.on("message_end", (event, ctx) => {
     if (!ownsRuntime(ctx)) return;
-    if (ownsContextConfidence(ctx)) {
+    if (event.message.role === "assistant" && ownsContextConfidence(ctx)) {
       contextConfidence.finish(event.message);
       syncContextConfidence();
     }

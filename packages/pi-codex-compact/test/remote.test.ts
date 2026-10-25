@@ -14,6 +14,14 @@ import { type CompactionFailureCode, failureFrom, formatCompactionFailure } from
 import { MAX_SSE_BYTES } from "../src/protocol.js";
 import { contextForProvider, requestRemoteCompaction } from "../src/remote.js";
 
+const credentials = {
+  apiKey: "secret-api-key",
+  headers: { Authorization: "Bearer secret-header-token", "X-Provider-Token": "secret-provider-token" },
+  env: { CODEX_SECRET: "secret-env-token" },
+};
+const secrets = [credentials.apiKey, ...Object.values(credentials.headers), ...Object.values(credentials.env)];
+const credentialEcho = JSON.stringify(credentials);
+
 const model = {
   id: "gpt-5.6",
   name: "GPT-5.6",
@@ -686,6 +694,309 @@ test("real Codex and inspector finish at response.completed without EOF and canc
   assert.equal(controller.signal.aborted, false);
 }, 2000);
 
+for (const type of ["response.completed", "response.done"]) {
+  for (const chunkSize of [1, 7, 4096]) {
+    for (const open of [false, true]) {
+      test(`real Codex accepts fully CRLF ${type}, fragmented every ${chunkSize} bytes (${open ? "open" : "closed"})`, async () => {
+        const item = { type: "compaction", encrypted_content: "opaque-λ" };
+        const bytes = new TextEncoder().encode(
+          [
+            { type: "response.created", response: { id: "offline" } },
+            { type: "response.output_item.done", item },
+            { type, response: { status: "completed", output: [item, item] } },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`)
+            .join(""),
+        );
+        const cancelled = Promise.withResolvers<void>();
+        let cancellations = 0;
+        const result = await realRequest(
+          new AbortController().signal,
+          async () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(source) {
+                  for (let i = 0; i < bytes.length; i += chunkSize) source.enqueue(bytes.slice(i, i + chunkSize));
+                  if (!open) source.close();
+                },
+                cancel() {
+                  cancellations++;
+                  cancelled.resolve();
+                },
+              }),
+              { headers: { "content-type": "text/event-stream", "content-length": String(bytes.length) } },
+            ),
+          500,
+        );
+        assert.deepEqual(result.item, item);
+        if (open) await cancelled.promise;
+        assert.equal(cancellations, open ? 1 : 0);
+      }, 1500);
+    }
+  }
+  test(`real Codex accepts closed LF ${type} with deduplicated output`, async () => {
+    const item = { type: "compaction", encrypted_content: "opaque" };
+    const result = await realRequest(
+      new AbortController().signal,
+      async () =>
+        new Response(
+          [
+            { type: "response.output_item.done", item },
+            { type, response: { status: "completed", output: [item, item] } },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        ),
+      500,
+    );
+    assert.deepEqual(result.item, item);
+  });
+}
+
+for (const type of ["response.completed", "response.done", "response.incomplete", "response.cancelled"]) {
+  for (const open of [false, true]) {
+    test(`real Codex rejects ${type} incomplete status (${open ? "open" : "closed"}) and cancels promptly`, async () => {
+      const cancelled = Promise.withResolvers<void>();
+      let cancellations = 0;
+      await assert.rejects(
+        realRequest(
+          new AbortController().signal,
+          async () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(source) {
+                  source.enqueue(
+                    new TextEncoder().encode(
+                      `data: ${JSON.stringify({ type, response: { status: "incomplete", output: [{ type: "compaction", encrypted_content: "opaque" }] } })}\n\n`,
+                    ),
+                  );
+                  if (!open) source.close();
+                },
+                cancel() {
+                  cancellations++;
+                  cancelled.resolve();
+                },
+              }),
+            ),
+          250,
+        ),
+        (error) => assertSafeError(error, false, "remote_provider_error"),
+      );
+      if (open) await cancelled.promise;
+      assert.equal(cancellations, open ? 1 : 0);
+    }, 1500);
+  }
+}
+
+for (const code of ["context_window_exceeded", "context_length_exceeded"]) {
+  for (const event of [
+    { type: "error", code, message: credentialEcho },
+    { type: "error", error: { code, message: credentialEcho } },
+    { type: "response.failed", response: { error: { code, message: credentialEcho } } },
+  ]) {
+    test(`real Codex preserves the closed context diagnostic from ${JSON.stringify(event).slice(0, 90)}`, async () => {
+      let cancellations = 0;
+      await assert.rejects(
+        realRequest(
+          new AbortController().signal,
+          async () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(source) {
+                  source.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+                },
+                cancel() {
+                  cancellations++;
+                },
+              }),
+            ),
+          500,
+        ),
+        (error) => {
+          assertSafeError(error);
+          assert.equal(failureFrom(error, "local_compaction_failed").code, "remote_context_window_exceeded");
+          return true;
+        },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.equal(cancellations, 1);
+    });
+  }
+}
+
+for (const event of [
+  { type: "error", code: credentialEcho, message: "context_window_exceeded" },
+  { type: "error", code: "context_window_exceeded secret-api-key" },
+  { type: "error", code: "CONTEXT_WINDOW_EXCEEDED" },
+  { type: "error", code: { code: "context_window_exceeded" } },
+  { type: "error", code: ["context_window_exceeded"] },
+  { type: "error", response: { error: { code: "context_window_exceeded" } } },
+  { type: "response.failed", code: "context_window_exceeded", error: { code: "context_length_exceeded" } },
+  { type: "response.failed", response: { error: { code: credentialEcho, message: "context_window_exceeded" } } },
+]) {
+  test(`unknown, malformed, or misplaced wire codes remain generic: ${JSON.stringify(event).slice(0, 90)}`, async () => {
+    await assert.rejects(
+      realRequest(new AbortController().signal, async () => new Response(`data: ${JSON.stringify(event)}\n\n`), 500),
+      (error) => assertSafeError(error, false, "remote_provider_error"),
+    );
+  });
+}
+
+test("the SSE limit counts original CRLF bytes, not the shorter provider branch", async () => {
+  const terminal = `\r\n\r\ndata: ${JSON.stringify({ type: "response.completed", response: { output: [{ type: "compaction", encrypted_content: "opaque" }] } })}\r\n\r\n`;
+  const body = `:${"x".repeat(MAX_SSE_BYTES - Buffer.byteLength(terminal))}${terminal}`;
+  assert.equal(Buffer.byteLength(body), MAX_SSE_BYTES + 1);
+  assert.ok(Buffer.byteLength(body.replaceAll("\r\n", "\n")) <= MAX_SSE_BYTES);
+  let cancellations = 0;
+  await assert.rejects(
+    realRequest(
+      new AbortController().signal,
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(source) {
+              source.enqueue(new TextEncoder().encode(body));
+            },
+            cancel() {
+              cancellations++;
+            },
+          }),
+        ),
+      2000,
+    ),
+    (error) => assertSafeError(error, false, "remote_response_invalid"),
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(cancellations, 1);
+}, 3000);
+
+for (const status of [200, 429]) {
+  test(`provider branch handles CRs and content-length deliberately (HTTP ${status})`, async () => {
+    const originalBody = `: bare\rCR\r\r\n\r\n${await responseSse().text()}\r`;
+    let observed = false;
+    const original = fakeProvider(() => undefined);
+    const provider: Provider = {
+      ...original,
+      stream(requestModel, context, options) {
+        return original.stream(requestModel, context, {
+          ...options,
+          fetch: async (input, init) => {
+            const response = await options?.fetch?.(input, init);
+            assert.ok(response);
+            const text = await response.text();
+            assert.equal(text, status === 200 ? originalBody.replaceAll("\r\n", "\n") : originalBody);
+            assert.equal(
+              response.headers.get("content-length"),
+              status === 200 ? null : String(Buffer.byteLength(originalBody)),
+            );
+            observed = true;
+            return new Response(text, { status });
+          },
+        });
+      },
+    };
+    const pending = requestRemoteCompaction({
+      provider,
+      model,
+      context: { messages: [] },
+      signal: new AbortController().signal,
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(source) {
+              for (const byte of new TextEncoder().encode(originalBody)) source.enqueue(new Uint8Array([byte]));
+              source.close();
+            },
+          }),
+          { status, headers: { "content-length": String(Buffer.byteLength(originalBody)) } },
+        ),
+    });
+    if (status === 200) assert.equal((await pending).item.encrypted_content, "opaque");
+    else await assert.rejects(pending, (error) => assertSafeError(error, false, "remote_http_error"));
+    assert.equal(observed, true);
+  });
+}
+
+for (const outcome of ["caller abort", "retired owner"]) {
+  for (const event of [{ type: "error", code: "context_window_exceeded" }, { type: "response.incomplete" }]) {
+    test(`${outcome} wins over ${event.type} inspection failure`, async () => {
+      const caller = new AbortController();
+      let current = true;
+      let cancellations = 0;
+      await assert.rejects(
+        requestRemoteCompaction({
+          provider: openaiCodexProvider(),
+          model,
+          context: { messages: [] },
+          apiKey: codexApiKey,
+          signal: caller.signal,
+          isCurrent: () => current,
+          requestTimeoutMs: 500,
+          maxRetries: 0,
+          fetch: async (_input, init) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                if (outcome === "caller abort") caller.abort(new Error(credentialEcho));
+                else current = false;
+              },
+              { once: true },
+            );
+            return new Response(
+              new ReadableStream({
+                start(source) {
+                  source.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+                },
+                cancel() {
+                  cancellations++;
+                },
+              }),
+            );
+          },
+        }),
+        (error) => assertSafeError(error, true),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.equal(cancellations, 1);
+    });
+  }
+}
+
+test("arbitrary thrown code/error/response/message getters never become wire diagnostics", async () => {
+  let reads = 0;
+  const raw = Object.defineProperties(
+    {},
+    Object.fromEntries(
+      ["code", "error", "response", "message", "cause", "status"].map((key) => [
+        key,
+        {
+          get() {
+            reads++;
+            throw new Error(credentialEcho);
+          },
+        },
+      ]),
+    ),
+  );
+  const provider = {
+    ...fakeProvider(() => undefined),
+    stream() {
+      throw raw;
+    },
+  };
+  await assert.rejects(
+    requestRemoteCompaction({
+      provider,
+      model,
+      context: { messages: [] },
+      signal: new AbortController().signal,
+      fetch: async () => assert.fail("no fetch"),
+    }),
+    (error) => assertSafeError(error, false, "remote_provider_error"),
+  );
+  assert.equal(reads, 0);
+});
+
 test("the extension deadline also bounds an injected fetch that ignores abort entirely", async () => {
   let fetchSignal: AbortSignal | undefined;
   const started = Date.now();
@@ -726,6 +1037,101 @@ for (const status of [200, 400]) {
     assert.equal(cancellations, 1);
   }, 2000);
 }
+
+test("owned deadline wins before a queued structured context-window SSE failure is inspected", async () => {
+  vi.useFakeTimers();
+  const caller = new AbortController();
+  const readQueued = Promise.withResolvers<void>();
+  const releaseRead = Promise.withResolvers<void>();
+  const readReleased = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  let teeBranches: [ReadableStream<Uint8Array>, ReadableStream<Uint8Array>] | undefined;
+  let fetchSignal: AbortSignal | undefined;
+  let cancellations = 0;
+  let failure: unknown;
+  const tee = ReadableStream.prototype.tee;
+  const teeSpy = vi.spyOn(ReadableStream.prototype, "tee").mockImplementation(function (
+    this: ReadableStream<Uint8Array>,
+  ) {
+    const branches = tee.call(this);
+    teeBranches = branches;
+    const inspectionReader = branches[1].getReader();
+    const read = inspectionReader.read.bind(inspectionReader);
+    // Hold an already queued read across the deadline. Unlike a sleep, this
+    // deterministically makes structured SSE inspection lose the terminal race
+    // even when the source/tee cancellation is still completing.
+    vi.spyOn(inspectionReader, "read").mockImplementationOnce(async () => {
+      const result = await read();
+      readQueued.resolve();
+      await releaseRead.promise;
+      readReleased.resolve();
+      return result;
+    });
+    vi.spyOn(branches[1], "getReader").mockReturnValueOnce(inspectionReader);
+    return branches;
+  });
+  try {
+    const pending = realRequest(
+      caller.signal,
+      async (_input, init) => {
+        fetchSignal = init?.signal ?? undefined;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              source = controller;
+            },
+            cancel() {
+              cancellations++;
+              cancelled.resolve();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+      1000,
+    );
+    const rejected = assert.rejects(pending, (error) => {
+      failure = error;
+      return assertSafeError(error, false, "remote_timeout");
+    });
+    // Wait for stream setup without advancing the owned deadline.
+    await vi.advanceTimersByTimeAsync(0);
+    assert.ok(source);
+    source.enqueue(
+      new TextEncoder().encode(
+        `data: ${JSON.stringify({ type: "response.failed", response: { error: { code: "context_window_exceeded", message: credentialEcho } } })}\n\n`,
+      ),
+    );
+    await readQueued.promise;
+    vi.advanceTimersByTime(1000);
+    assert.equal(fetchSignal?.aborted, true, "the owned deadline fires before releasing the inspection");
+    releaseRead.resolve();
+    await readReleased.promise;
+    await rejected;
+    await cancelled.promise;
+    await vi.runAllTimersAsync();
+    assertSafeError(failure, false, "remote_timeout");
+    assert.equal(cancellations, 1, "abort cleans up the source exactly once");
+    assert.ok(teeBranches);
+    for (const branch of teeBranches) {
+      assert.equal(branch.locked, false, "both tee consumers release their readers");
+      const reader = branch.getReader();
+      try {
+        assert.deepEqual(await reader.read(), { done: true, value: undefined }, "both tee branches are cancelled");
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    assert.equal(caller.signal.aborted, false, "internal deadline must not acquire caller cancellation");
+    assert.equal(vi.getTimerCount(), 0, "deadline/provider timers are released");
+  } finally {
+    releaseRead.resolve();
+    caller.abort();
+    teeSpy.mockRestore();
+    vi.useRealTimers();
+  }
+}, 2000);
 
 test("external abort cancels an injected stalled body and clears deadline/listener ownership", async () => {
   const controller = new AbortController();
@@ -770,14 +1176,6 @@ test("external abort cancels an injected stalled body and clears deadline/listen
     clearTimer.mockRestore();
   }
 }, 2000);
-
-const credentials = {
-  apiKey: "secret-api-key",
-  headers: { Authorization: "Bearer secret-header-token", "X-Provider-Token": "secret-provider-token" },
-  env: { CODEX_SECRET: "secret-env-token" },
-};
-const secrets = [credentials.apiKey, ...Object.values(credentials.headers), ...Object.values(credentials.env)];
-const credentialEcho = JSON.stringify(credentials);
 
 function assertSafeError(error: unknown, aborted = false, expectedCode?: CompactionFailureCode): boolean {
   assert.ok(error instanceof Error);

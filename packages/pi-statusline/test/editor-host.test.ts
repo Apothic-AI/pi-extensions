@@ -8,6 +8,7 @@ import {
   InteractiveMode,
   initTheme,
   SessionManager,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
@@ -37,6 +38,7 @@ function createKeys(bindings?: KeybindingsConfig) {
 
 // Exercise Pi's real custom-dialog mounting, closing and draft restoration.
 function createEditorHost(keys = createKeys()) {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   const editor = {
     text: "original draft",
     focused: true,
@@ -70,6 +72,8 @@ function createEditorHost(keys = createKeys()) {
     editorContainer,
     ui,
     keybindings: keys,
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   const custom: ExtensionCommandContext["ui"]["custom"] = (factory, options) =>
     host.showExtensionCustom(factory, options);

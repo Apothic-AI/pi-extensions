@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -120,18 +120,23 @@ for (const incremental of [true, false]) {
     }
     assert.ok(payload);
     assert.equal(fetchAttempts, 0);
-    assert.deepEqual(
-      payload.tools.map((tool: JsonObject) => tool.name),
-      incremental ? ["read"] : ["read", "todo"],
-    );
+    const top = payload.tools ?? [];
     const groups = payload.input.filter((item: JsonObject) => item.type === "additional_tools");
-    assert.equal(groups.length, incremental ? 1 : 0);
+    const layout = {
+      top: top.map((tool: JsonObject) => tool.name),
+      groups: groups.map((group: JsonObject) => group.tools.map((tool: JsonObject) => tool.name)),
+    };
     if (incremental) {
-      assert.equal(groups[0].role, "developer");
-      assert.deepEqual(
-        groups[0].tools.map((tool: JsonObject) => tool.name),
-        ["todo"],
+      // Pi 1.0.4 keeps the initial read tool at the top level; newer Codex
+      // serializers emit both declarations as ordered additional_tools groups.
+      assert.ok(
+        JSON.stringify(layout) === JSON.stringify({ top: ["read"], groups: [["todo"]] }) ||
+          JSON.stringify(layout) === JSON.stringify({ top: [], groups: [["read"], ["todo"]] }),
+        "only the two known incremental wire layouts are supported by this fixture",
       );
+      for (const group of groups) assert.equal(group.role, "developer");
+    } else {
+      assert.deepEqual(layout, { top: ["read", "todo"], groups: [] });
     }
     const tracker = new ToolStateTracker();
     const owner = {};
@@ -144,7 +149,7 @@ for (const incremental of [true, false]) {
     assert.equal(validate(payload), true);
     if (incremental) {
       const flat = structuredClone(payload);
-      flat.tools.push(...groups[0].tools);
+      flat.tools = [...top, ...groups.flatMap((group: JsonObject) => group.tools)];
       flat.input = flat.input.filter((item: JsonObject) => item.type !== "additional_tools");
       assert.equal(validate(flat), false, "the same effective tool set is not the same serialized proof");
     }
@@ -152,7 +157,13 @@ for (const incremental of [true, false]) {
 }
 
 /** Real SDK and Codex serializer, isolated credentials, and a fully stubbed transport. */
-async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "auth" | "flight") {
+async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "auth" | "flight", additive = false) {
+  const sessionModel = additive
+    ? {
+        ...model,
+        compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true, supportsToolSearch: true },
+      }
+    : model;
   const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-loadout-"));
   vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected live HTTP request"));
   vi.spyOn(globalThis, "WebSocket").mockImplementation(() => {
@@ -162,6 +173,8 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
   let appendGoal = () => {};
   let compacting = false;
   let compactionAuth = 0;
+  let promptSection: string | undefined;
+  let todoTool: ToolDefinition | undefined;
   const preparations: Array<{ firstKeptEntryId: string; tokensBefore: number; sourceIds: string[] }> = [];
   const fetch: typeof globalThis.fetch = async (_url, init) => {
     const body = init?.body;
@@ -212,7 +225,7 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
           },
         },
       },
-      getModels: () => [model],
+      getModels: () => [sessionModel],
       stream: (requestModel, context, options) =>
         actual.stream(requestModel, context, { ...options, transport: "sse", fetch: options?.fetch ?? fetch }),
       streamSimple: (requestModel, context, options) =>
@@ -223,7 +236,7 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
     await compactSettings.update({ allowCanonicalHistory: true });
     const open = async (manager: SessionManager) => {
       const settingsManager = SettingsManager.inMemory({
-        defaultTools: ["read", "codemode", "inspect"],
+        defaultTools: additive ? ["read"] : ["read", "codemode", "inspect"],
         compaction: { enabled: false, reserveTokens: 16_384, keepRecentTokens: 6 },
         retry: { enabled: false },
       });
@@ -236,9 +249,16 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
         noSkills: true,
         noPromptTemplates: true,
         noThemes: true,
+        systemPrompt: additive ? "Synthetic fixed additive prompt." : undefined,
         extensionFactories: [
           // Synthetic earlier extension uses only the public append API, not Goal source.
           (pi) => {
+            if (additive)
+              pi.on("before_agent_start", (event) => {
+                // Collapse the request to its resolved head without hiding prompt
+                // drift behind an unrelated fixed string.
+                event.systemPromptOptions.forceSystemPrompt = event.systemPrompt;
+              });
             appendGoal = () => {
               const before = buildSessionContext(manager.getBranch(), manager.getLeafId()).messages;
               pi.appendEntry("goal-state", { synthetic: true });
@@ -261,7 +281,8 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
           createCodemodeExtension({ mode }),
           (pi) => {
             registerTool = (tool) => pi.registerTool(tool);
-            pi.registerTool(editableTool);
+            if (!additive) pi.registerTool(editableTool);
+            if (todoTool) pi.registerTool(todoTool);
           },
           createCodexCompactExtension({
             settingsRuntime: compactSettings,
@@ -269,12 +290,17 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
           }),
         ],
       });
+      if (additive) {
+        vi.spyOn(resourceLoader, "getAppendSystemPrompt").mockImplementation(() =>
+          promptSection === undefined ? [] : [promptSection],
+        );
+      }
       await resourceLoader.reload();
       assert.deepEqual(resourceLoader.getExtensions().errors, []);
       const { session } = await createAgentSession({
         cwd: directory,
         agentDir: directory,
-        model,
+        model: sessionModel,
         thinkingLevel: "off",
         modelRuntime,
         resourceLoader,
@@ -306,6 +332,30 @@ async function sdkFixture(mode: "on" | "only" = "on", goalPhase?: "before" | "au
         })) {
           assert.notEqual(event.type, "error", JSON.stringify(event));
         }
+      },
+      setPromptSection: (value: string | undefined) => {
+        promptSection = value;
+      },
+      addTool: () => {
+        assert.ok(registerTool);
+        todoTool = {
+          name: "todo",
+          label: "Todo",
+          description: "Synthetic additive checklist",
+          parameters: Type.Object({ title: Type.String() }),
+          execute: async () => ({ content: [{ type: "text", text: "Offline checklist" }], details: {} }),
+        };
+        registerTool(todoTool);
+      },
+      changeTodo: (drift: "description" | "schema") => {
+        assert.ok(registerTool && todoTool);
+        todoTool = {
+          ...todoTool,
+          ...(drift === "description"
+            ? { description: "Unsent same-name checklist description" }
+            : { parameters: Type.Object({ title: Type.String(), completed: Type.Boolean() }) }),
+        };
+        registerTool(todoTool);
       },
       changeDescription: () => {
         assert.ok(registerTool);
@@ -379,6 +429,210 @@ test("SDK codemode request → remote compaction → persisted reload → opaque
     fixture.cleanup();
   }
 });
+
+function wireSurfaces(payload: JsonObject) {
+  return {
+    tools: payload.tools,
+    groups: payload.input.filter((item: JsonObject) => item.type === "additional_tools"),
+    instructions: payload.instructions,
+    prompt: payload.input.filter(
+      (item: JsonObject) => item.type !== "additional_tools" && (item.role === "system" || item.role === "developer"),
+    ),
+  };
+}
+
+for (const drift of ["none", "membership", "description", "schema", "prompt", "fingerprint", "anchor"] as const) {
+  test(`SDK prior checkpoint → persisted additive tool → ordinary request → repeated compaction (drift=${drift})`, async () => {
+    const fixture = await sdkFixture("on", undefined, true);
+    const manager = SessionManager.create(fixture.directory, fixture.directory);
+    let session: AgentSession | undefined;
+    try {
+      session = await fixture.open(manager);
+      await session.prompt(`First task. ${"Older conversation content. ".repeat(100)}`);
+      await session.prompt("Keep this recent task.");
+      const first = await session.compact();
+      const firstDetails = parseCheckpointDetails(first.details);
+      assert.ok(firstDetails);
+      const firstHistory = structuredClone(manager.getEntries());
+      fixture.addTool();
+      session.setActiveToolsByName(["read", "todo"]);
+      const omitted = manager.appendMessage({ role: "user", content: "OMITTED_ADDITIVE_CANARY", timestamp: 101 });
+      const replaced = manager.appendMessage({ role: "user", content: "STALE_ADDITIVE_CANARY", timestamp: 102 });
+      manager.appendContextEdit(omitted, null);
+      manager.appendContextEdit(replaced, { content: "REPLACEMENT_ADDITIVE_CANARY" });
+      assert.doesNotMatch(JSON.stringify(manager.buildSessionContext().messages), /OMITTED_ADDITIVE|STALE_ADDITIVE/);
+      await session.prompt("Establish unchanged additive declarations after the checkpoint.");
+      assert.deepEqual(
+        getCurrentTools(manager.buildSessionContext().messages).map((tool) => tool.name),
+        ["read", "todo"],
+      );
+      assert.deepEqual(
+        manager
+          .buildSessionContext()
+          .messages.filter((message) => message.role === "system")
+          .map((message) => message.toolsAdded?.map((tool) => tool.name)),
+        [["read"], ["todo"]],
+        "canonical history must retain separate additive declarations",
+      );
+      const ordinary = fixture.requests.at(-1);
+      assert.ok(ordinary);
+      assert.doesNotMatch(JSON.stringify(ordinary), /OMITTED_ADDITIVE_CANARY|STALE_ADDITIVE_CANARY/);
+      assert.match(JSON.stringify(ordinary), /REPLACEMENT_ADDITIVE_CANARY/);
+      const declarations = wireSurfaces(ordinary);
+      const effective = [
+        ...(declarations.tools ?? []),
+        ...declarations.groups.flatMap((group: JsonObject) => group.tools),
+      ];
+      assert.deepEqual(
+        effective.map((tool: JsonObject) => tool.name),
+        ["read", "todo"],
+      );
+      assert.equal(ordinary.input.filter((item: JsonObject) => item.type === "compaction").length, 1);
+      const requestsBefore = fixture.requests.length;
+      if (drift === "membership") session.setActiveToolsByName(["read"]);
+      if (drift === "description" || drift === "schema") {
+        fixture.changeTodo(drift);
+        const recorded = getCurrentTools(manager.buildSessionContext().messages).find((tool) => tool.name === "todo");
+        const live = session.getAllTools().find((tool) => tool.name === "todo");
+        assert.ok(recorded && live);
+        assert.deepEqual(session.getActiveToolNames(), ["read", "todo"], "membership alone must not admit drift");
+        assert.notDeepEqual(
+          live[drift === "schema" ? "parameters" : "description"],
+          recorded[drift === "schema" ? "parameters" : "description"],
+        );
+        assert.equal(session.systemPrompt, getCurrentSystemPrompt(manager.buildSessionContext().messages));
+      }
+      if (drift === "prompt") {
+        const previousPrompt = session.systemPrompt;
+        vi.spyOn(session, "systemPrompt", "get").mockReturnValue(`${previousPrompt}\nUNSENT_PROMPT_CANARY`);
+        assert.notEqual(session.systemPrompt, getCurrentSystemPrompt(manager.buildSessionContext().messages));
+      }
+      if (drift === "fingerprint" || drift === "anchor") {
+        const corrupted = structuredClone(firstDetails);
+        assert.ok(corrupted.keptMessageFingerprints.length > 0, "exercise a retained lineage, not an empty proof");
+        if (drift === "fingerprint") corrupted.keptMessageFingerprints[0] = "0".repeat(64);
+        assert.ok(parseCheckpointDetails(corrupted), "well-formed details must still fail lineage validation");
+        manager.appendCompaction(
+          drift === "anchor" ? `${first.summary} CORRUPTED_ANCHOR` : first.summary,
+          first.firstKeptEntryId,
+          first.tokensBefore,
+          corrupted,
+          true,
+        );
+        manager.appendMessage({ role: "user", content: "Synthetic task after corrupted checkpoint.", timestamp: 103 });
+      }
+      const before = structuredClone(manager.getEntries());
+      if (drift !== "none") {
+        const sessionFile = manager.getSessionFile();
+        assert.ok(sessionFile);
+        const diskBefore = readFileSync(sessionFile, "utf8");
+        await assert.rejects(session.compact(), /cancelled/i);
+        assert.equal(fixture.requests.length, requestsBefore, "unsent drift/corruption must not reach transport");
+        assert.deepEqual(manager.getEntries(), before, "retain the prior opaque checkpoint");
+        assert.equal(readFileSync(sessionFile, "utf8"), diskBefore, "cancellation must not rewrite persisted history");
+      } else {
+        const repeated = await session.compact();
+        assert.ok(
+          parseCheckpointDetails(repeated.details),
+          "canonical resolved system state must reproduce ordinary wire proof",
+        );
+        assert.equal(fixture.requests.length, requestsBefore + 1, "one Remote V2 request, no native fallback");
+        const remote = fixture.requests.at(-1);
+        assert.ok(remote);
+        assert.deepEqual(
+          wireSurfaces(remote),
+          declarations,
+          "exact prompt and declaration surfaces, not just membership",
+        );
+        assert.doesNotMatch(JSON.stringify(remote), /OMITTED_ADDITIVE_CANARY|STALE_ADDITIVE_CANARY/);
+        assert.match(JSON.stringify(remote), /REPLACEMENT_ADDITIVE_CANARY/);
+        assert.equal(remote.input.filter((item: JsonObject) => item.type === "compaction").length, 1);
+        assert.equal(remote.input.filter((item: JsonObject) => item.type === "compaction_trigger").length, 1);
+        const persisted = structuredClone(manager.getEntries());
+        const sessionFile = manager.getSessionFile();
+        assert.ok(sessionFile);
+        session.dispose();
+        const reopened = SessionManager.open(sessionFile);
+        assert.deepEqual(
+          reopened.getEntries(),
+          persisted,
+          "repeated checkpoint and append-only edits survive disk reload",
+        );
+        session = await fixture.open(reopened);
+        await session.prompt("Replay repeated additive checkpoint after reload.");
+        assert.equal(session.getLastAssistantText(), "Done.");
+        const replay = fixture.requests.at(-1);
+        assert.ok(replay);
+        assert.equal(replay.input.filter((item: JsonObject) => item.type === "compaction").length, 1);
+        assert.equal(replay.input.filter((item: JsonObject) => item.type === "compaction_trigger").length, 0);
+        assert.doesNotMatch(
+          JSON.stringify(replay),
+          /PI_CODEX_REMOTE_CHECKPOINT|OMITTED_ADDITIVE_CANARY|STALE_ADDITIVE_CANARY/,
+        );
+        assert.match(JSON.stringify(replay), /REPLACEMENT_ADDITIVE_CANARY/);
+        assert.deepEqual(
+          parseCheckpointDetails(reopened.getEntries().findLast((entry) => entry.type === "compaction")?.details),
+          parseCheckpointDetails(repeated.details),
+        );
+      }
+      assert.deepEqual(manager.getEntries().slice(0, firstHistory.length), firstHistory, "never rewrite prior history");
+    } finally {
+      session?.dispose();
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const section of ["replaced", "removed"] as const) {
+  test(`SDK prior additive checkpoint resolves a ${section} named prompt section for repeated compaction`, async () => {
+    const fixture = await sdkFixture("on", undefined, true);
+    const manager = SessionManager.create(fixture.directory, fixture.directory);
+    let session: AgentSession | undefined;
+    try {
+      fixture.setPromptSection("STALE_SECTION_CANARY");
+      session = await fixture.open(manager);
+      await session.prompt(`First task. ${"Older conversation content. ".repeat(100)}`);
+      await session.prompt("Keep this recent task.");
+      assert.match(getCurrentSystemPrompt(manager.buildSessionContext().messages), /STALE_SECTION_CANARY/);
+      const first = await session.compact();
+      assert.ok(parseCheckpointDetails(first.details));
+      fixture.setPromptSection(section === "replaced" ? "REPLACEMENT_SECTION_CANARY" : undefined);
+      fixture.addTool();
+      session.setActiveToolsByName(["read", "todo"]);
+      await session.prompt("Establish fresh additive evidence for the changed prompt section.");
+      const transcript = manager.buildSessionContext().messages;
+      const patches = transcript.filter((message) => message.role === "system");
+      assert.ok(patches.some((message) => message.sections?.addendum?.includes("STALE_SECTION_CANARY")));
+      assert.equal(
+        patches.at(-1)?.sections?.addendum,
+        section === "replaced" ? "<addendum>\nREPLACEMENT_SECTION_CANARY\n</addendum>" : null,
+        "use the public structured transcript's named replacement/removal, not provider compat mutation",
+      );
+      const resolved = getCurrentSystemPrompt(transcript);
+      assert.equal(session.systemPrompt, resolved);
+      assert.doesNotMatch(resolved, /STALE_SECTION_CANARY/);
+      if (section === "replaced") assert.match(resolved, /REPLACEMENT_SECTION_CANARY/);
+      const ordinary = fixture.requests.at(-1);
+      assert.ok(ordinary);
+      const ordinarySurfaces = wireSurfaces(ordinary);
+      assert.doesNotMatch(JSON.stringify(ordinarySurfaces), /STALE_SECTION_CANARY/);
+      if (section === "replaced") assert.match(JSON.stringify(ordinarySurfaces), /REPLACEMENT_SECTION_CANARY/);
+      const before = fixture.requests.length;
+      const repeated = await session.compact();
+      assert.ok(parseCheckpointDetails(repeated.details));
+      assert.equal(fixture.requests.length, before + 1);
+      const remote = fixture.requests.at(-1);
+      assert.ok(remote);
+      assert.deepEqual(wireSurfaces(remote), ordinarySurfaces, "resolved prompt as well as exact tool declarations");
+      assert.doesNotMatch(JSON.stringify(wireSurfaces(remote)), /STALE_SECTION_CANARY/);
+      assert.equal(remote.input.filter((item: JsonObject) => item.type === "compaction").length, 1);
+      assert.equal(remote.input.filter((item: JsonObject) => item.type === "compaction_trigger").length, 1);
+    } finally {
+      session?.dispose();
+      fixture.cleanup();
+    }
+  });
+}
 
 for (const phase of ["before", "auth", "flight"] as const) {
   test(`SDK Goal bookkeeping ${phase} compaction preserves remote checkpoint and preparation metadata`, async () => {

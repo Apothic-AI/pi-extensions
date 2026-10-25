@@ -117,6 +117,7 @@ function isCheckpointCompatible(
 // have only raw context entries and must continue using that legacy path.
 const piCodingAgentCompat: { buildSessionProjection?: typeof piCodingAgent.buildSessionProjection } = piCodingAgent;
 const piAiCompat: {
+  getCurrentSystemMessage?: typeof piAi.getCurrentSystemMessage;
   getCurrentSystemPrompt?: typeof piAi.getCurrentSystemPrompt;
   getCurrentTools?: typeof piAi.getCurrentTools;
 } = piAi;
@@ -215,7 +216,13 @@ function projectedCurrentMessages(
   if (!projected) {
     throw compactionError("checkpoint_projection_failed");
   }
-  return { messages: projected, transcript: session.messages, prior };
+  // A successful checkpoint projection changes the conversation. Pi restores
+  // one resolved canonical system head after that same ordinary context hook;
+  // reproduce its declaration layout here, not separate historical additions.
+  // The original transcript remains authoritative for all live-state guards.
+  const head = piAiCompat.getCurrentSystemMessage?.(session.messages);
+  const messages = head ? [head, ...projected.filter((message) => message.role !== "system")] : projected;
+  return { messages, transcript: session.messages, prior };
 }
 
 function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings, failure: CompactionFailure): void {

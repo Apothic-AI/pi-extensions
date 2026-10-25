@@ -4,17 +4,27 @@ import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-a
 type ModelRoute = Pick<NonNullable<ExtensionContext["model"]>, "provider" | "api" | "id">;
 type Assistant = Extract<AgentMessage, { role: "assistant" }>;
 
+export const CONTEXT_CONFIDENCE_ENTRY = "pi-statusline:context-confidence";
+export const CONTEXT_CONFIDENCE_UNKNOWN = Object.freeze({ version: 1, state: "unknown" } as const);
+
+function unknownRecord(data: unknown): boolean {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(data);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const fields = Object.getOwnPropertyDescriptors(data);
+    return Reflect.ownKeys(fields).length === 2 && fields.version?.value === 1 && fields.state?.value === "unknown";
+  } catch {
+    return false;
+  }
+}
+
 function routeKey(model: ModelRoute | undefined): string | undefined {
   return model?.provider && model.api && model.id ? JSON.stringify([model.provider, model.api, model.id]) : undefined;
 }
 
 function messageRoute(message: Assistant): string | undefined {
   return routeKey({ provider: message.provider, api: message.api, id: message.model });
-}
-
-function messageKey(message: Assistant): string | undefined {
-  const identity = message.responseId ?? message.timestamp;
-  return identity === undefined ? undefined : JSON.stringify([messageRoute(message), identity]);
 }
 
 function failed(message: Assistant): boolean {
@@ -38,21 +48,21 @@ function successfulUsage(message: Assistant): boolean {
 export class ContextConfidence {
   unknown = false;
   private route: string | undefined;
-  private readonly completed = new Set<string>();
-  private started = new Set<string>();
-  private startedObjects = new WeakSet<object>();
-  private completedObjects = new WeakSet<object>();
+  // One admission per public assistant start, not per timestamp/response ID value.
+  // Retiring an owner or invalidating evidence discards its in-flight admission.
+  private active: { message: Assistant; timestamp: number; responseId: string | undefined } | undefined;
 
   rebuild(entries: readonly SessionEntry[], model: ModelRoute | undefined): void {
     // No failure evidence on older hosts/fixtures preserves public API behavior.
     this.unknown = false;
     this.route = routeKey(model);
-    this.completed.clear();
-    this.completedObjects = new WeakSet();
-    this.clearStarted();
+    this.active = undefined;
     let previousModel: { provider: string; id: string } | undefined;
     for (const entry of entries) {
       if (entry.type === "compaction") this.invalidate();
+      if (entry.type === "custom" && entry.customType === CONTEXT_CONFIDENCE_ENTRY && unknownRecord(entry.data)) {
+        this.invalidate();
+      }
       if (entry.type === "model_change") {
         if (previousModel && (previousModel.provider !== entry.provider || previousModel.id !== entry.modelId)) {
           this.invalidate();
@@ -62,7 +72,6 @@ export class ContextConfidence {
       if (entry.type !== "message" || entry.message.role !== "assistant") continue;
       const message = entry.message;
       if (messageRoute(message)) previousModel = { provider: message.provider, id: message.model };
-      this.remember(message);
       this.apply(message);
     }
   }
@@ -76,46 +85,41 @@ export class ContextConfidence {
 
   invalidate(): void {
     this.unknown = true;
-    this.clearStarted();
+    this.active = undefined;
   }
 
   start(message: AgentMessage): void {
-    if (message.role !== "assistant" || messageRoute(message) !== this.route || !this.route) return;
-    const key = messageKey(message);
-    if (key) this.started.add(key);
-    else this.startedObjects.add(message);
+    if (message.role !== "assistant") return;
+    this.active = undefined;
+    if (!this.route || messageRoute(message) !== this.route) return;
+    // Providers emit start before responseId exists; agent-core shallow-copies
+    // that partial. Keep the admitted timestamp/object stable as the ID arrives.
+    this.active = { message, timestamp: message.timestamp, responseId: message.responseId };
   }
 
   finish(message: AgentMessage): void {
     if (message.role !== "assistant") return;
     const route = messageRoute(message);
     if (this.route && route && route !== this.route) return;
-    const key = messageKey(message);
-    const seen = key ? this.completed.has(key) : this.completedObjects.has(message);
-    if (seen) return;
-    const started = key ? this.started.delete(key) : this.startedObjects.has(message);
-    this.startedObjects.delete(message);
-    this.remember(message);
-    // An unsuccessful completion is sufficient evidence even without a start.
-    // Recovery requires a new response admitted by this branch/model owner.
-    if (failed(message)) this.invalidate();
-    else if (started) this.apply(message);
+    // Failure is evidence even without an admission, including colliding IDs.
+    if (failed(message)) {
+      this.invalidate();
+      return;
+    }
+    const active = this.active;
+    if (!active || !this.route || route !== this.route) return;
+    if (message !== active.message && (!Number.isFinite(active.timestamp) || message.timestamp !== active.timestamp)) {
+      return;
+    }
+    if (active.responseId && message.responseId && active.responseId !== message.responseId) return;
+    this.active = undefined;
+    // A duplicate/historical finish cannot recover without a new public start.
+    this.apply(message);
   }
 
   private apply(message: Assistant): void {
     if (failed(message)) this.invalidate();
     else if (this.route && messageRoute(message) && messageRoute(message) !== this.route) this.invalidate();
     else if (this.route && messageRoute(message) === this.route && successfulUsage(message)) this.unknown = false;
-  }
-
-  private remember(message: Assistant): void {
-    const key = messageKey(message);
-    if (key) this.completed.add(key);
-    else this.completedObjects.add(message);
-  }
-
-  private clearStarted(): void {
-    this.started.clear();
-    this.startedObjects = new WeakSet();
   }
 }

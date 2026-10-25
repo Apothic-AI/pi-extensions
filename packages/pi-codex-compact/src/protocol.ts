@@ -1,3 +1,5 @@
+import { compactionError, failureFrom } from "./failure.js";
+
 export const MAX_SSE_BYTES = 8 * 1024 * 1024;
 export const MAX_COMPACTION_ITEM_BYTES = 2 * 1024 * 1024;
 
@@ -49,12 +51,31 @@ export interface CollectedCompaction {
   completedResponse?: JsonObject;
 }
 
+function isCompletedEvent(event: JsonObject): boolean {
+  return event.type === "response.completed" || event.type === "response.done";
+}
+
+// Only call with JSON-decoded wire events, never arbitrary thrown errors. The
+// allowed code positions are intentionally narrower than provider error text.
+function hasContextWindowCode(event: JsonObject): boolean {
+  const matches = (code: unknown) => code === "context_window_exceeded" || code === "context_length_exceeded";
+  if (event.type === "error") {
+    return matches(event.code) || (isObject(event.error) && matches(event.error.code));
+  }
+  return (
+    event.type === "response.failed" &&
+    isObject(event.response) &&
+    isObject(event.response.error) &&
+    matches(event.response.error.code)
+  );
+}
+
 function compactionItemsFromEvent(event: JsonObject): unknown[] {
   const items: unknown[] = [];
   if (event.type === "response.output_item.done" && isObject(event.item)) {
     items.push(event.item);
   }
-  if (event.type === "response.completed" && isObject(event.response)) {
+  if (isCompletedEvent(event) && isObject(event.response)) {
     const output = event.response.output;
     if (Array.isArray(output)) {
       // A bounded JSON array can still exceed JavaScript's call argument limit.
@@ -71,6 +92,8 @@ function validateSseStep(run: () => void): void {
     run();
   } catch (error) {
     if (error instanceof CodexCompactionProtocolError || error instanceof CodexCompactionProviderError) throw error;
+    // WeakMap provenance only: no arbitrary error properties are inspected.
+    if (failureFrom(error, "remote_response_invalid").code === "remote_context_window_exceeded") throw error;
     // Local decoder/JSON/item validation failures are not network read errors.
     throw new CodexCompactionProtocolError("Remote compaction returned unsupported SSE output");
   }
@@ -112,10 +135,27 @@ export async function collectCompactionSse(
       throw new CodexCompactionProtocolError("Remote compaction returned malformed SSE JSON");
     }
     if (!isObject(parsed)) return;
-    // Closed terminal failure types only. Never parse/copy their arbitrary text.
-    if (parsed.type === "error" || parsed.type === "response.failed") throw new CodexCompactionProviderError();
-    if (parsed.type === "response.completed") {
-      completedResponse = isObject(parsed.response) ? parsed.response : {};
+    // Closed terminal types and exact structured codes only. Never parse/copy
+    // messages or other arbitrary text, including incomplete_details.
+    if (parsed.type === "error" || parsed.type === "response.failed") {
+      if (hasContextWindowCode(parsed)) throw compactionError("remote_context_window_exceeded");
+      throw new CodexCompactionProviderError();
+    }
+    if (parsed.type === "response.incomplete" || parsed.type === "response.cancelled") {
+      throw new CodexCompactionProviderError();
+    }
+    if (isCompletedEvent(parsed)) {
+      const response = isObject(parsed.response) ? parsed.response : {};
+      const status = response.status;
+      if (status === "failed" || status === "cancelled" || status === "incomplete") {
+        throw new CodexCompactionProviderError();
+      }
+      // Older completed fixtures omit status. Present statuses must establish
+      // success, not a still-running/unknown/malformed response state.
+      if (status !== undefined && status !== "completed") {
+        throw new CodexCompactionProtocolError("Remote compaction returned an unsupported terminal status");
+      }
+      completedResponse = response;
     }
     for (const candidate of compactionItemsFromEvent(parsed)) {
       const item = validateCompactionItem(candidate, options.maxItemBytes);
