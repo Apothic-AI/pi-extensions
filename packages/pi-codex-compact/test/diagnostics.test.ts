@@ -199,9 +199,22 @@ test("safe diagnostics discard forged error fields and reject nonnumeric or out-
   assert.deepEqual(failureFrom(compactionError("remote_provider_error", 401), "local_compaction_failed"), {
     code: "remote_provider_error",
   });
+  assert.deepEqual(
+    failureFrom(
+      { code: "remote_context_window_exceeded", error: { code: "context_window_exceeded" } },
+      "remote_provider_error",
+    ),
+    { code: "remote_provider_error" },
+  );
+  assert.deepEqual(failureFrom(compactionError("remote_context_window_exceeded", 400), "local_compaction_failed"), {
+    code: "remote_context_window_exceeded",
+  });
   const getters = Object.defineProperties(
     {},
     {
+      code: { get: () => assert.fail("must not inspect arbitrary errors") },
+      error: { get: () => assert.fail("must not inspect arbitrary errors") },
+      response: { get: () => assert.fail("must not inspect arbitrary errors") },
       message: { get: () => assert.fail("must not inspect arbitrary errors") },
       cause: { get: () => assert.fail("must not inspect arbitrary errors") },
       status: { get: () => assert.fail("must not inspect arbitrary errors") },

@@ -73,6 +73,34 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// The built-in Codex parser splits frames on LF/LF. Normalize only its tee
+// branch, byte-wise (including a CR/LF split across chunks), without decoding
+// UTF-8 or changing bare CRs. The inspector must count the original wire bytes.
+function providerSseBody(stream: ReadableStream<Uint8Array>, signal: AbortSignal): ReadableStream<Uint8Array> {
+  let pendingCr = false;
+  return stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const output = new Uint8Array(chunk.byteLength + 1);
+        let length = 0;
+        for (const byte of chunk) {
+          if (pendingCr) {
+            if (byte !== 10) output[length++] = 13;
+            pendingCr = false;
+          }
+          if (byte === 13) pendingCr = true;
+          else output[length++] = byte;
+        }
+        if (length > 0) controller.enqueue(output.subarray(0, length));
+      },
+      flush(controller) {
+        if (pendingCr) controller.enqueue(new Uint8Array([13]));
+      },
+    }),
+    { signal },
+  );
+}
+
 export async function requestRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
   const controller = new AbortController();
   const onRequestAbort = () => controller.abort();
@@ -176,11 +204,12 @@ async function performRemoteCompaction(
     let providerBody = bridge.readable;
     if (response.ok) {
       const [providerBranch, inspectionBody] = providerBody.tee();
-      providerBody = providerBranch;
+      providerBody = providerSseBody(providerBranch, signal);
       const inspection = collectCompactionSse(inspectionBody, { signal: operationSignal }).then(
         (value) => ({ ok: true as const, value }),
         (error: unknown) => {
-          const failure = compactionFailure(
+          const failure = failureFrom(
+            error,
             error instanceof CodexCompactionProviderError
               ? "remote_provider_error"
               : error instanceof CodexCompactionProtocolError
@@ -195,10 +224,14 @@ async function performRemoteCompaction(
       );
       inspections.push(inspection);
     }
+    const headers = new Headers(response.headers);
+    // Normalization can shorten a successful SSE body. Do not advertise the
+    // original length; unsuccessful bodies/metadata retain provider semantics.
+    if (response.ok) headers.delete("content-length");
     return new Response(providerBody, {
       status: response.status,
       statusText: response.statusText,
-      headers: response.headers,
+      headers,
     });
   };
 

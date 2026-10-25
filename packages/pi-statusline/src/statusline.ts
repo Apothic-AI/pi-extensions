@@ -3,6 +3,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { getCapabilities, type TUI } from "@earendil-works/pi-tui";
 import { type CommandOwner, isOwnerCurrent } from "./command-owner.js";
 import { registerStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
+import { CONTEXT_CONFIDENCE_ENTRY, CONTEXT_CONFIDENCE_UNKNOWN, ContextConfidence } from "./context-confidence.js";
 import {
   buildExtensionStatusIconAliases,
   type ExtensionStatusIconAliasMap,
@@ -36,6 +37,9 @@ export default function statusline(pi: ExtensionAPI) {
   let activeTerminal: TerminalLifetime | undefined;
   let observedUsageLeafId: string | null = null;
   const footerUsage = new FooterUsageAccumulator();
+  const contextConfidence = new ContextConfidence();
+  let confidenceLeaf: string | null = null;
+  let confidenceBranchRetired = false;
   const runtime: RuntimeState = {
     turnCount: 0,
     activeTools: new Map(),
@@ -89,6 +93,46 @@ export default function statusline(pi: ExtensionAPI) {
       return ctx.sessionManager === activeSessionManager;
     } catch {
       return false;
+    }
+  };
+
+  const syncContextConfidence = () => {
+    runtime.contextUsageUnknown = contextConfidence.unknown;
+  };
+  const retireContextConfidence = () => {
+    confidenceBranchRetired = true;
+    contextConfidence.invalidate();
+    syncContextConfidence();
+    refresh();
+    return false;
+  };
+  const ownsContextConfidence = (ctx: ExtensionContext) => {
+    if (!ownsRuntime(ctx) || confidenceBranchRetired) return false;
+    try {
+      if (ctx.mode !== "tui" || !ctx.hasUI || ctx.ui !== activeGitStatusTarget?.ui) return false;
+      if (!isActiveGitStatusTarget(ctx.cwd, sessionGeneration)) return false;
+      const leaf = ctx.sessionManager.getLeafId();
+      if (leaf !== confidenceLeaf) {
+        // Navigation can replace the branch before session_tree is dispatched.
+        // Walk only the new suffix, never rescan the full branch or render history.
+        let ancestor = leaf;
+        const visited = new Set<string>();
+        while (ancestor !== confidenceLeaf) {
+          if (ancestor === null || visited.has(ancestor)) return retireContextConfidence();
+          visited.add(ancestor);
+          const entry = ctx.sessionManager.getEntry(ancestor);
+          if (!entry || entry.id !== ancestor || (entry.parentId !== null && typeof entry.parentId !== "string")) {
+            return retireContextConfidence();
+          }
+          ancestor = entry.parentId;
+        }
+        confidenceLeaf = leaf;
+      }
+      contextConfidence.selectModel(ctx.model);
+      syncContextConfidence();
+      return true;
+    } catch {
+      return retireContextConfidence();
     }
   };
 
@@ -226,6 +270,11 @@ export default function statusline(pi: ExtensionAPI) {
     if (ctx.mode !== "tui" || !ctx.hasUI) return;
     const cwd = ctx.cwd;
     rebuildFooterUsage(ctx);
+    const branch = ctx.sessionManager.getBranch();
+    contextConfidence.rebuild(branch, ctx.model);
+    confidenceLeaf = ctx.sessionManager.getLeafId();
+    confidenceBranchRetired = false;
+    syncContextConfidence();
     runtime.homeDir = homedir();
     previewPalettePreset = undefined;
     abortGitStatusRefresh("Statusline session context replaced");
@@ -439,14 +488,30 @@ export default function statusline(pi: ExtensionAPI) {
   pi.on("session_before_fork", () => closeCommandsBeforeNavigation());
 
   pi.on("session_tree", (_event, ctx) => {
+    if (!ownsRuntime(ctx)) return;
     installFooter(ctx);
     refresh();
   });
 
   pi.on("session_compact", (_event, ctx) => {
-    if (!ownsRuntime(ctx)) return;
+    if (!ownsContextConfidence(ctx)) return;
+    contextConfidence.invalidate();
+    syncContextConfidence();
     rebuildFooterUsage(ctx);
     refresh();
+  });
+
+  pi.on("session_compact_failed", (_event, ctx) => {
+    if (!ownsContextConfidence(ctx)) return;
+    contextConfidence.invalidate();
+    syncContextConfidence();
+    // Pi does not persist this event. Journal only our display latch, not the
+    // provider error or token history, on the currently owned session branch.
+    try {
+      pi.appendEntry(CONTEXT_CONFIDENCE_ENTRY, CONTEXT_CONFIDENCE_UNKNOWN);
+    } finally {
+      refresh();
+    }
   });
 
   pi.on("session_shutdown", (event, ctx) => {
@@ -477,7 +542,10 @@ export default function statusline(pi: ExtensionAPI) {
     runtime.requestRender = undefined;
   });
 
-  pi.on("model_select", () => refresh());
+  pi.on("model_select", (_event, ctx) => {
+    if (!ownsContextConfidence(ctx)) return;
+    refresh();
+  });
 
   pi.on("thinking_level_select", (event) => {
     runtime.thinkingLevel = event.level;
@@ -525,8 +593,17 @@ export default function statusline(pi: ExtensionAPI) {
     refresh();
   });
 
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role !== "assistant" || !ownsContextConfidence(ctx)) return;
+    contextConfidence.start(event.message);
+  });
+
   pi.on("message_end", (event, ctx) => {
     if (!ownsRuntime(ctx)) return;
+    if (event.message.role === "assistant" && ownsContextConfidence(ctx)) {
+      contextConfidence.finish(event.message);
+      syncContextConfidence();
+    }
     updateFooterUsage(event.message);
     refresh();
   });

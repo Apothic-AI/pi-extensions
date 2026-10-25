@@ -16,7 +16,7 @@ initTheme("dark", false);
 test.each(["select", "cancel", "retire"])(
   "installed Pi custom host %s restores its draft before any owner open",
   async (exit) => {
-    assert.equal(VERSION, "1.0.4");
+    assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
     vi.useFakeTimers();
     const controller = new AbortController();
     const editor = {
@@ -46,6 +46,8 @@ test.each(["select", "cancel", "retire"])(
       editorContainer,
       ui,
       keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+      ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
     }) as { showExtensionCustom: ExtensionContext["ui"]["custom"] };
     const context = createMockContext({
       mode: "tui",

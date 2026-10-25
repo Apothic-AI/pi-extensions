@@ -132,7 +132,8 @@ failure cannot turn opaque cancellation into native fallback.
 | `remote_http_error; HTTP NNN` | The intercepted transport returned a non-success HTTP response. Only an integer `Response.status` from 100–599 is included, when valid. |
 | `remote_timeout` | The extension-owned remote deadline expired, including response-body inspection. |
 | `remote_transport_error` | Fetch or response-body reading failed without a more specific safe observation. |
-| `remote_provider_error` | The provider threw/emitted an error, or SSE contained a terminal `error` / `response.failed` event, without a more specific safe observation. Only the event type is recognized; its text is ignored. |
+| `remote_provider_error` | The provider threw/emitted an error, or SSE reported terminal failure, cancellation, or incomplete output, without a more specific safe observation. Arbitrary text is ignored. |
+| `remote_context_window_exceeded` | JSON SSE reported exactly `context_window_exceeded` or `context_length_exceeded` at `code` / `error.code` on an `error` event, or `response.error.code` on `response.failed`. This is one fixed observation code, not overflow recovery or a diagnosis of an earlier failure. |
 | `remote_response_invalid` | A successful HTTP response had absent, malformed, unsupported, oversized, or otherwise invalid compaction SSE. |
 | `state_divergence` | Live prompt/tools no longer matched the completed request; the result was discarded. |
 | `local_compaction_failed` | Local checkpoint construction failed after the response was accepted. |
@@ -160,8 +161,18 @@ inspection or iterator closure, preserving any already observed safe failure. Lo
 failures are not classified as network read errors. A throwing
 ownership callback/getter fails closed as source-free cancellation. Malformed/deep unsupported
 checkpoint details return validation failure rather than escaping the hook into native fallback.
+Successful compaction accepts `response.completed` and the built-in provider's `response.done`
+alias, with absent (legacy) or `completed` status. Known unsuccessful terminal statuses and explicit
+`response.incomplete` / `response.cancelled` events fail promptly, even without EOF. Other present
+terminal statuses are invalid. Output-item and terminal-output copies are deduplicated, still requiring
+exactly one bounded opaque item. CRLF delimiters are normalized to LF only on the successful SSE branch
+consumed by the built-in provider, including fragmented CR/LF bytes; the inspector retains original
+bytes and its 8 MiB limit. The normalized branch omits the original `content-length`. Non-success HTTP
+bodies and existing retries are unchanged.
+
 No extra model round, relaxed loadout equality, automatic checkpoint migration, or new retry is
-introduced. Existing bounded provider retries are unchanged.
+introduced. Existing bounded provider retries are unchanged. These offline-proven protocol fixes do
+not establish the cause of an unknown live failure.
 
 Pi snapshots the compaction branch before running extension hooks sequentially. An earlier Goal
 hook can then append plain `custom` records with exactly `customType: "goal-state"`. Preparation
@@ -291,7 +302,12 @@ missing/hidden tools, other group roles or fields, and tool-search updates (`too
 `tool_search_output`) are rejected. The raw recorded/registry membership and schema checks still apply.
 It freezes both public tool surfaces and the original top-level tools plus ordered additive groups,
 including schema, format, and strictness metadata; Remote V2 must reproduce that exact declaration
-surface before sending. Flattening, regrouping, or reordering declarations is not equivalent proof,
+surface before sending. After successfully projecting a prior checkpoint, hosts exposing
+`getCurrentSystemMessage` supply one resolved **canonical** system head for the remote request,
+matching Pi's restoration after the ordinary checkpoint context hook. This avoids replaying historical
+additive system entries in a different wire layout. First compaction and legacy hosts retain their
+existing path; preflight and post-response guards still check the unmodified canonical transcript.
+No request-local filter output is reused. Flattening, regrouping, or reordering declarations is not equivalent proof,
 even with the same effective tool set. Ordinary input text, messages, and checkpoint content are not
 retained or compared by this tracker. Cached provider callbacks cannot approve unsent registry edits,
 and hidden declarations cause Pi-native fallback (or cancellation with an active opaque boundary)

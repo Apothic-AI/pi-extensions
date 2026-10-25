@@ -15,6 +15,7 @@ import {
   initTheme,
   SessionManager,
   SettingsManager,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Editor, KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { test, vi } from "vitest";
@@ -22,6 +23,7 @@ import { test, vi } from "vitest";
 initTheme("dark", false);
 
 function createHost() {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   const editor = {
     text: "outgoing draft",
     focused: true,
@@ -58,6 +60,8 @@ function createHost() {
       { ...TUI_KEYBINDINGS, "app.editor.external": { defaultKeys: "ctrl+g", description: "External editor" } },
       { "app.editor.external": "ctrl+x" },
     ),
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   return {
     custom: ((factory, options) =>

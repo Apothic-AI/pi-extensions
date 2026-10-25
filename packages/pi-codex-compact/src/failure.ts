@@ -13,6 +13,7 @@ const FAILURE_CODES = [
   "remote_timeout",
   "remote_transport_error",
   "remote_provider_error",
+  "remote_context_window_exceeded",
   "payload_rejected",
   "remote_response_invalid",
   "local_compaction_failed",
