@@ -165,6 +165,7 @@
         "@earendil-works/pi-agent-core": "1.0.4",
         "@earendil-works/pi-ai": "1.0.4",
         "@earendil-works/pi-coding-agent": "1.0.4",
+        "@earendil-works/pi-tui": "1.0.4",
         "@types/node": "26.1.2",
         "typescript": "7.0.2",
       },
@@ -172,6 +173,7 @@
         "@earendil-works/pi-agent-core": "*",
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
       },
     },
     "packages/pi-files-widget": {

@@ -38,6 +38,7 @@ import {
 } from "./failure.js";
 import { PreparationBranchFence } from "./preparation-branch.js";
 import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
+import { createRecoveryCommand } from "./recovery-command.js";
 import { requestRemoteCompaction } from "./remote.js";
 import {
   type CodexCompactSettings,
@@ -196,12 +197,12 @@ function sessionStateMatchesRequest(
 }
 
 function projectedCurrentMessages(
-  event: SessionBeforeCompactEvent,
+  branchEntries: SessionEntry[],
   model: Model<"openai-codex-responses">,
 ): { messages: AgentMessage[]; transcript: AgentMessage[]; prior?: CodexCheckpointDetails } {
-  const leafId = event.branchEntries.at(-1)?.id ?? null;
-  const session = buildSessionContext(event.branchEntries, leafId);
-  const compaction = activeCompaction(event.branchEntries);
+  const leafId = branchEntries.at(-1)?.id ?? null;
+  const session = buildSessionContext(branchEntries, leafId);
+  const compaction = activeCompaction(branchEntries);
   const prior = parseCheckpointDetails(compaction?.details);
   if (!prior) {
     if (isOpaqueCompaction(compaction)) {
@@ -400,7 +401,7 @@ async function compactRemotely(
     if (!provider) throw compactionError("provider_unavailable");
     const requestModel = { ...model, baseUrl: auth.baseUrl ?? model.baseUrl };
     phase = "checkpoint_projection_failed";
-    const current = projectedCurrentMessages(event, model);
+    const current = projectedCurrentMessages(event.branchEntries, model);
     phase = "loadout_mismatch";
     if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState)) {
       throw compactionError("loadout_mismatch");
@@ -497,20 +498,38 @@ export function createCodexCompactExtension(
     let generation = 0;
     let active = true;
     let experimentalWarningShown = false;
+    const recovery = createRecoveryCommand(pi, settingsRuntime, {
+      project: projectedCurrentMessages,
+      matches: (transcript, ctx) => transcriptMatchesLiveState(transcript, pi, ctx, toolState),
+      tools: () => activeTools(pi),
+      authenticate: awaitCompactionAuth,
+      payloadValidator: (ctx) => toolState.payloadValidator(ctx.sessionManager, ctx.sessionManager.getSessionId()),
+      fetch: options.fetch,
+    });
+    // Idle recovery has its own controller; never abort unrelated agent work.
+    pi.on("input", () => recovery.cancel());
+    pi.on("before_agent_start", () => recovery.cancel());
+    pi.on("agent_start", () => recovery.cancel());
+    pi.on("session_before_tree", () => recovery.cancel());
+    pi.on("session_before_switch", () => recovery.cancel());
+    pi.on("session_before_fork", () => recovery.cancel());
 
     pi.registerCommand("codex-compact", {
       description: "Compact now or configure experimental Codex Remote Compaction V2",
-      handler: async (_args, ctx) => {
+      handler: async (args, ctx) => {
+        if (await recovery.handle(args, ctx)) return;
         const ownerGeneration = generation;
         await showCodexCompactMenu(settingsRuntime, ctx, {
           signal: sessionController.signal,
           isCurrent: () => ownerGeneration === generation && !sessionController.signal.aborted,
+          recover: () => recovery.run(ctx, sessionController.signal),
         });
       },
     });
 
     pi.on("session_start", async (event, ctx) => {
       active = true;
+      recovery.cancel();
       toolState.reset(ctx.sessionManager);
       if (event.reason !== "reload") resetTailProvenance(ctx);
       sessionController.abort();
@@ -549,8 +568,9 @@ export function createCodexCompactExtension(
       }
     });
 
-    pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(
+    pi.on("session_before_compact", (event, ctx) => {
+      recovery.cancel();
+      return compactRemotely(
         pi,
         event,
         ctx,
@@ -558,8 +578,8 @@ export function createCodexCompactExtension(
         toolState,
         sessionController.signal,
         options.fetch,
-      ),
-    );
+      );
+    });
 
     // Legacy hosts trim a recovery tail after compaction. Canonical hosts have
     // already persisted context edits before the hook and keep full provenance.
@@ -589,6 +609,7 @@ export function createCodexCompactExtension(
     });
 
     pi.on("session_tree", (_event, ctx) => {
+      recovery.cancel();
       generation += 1;
       sessionController.abort();
       sessionController = new AbortController();
@@ -657,6 +678,7 @@ export function createCodexCompactExtension(
     });
 
     pi.on("model_select", (event, ctx) => {
+      recovery.cancel();
       if (!settingsRuntime.get().settings.enabled) return;
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || isCheckpointCompatible(checkpoint.details, event.model)) return;
@@ -673,6 +695,7 @@ export function createCodexCompactExtension(
 
     pi.on("session_shutdown", async (event, ctx) => {
       active = false;
+      recovery.cancel();
       toolState.reset(ctx.sessionManager);
       if (event.reason !== "reload") tailProvenance.delete(ctx.sessionManager);
       generation += 1;

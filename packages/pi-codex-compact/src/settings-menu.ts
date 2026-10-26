@@ -6,6 +6,7 @@ import type { CodexCompactSettings, CodexCompactSettingsRuntime, CodexCompactSet
 type Screen = "main" | "settings" | "invalid";
 type Action =
   | "compact-now"
+  | "recovery-export"
   | "set-enabled"
   | "set-canonical"
   | "set-timeout"
@@ -16,6 +17,7 @@ type Action =
 export interface SettingsMenuOwner {
   signal: AbortSignal;
   isCurrent(): boolean;
+  recover?(): Promise<void>;
 }
 
 interface CompactMenuStatus {
@@ -60,7 +62,7 @@ async function update(
 
 export function createCodexCompactMenu(
   runtime: CodexCompactSettingsRuntime,
-  options: { onCompactRequested?: () => void; status?: CompactMenuStatus } = {},
+  options: { onCompactRequested?: () => void; onRecoveryRequested?: () => void; status?: CompactMenuStatus } = {},
 ): MenuDefinition<CodexCompactSettingsState, Screen, Action, ExtensionCommandContext> {
   return {
     start: "main",
@@ -79,6 +81,13 @@ export function createCodexCompactMenu(
             label: "Compact now",
             description: "Close this menu and compact the active session immediately.",
             action: "compact-now",
+          },
+          {
+            id: "recovery-export",
+            label: "Recovery export (new session)",
+            description:
+              "Read-only recovery offer; then confirm once with its exact /codex-compact nonce command. Original unchanged.",
+            action: "recovery-export",
           },
           state.kind === "invalid"
             ? {
@@ -164,6 +173,10 @@ export function createCodexCompactMenu(
         options.onCompactRequested?.();
         return { kind: "close" };
       },
+      "recovery-export": async () => {
+        options.onRecoveryRequested?.();
+        return { kind: "close" };
+      },
       "set-enabled": ({ ctx, value, signal }) => update(runtime, ctx, { enabled: value === "On" }, signal),
       "set-canonical": ({ ctx, value, signal }) =>
         update(runtime, ctx, { allowCanonicalHistory: value === "On" }, signal),
@@ -190,11 +203,15 @@ export async function showCodexCompactMenu(
   const { runMenu } = await import("@narumitw/pi-tui-kit");
   if (owner.signal.aborted || !owner.isCurrent()) return;
   let compactRequested = false;
+  let recoveryRequested = false;
   await runMenu(
     withBorderedCustomUi(ctx),
     createCodexCompactMenu(runtime, {
       onCompactRequested: () => {
         compactRequested = true;
+      },
+      onRecoveryRequested: () => {
+        recoveryRequested = true;
       },
       status: compactMenuStatus(ctx),
     }),
@@ -204,7 +221,12 @@ export async function showCodexCompactMenu(
       isCurrent: owner.isCurrent,
     },
   );
-  if (!compactRequested || owner.signal.aborted || !owner.isCurrent()) return;
+  if (owner.signal.aborted || !owner.isCurrent()) return;
+  if (recoveryRequested) {
+    await owner.recover?.();
+    return;
+  }
+  if (!compactRequested) return;
   const sessionId = ctx.sessionManager.getSessionId();
   // ctx.signal belongs to the interrupted agent turn, not this compaction:
   // SDK compact() intentionally aborts that turn before starting its own work.
