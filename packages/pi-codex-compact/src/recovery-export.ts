@@ -3,7 +3,7 @@ import fsPromises from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { SystemMessage, Usage } from "@earendil-works/pi-ai";
-import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION, parseSessionEntries, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   type CodexCheckpointDetails,
   fallbackSummary,
@@ -29,6 +29,8 @@ export interface RecoveryExportInput {
   usage: Usage;
   signal: AbortSignal;
   isCurrent(): boolean;
+  /** Synchronous committed-success boundary, before any asynchronous cleanup. */
+  onPublished?(result: RecoveryExportResult): void;
 }
 export interface RecoveryExportResult {
   sessionId: string;
@@ -54,6 +56,9 @@ export function buildRecoverySession(input: RecoveryExportInput): SessionManager
   manager.appendMessage(persisted(input.head));
   manager.appendCompaction(fallbackSummary(details.checkpointId), null, 0, details, true, input.usage);
   for (const message of input.suffix) manager.appendMessage(persisted(resetHistoricalUsage(message)));
+  // This is a fresh recovery choice, not copied automation state. Native resume
+  // also infers selection from historical assistants, so our choice must be last.
+  manager.appendModelChange(details.provider, details.modelId);
   validateRecoverySession(manager, input);
   return manager;
 }
@@ -73,7 +78,7 @@ export function validateRecoverySession(manager: SessionManager, input: Recovery
   const entries = manager.getEntries();
   const expectedSuffix = persisted(input.suffix.map(resetHistoricalUsage));
   if (
-    entries.length !== expectedSuffix.length + 2 ||
+    entries.length !== expectedSuffix.length + 3 ||
     entries[0]?.type !== "message" ||
     !isDeepStrictEqual(entries[0].message, persisted(input.head))
   )
@@ -99,12 +104,23 @@ export function validateRecoverySession(manager: SessionManager, input: Recovery
   }
   if (
     !isDeepStrictEqual(
-      entries.slice(2).map((entry) => (entry.type === "message" ? entry.message : null)),
+      entries.slice(2, -1).map((entry) => (entry.type === "message" ? entry.message : null)),
       expectedSuffix,
     )
   ) {
     throw new Error("Recovery suffix changed");
   }
+  const selection = entries.at(-1);
+  if (
+    selection?.type !== "model_change" ||
+    selection.provider !== input.details.provider ||
+    selection.modelId !== input.details.modelId ||
+    !isDeepStrictEqual(manager.buildSessionContext().model, {
+      provider: input.details.provider,
+      modelId: input.details.modelId,
+    })
+  )
+    throw new Error("Invalid recovery model selection");
   const replay = projectCheckpointContext(manager.buildSessionContext().messages, input.details, "full");
   if (
     replay?.filter((message) => message.role === "system").length !== 1 ||
@@ -118,10 +134,23 @@ export function validateRecoverySession(manager: SessionManager, input: Recovery
     throw new Error("Recovery canonical replay changed");
 }
 
+function sameInode(a: fs.BigIntStats, b: fs.BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
+}
+function pinnedPath(path: string, identity: fs.BigIntStats, directory = false): void {
+  const current = fs.lstatSync(path, { bigint: true });
+  if (
+    !sameInode(current, identity) ||
+    current.isSymbolicLink() ||
+    (directory ? !current.isDirectory() : !current.isFile())
+  )
+    throw new Error("Recovery staging identity changed");
+}
+
 /**
- * Private same-filesystem staging; only a complete fsynced validated native file
- * becomes selector-visible. linkSync is a no-replace publication point, with a
- * synchronous final owner check (no await between it and publication).
+ * Pinned descriptor validation and synchronous no-replace publication. Final
+ * checks detect observed swaps; portable path-based link/unlink cannot exclude
+ * a malicious same-UID process racing inside the final synchronous syscalls.
  */
 export async function exportRecoverySession(input: RecoveryExportInput): Promise<RecoveryExportResult> {
   assertCurrent(input);
@@ -135,50 +164,116 @@ export async function exportRecoverySession(input: RecoveryExportInput): Promise
   if (basename(filename) !== filename || !/^[0-9a-fTZ_-]+\.jsonl$/u.test(filename))
     throw new Error("Invalid recovery filename");
   const destination = join(input.sessionDir, filename);
-  const directory = await fsPromises.mkdtemp(join(input.sessionDir, ".codex-recovery-"));
-  // No .jsonl staging name, even if a selector traverses private subdirectories.
-  const staged = join(directory, "session.pending");
+  const destinationIdentity = fs.lstatSync(input.sessionDir, { bigint: true });
+  pinnedPath(input.sessionDir, destinationIdentity, true);
+  const dir = fs.openSync(input.sessionDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let directory: string | undefined;
+  let directoryIdentity: fs.BigIntStats | undefined;
+  let fileIdentity: fs.BigIntStats | undefined;
+  let handle: fsPromises.FileHandle | undefined;
   try {
+    if (!sameInode(fs.fstatSync(dir, { bigint: true }), destinationIdentity))
+      throw new Error("Recovery directory changed");
+    // Create and pin without yielding: an async creation completion must not
+    // adopt a directory replaced before its first identity observation.
+    directory = fs.mkdtempSync(join(input.sessionDir, ".codex-recovery-"));
+    directoryIdentity = fs.lstatSync(directory, { bigint: true });
+    pinnedPath(input.sessionDir, destinationIdentity, true);
+    pinnedPath(directory, directoryIdentity, true);
+    // No .jsonl staging name, even if a selector traverses private subdirectories.
+    const staged = join(directory, "session.pending");
     assertCurrent(input);
-    const handle = await fsPromises.open(staged, "wx", 0o600);
-    try {
-      await handle.writeFile(bytes, "utf8");
-      assertCurrent(input);
-      await handle.sync();
-    } finally {
-      await handle.close();
+    handle = await fsPromises.open(
+      staged,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    fileIdentity = await handle.stat({ bigint: true });
+    pinnedPath(directory, directoryIdentity, true);
+    pinnedPath(staged, fileIdentity);
+    await handle.writeFile(bytes, "utf8");
+    assertCurrent(input);
+    await handle.sync();
+    assertCurrent(input);
+    const size = Buffer.byteLength(bytes);
+    const descriptor = handle.fd;
+    const validatedIdentity = fs.fstatSync(descriptor, { bigint: true });
+    if (validatedIdentity.size !== BigInt(size)) throw new Error("Recovery staging changed");
+    const unchanged = () => {
+      const current = fs.fstatSync(descriptor, { bigint: true });
+      if (
+        !sameInode(current, validatedIdentity) ||
+        current.size !== validatedIdentity.size ||
+        current.mtimeNs !== validatedIdentity.mtimeNs ||
+        current.ctimeNs !== validatedIdentity.ctimeNs
+      )
+        throw new Error("Recovery staging changed");
+    };
+    const buffer = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+      if (!bytesRead) throw new Error("Recovery staging truncated");
+      offset += bytesRead;
     }
-    assertCurrent(input);
-    if ((await fsPromises.readFile(staged, "utf8")) !== bytes) throw new Error("Recovery staging changed");
-    const reopened = SessionManager.open(staged);
+    unchanged(); // Compare against PRE-read metadata, not a post-parse baseline.
+    const readBytes = buffer.toString("utf8");
+    if (readBytes !== bytes) throw new Error("Recovery staging changed");
+    // Parse bytes from the owned descriptor, never file-open an unchecked path:
+    // native file opening may repair malformed/header-only files in place.
+    const reopened = SessionManager.inMemory(input.cwd, undefined, parseSessionEntries(readBytes));
     if (
       reopened.getSessionId() !== manager.getSessionId() ||
       !isDeepStrictEqual(reopened.getEntries(), persisted(manager.getEntries()))
     )
       throw new Error("Recovery reload changed");
     validateRecoverySession(reopened, input);
-    // Fail unsupported directory syncing before publication whenever possible.
-    const dir = fs.openSync(input.sessionDir, "r");
+    fs.fsyncSync(dir);
+    assertCurrent(input); // Last user callback: path checks MUST follow it.
+    pinnedPath(input.sessionDir, destinationIdentity, true);
+    pinnedPath(directory, directoryIdentity, true);
+    pinnedPath(staged, fileIdentity);
+    unchanged();
+    fs.linkSync(staged, destination); // EEXIST (including symlinks) never overwrites.
+    let durabilityConfirmed = true;
     try {
       fs.fsyncSync(dir);
-      assertCurrent(input);
-      fs.linkSync(staged, destination); // EEXIST (including symlinks) must never overwrite.
-      let durabilityConfirmed = true;
-      try {
-        fs.fsyncSync(dir);
-      } catch {
-        durabilityConfirmed = false;
-      }
-      return { sessionId: manager.getSessionId(), path: destination, durabilityConfirmed };
-    } finally {
-      try {
-        fs.closeSync(dir);
-      } catch {
-        // Cleanup cannot turn a completed no-replace publication into failure.
-      }
+    } catch {
+      durabilityConfirmed = false;
     }
+    const result = { sessionId: manager.getSessionId(), path: destination, durabilityConfirmed };
+    try {
+      input.onPublished?.(result);
+    } catch {
+      /* Observer failure cannot undo completed publication or skip owned cleanup. */
+    }
+    return result;
   } finally {
-    // Never remove a completed externally usable export, even on late UI/error.
-    await fsPromises.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    // Keep the descriptor pinned through cleanup; never recursively remove a
+    // replacement directory or unlink an observed foreign file/symlink.
+    try {
+      if (directory && directoryIdentity) {
+        pinnedPath(input.sessionDir, destinationIdentity, true);
+        pinnedPath(directory, directoryIdentity, true);
+        if (fileIdentity) {
+          const staged = join(directory, "session.pending");
+          pinnedPath(staged, fileIdentity);
+          fs.unlinkSync(staged);
+        }
+        fs.rmdirSync(directory); // Empty only; foreign content is never removed.
+      }
+    } catch {
+      /* Uncertain ownership leaves artifacts rather than deleting foreign data. */
+    }
+    try {
+      await handle?.close();
+    } catch {
+      /* Completed publication remains usable. */
+    }
+    try {
+      fs.closeSync(dir);
+    } catch {
+      /* Completed publication remains usable. */
+    }
   }
 }

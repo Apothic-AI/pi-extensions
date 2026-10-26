@@ -86,7 +86,7 @@ export function createCodexCompactMenu(
             id: "recovery-export",
             label: "Recovery export (new session)",
             description:
-              "Explicit one-shot prefix recovery; original unchanged. Requires an idle compatible checkpoint.",
+              "Read-only recovery offer; then confirm once with its exact /codex-compact nonce command. Original unchanged.",
             action: "recovery-export",
           },
           state.kind === "invalid"

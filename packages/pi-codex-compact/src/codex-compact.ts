@@ -516,7 +516,8 @@ export function createCodexCompactExtension(
 
     pi.registerCommand("codex-compact", {
       description: "Compact now or configure experimental Codex Remote Compaction V2",
-      handler: async (_args, ctx) => {
+      handler: async (args, ctx) => {
+        if (await recovery.handle(args, ctx)) return;
         const ownerGeneration = generation;
         await showCodexCompactMenu(settingsRuntime, ctx, {
           signal: sessionController.signal,

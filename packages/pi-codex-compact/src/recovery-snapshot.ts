@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { estimateTokens, findCutPoint, SessionManager } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, findCutPoint, SessionManager } from "@earendil-works/pi-coding-agent";
 import { checkpointMarker } from "./checkpoint.js";
 
 export type RecoveryMessage = Parameters<SessionManager["appendMessage"]>[0];
@@ -14,11 +14,42 @@ function supported(message: AgentMessage): message is RecoveryMessage {
   return ["user", "assistant", "toolResult", "custom", "bashExecution"].includes(message.role);
 }
 
-/** Deliberately stricter than provider repair: no invented/missing/duplicate results. */
-export function assertClosedToolPairs(messages: readonly RecoveryMessage[], seen = new Set<string>()): void {
+/** Conservative lower bound, without invoking a provider or previewing a request. */
+function hasProviderContent(messages: readonly RecoveryMessage[]): boolean {
+  return convertToLlm([...messages]).some((message) => {
+    if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted"))
+      return false;
+    if (typeof message.content === "string") return message.content.length > 0;
+    return message.content.some((part) => {
+      if (part.type === "text") return part.text.length > 0;
+      if (part.type === "image") return part.data.length > 0;
+      if (part.type === "toolCall") return part.id.length > 0 && part.name.length > 0;
+      // Thinking/signatures remain intact in the selected messages, but alone
+      // cannot prove visibility: same-model unsigned reasoning and cross-model
+      // redacted/empty signed reasoning can both disappear in native conversion.
+      return false;
+    });
+  });
+}
+
+interface ToolPairBookkeeping {
+  raw: Set<string>;
+  effective: Set<string>;
+}
+const bookkeeping = (): ToolPairBookkeeping => ({ raw: new Set(), effective: new Set() });
+
+// Conservative validation ONLY: Responses uses the sanitized first component
+// as call_id even for historical foreign calls. Never change persisted IDs.
+function codexCallKey(id: string): string {
+  return id
+    .split("|")[0]
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 64)
+    .replace(/_+$/, "");
+}
+function checkPairs(messages: readonly AgentMessage[], seen: Set<string>, effective = false): void {
   const pending = new Map<string, string>();
   for (const message of messages) {
-    if (!supported(message)) throw new Error("Unsupported recovery role");
     if (message.role === "toolResult") {
       if (
         typeof message.toolCallId !== "string" ||
@@ -37,13 +68,27 @@ export function assertClosedToolPairs(messages: readonly RecoveryMessage[], seen
     if (message.role !== "assistant") continue;
     for (const part of message.content) {
       if (part.type !== "toolCall") continue;
-      if (typeof part.id !== "string" || !part.id || typeof part.name !== "string" || !part.name || seen.has(part.id))
+      const key = typeof part.id === "string" ? (effective ? codexCallKey(part.id) : part.id) : "";
+      if (!key || typeof part.name !== "string" || !part.name || seen.has(key))
         throw new Error("Recovery tool call is ambiguous");
-      seen.add(part.id);
+      seen.add(key);
       pending.set(part.id, part.name);
     }
   }
   if (pending.size) throw new Error("Recovery crosses an open tool-call boundary");
+}
+
+/** Raw AND provider-effective closure; provider repair must never invent a pair. */
+export function assertClosedToolPairs(messages: readonly RecoveryMessage[], seen = bookkeeping()): void {
+  if (!messages.every(supported)) throw new Error("Unsupported recovery role");
+  checkPairs(messages, seen.raw);
+  checkPairs(
+    convertToLlm([...messages]).filter(
+      (message) => message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted"),
+    ),
+    seen.effective,
+    true,
+  );
 }
 
 /**
@@ -81,10 +126,10 @@ export function splitRecoveryContext(
   }
   const prefix = messages.slice(0, cutIndex);
   const suffix = messages.slice(cutIndex);
-  if (!prefix.slice(markers[0] + 1).some((message) => estimateTokens(message) > 0)) {
-    throw new Error("Recovery prefix contains no new model-visible content");
+  if (!hasProviderContent(prefix.slice(markers[0] + 1)) || !hasProviderContent(suffix)) {
+    throw new Error("Recovery needs proven provider-visible new prefix and removed suffix content");
   }
-  const seen = new Set<string>();
+  const seen = bookkeeping();
   assertClosedToolPairs(prefix, seen);
   assertClosedToolPairs(suffix, seen);
   return { cutIndex, prefix, suffix };

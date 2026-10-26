@@ -119,33 +119,75 @@ prompt/tools/model and source lineage. RPC/headless recovery is not supported.
 Pi's public settings getters resolve the active model's `compaction.keepRecentTokens` (including
 model overrides and the host's trusted effective settings). Its public cut helper selects a suffix
 from an in-memory canonical entry view; this is not private native compaction preparation. The split
-must leave one prior marker plus meaningful new prefix content and a nonempty smaller, completely
-unsent suffix. Only `user`, `assistant`, `toolResult`, `custom`, and `bashExecution` messages are
+must leave one prior marker plus proven provider-visible new prefix content and a nonempty smaller,
+completely unsent suffix with proven provider-visible content. Excluded bash records and errored or
+aborted assistant partials do not prove either condition; token estimates alone are insufficient. Only `user`, `assistant`, `toolResult`, `custom`, and `bashExecution` messages are
 supported; summaries, ambiguous IDs, missing results, and crossed tool pairs reject the operation.
+Both raw and provider-filtered halves must have closed tool pairs: failed/aborted calls cannot leave
+orphan results. Validation also rejects empty/colliding effective Codex call IDs after Responses
+sanitization/truncation, including across the split; stored IDs are never rewritten.
 No cut is guessed or recursively retried. Existing consent, loadout, frozen-wire, model and ownership
 gates remain in force; recovery does not establish or fabricate loadout evidence.
 
-Every export asks for informed confirmation, even when **Allow canonical history** is enabled.
+Selecting recovery only shows an **informed, read-only offer** with prefix/suffix counts and an exact
+`/codex-compact confirm-recovery <UUID>` command. It does not authenticate, send, stage files, or change
+settings. To authorize one export, deliberately run that exact command within five minutes in the same
+unchanged TUI session. The nonce is consumed before asynchronous work and cannot be reused. Decline by
+not confirming, or use `/codex-compact cancel-recovery`. Ordinary input/new runs, model/session/tree
+changes, reload/shutdown, expiry, or source/loadout/settings drift invalidate the offer. Malformed,
+unknown, expired, and duplicate confirmations never fall through to compaction or an ordinary send.
+Recovery never opens a native confirmation/custom dialog; silent offer expiry/cancellation cannot
+close another extension's newer selector or dialog.
+
+This explicit confirmation grants canonical-history permission **once**, even when **Allow canonical
+history** is disabled; it never toggles that setting. The full-compaction consent path is unchanged.
 The confirmed prefix uses the same canonical system/tool envelope and privacy boundary described
 below: request-local filters are bypassed, while persisted context edits remain honored. It makes
 one forced-SSE prefix request with **zero transport retries**, no ordinary preparation probe, no
-full-first request, and no native fallback. Escape cancels its owned progress operation. New input,
-agent work, navigation, session replacement/reload, or model/source/loadout drift retires the owner;
-late responses cannot publish an export or notify stale UI.
+full-first request, and no native fallback. Progress is a uniquely keyed **nonmodal** widget, not a
+custom dialog/editor. Escape, Ctrl+C, new terminal input, or widget disposal cancels only this recovery;
+input remains available to other UI. Kitty key-release events (including the Enter release after
+confirmation) are ignored; actual new keypresses still cancel synchronously. Scoped terminal-input
+subscriptions and disposable widgets are
+required capabilities. Cleanup never calls a custom dialog's completion callback or clears another
+widget's key. Provider identity, stream/auth implementations, structural model/profile state and the
+actual TUI owner are pinned before confirmation. Source/loadout drift or UI/mode rebinding rejects
+continuation before credentials, transport or publication, even before lifecycle cleanup runs.
+Public APIs do not expose an immediate notification of every arbitrary rebind: unsignalled rebinding
+is detected at the next continuation boundary, while native widget disposal and lifecycle/input
+cancellation abort synchronously. Late responses cannot publish or notify stale UI. A cold loadout
+mismatch reports a fixed safe diagnostic without authenticating; an owned deadline reports timeout
+only to a still-current owner, never after an earlier user/session cancellation.
+An offline native-reopen control reaches a read-only offer with an unchanged synthetic loadout and
+no post-reopen warm-up or injected observation; changing its active tools still fails closed. This
+does not qualify arbitrary resumed loadouts or establish real-target cold-load eligibility.
 
 On acceptance, the extension privately stages and validates a fresh current-format native session:
 one resolved system envelope, one ordinary V1 **retain-none** checkpoint, then the exact model-visible
-unsent suffix appended as new entries. No old raw summaries, compactions, abandoned branches,
+unsent suffix appended as new entries, and one **fresh recovery-model selection** after all historical
+assistant attribution. Native resume without a model override therefore selects the issuing compatible
+model, not a configured default or a historical suffix model. No old raw summaries, compactions, abandoned branches,
 control state, or pending queues are copied. Reasoning signatures, media, tool IDs/results, order,
 and model attribution are preserved. Copied historical assistant/tool-result **usage and cost are
 reset to zero**: original accounting remains in the untouched source, old large usage cannot become
 a new context baseline, and global billing is not counted twice. The new checkpoint records only
 the actual recovery request's usage. This is not byte-identical raw-history copying.
 
-The complete file is fsynced, reopened and replay-validated, then atomically published without
-replacing any existing path. Exports over 64 MiB are rejected. Failures clean owned staging files,
-not the original, backups, or a completed published export. A directory-durability warning can leave
-a complete usable export available. The result reports its new ID/path; open it explicitly with
+The complete file is fsynced and replay-validated from an open, pinned file descriptor using public
+read-only parsing/in-memory reconstruction, never a path-based native open that could repair a
+replacement file. Private staging creation and its initial identity pin are synchronous before any
+asynchronous boundary. Descriptor size/mtime/ctime are pinned **before** reading and verified immediately
+afterward and before publication against that same baseline, rejecting read-completion mutations. Destination/staging directories and the file's device/inode/type are checked again
+**after** the final owner callback, immediately before synchronous no-replace publication. Exports
+over 64 MiB are rejected. Cleanup unlinks only a verified owned file and removes its directory only
+if empty; uncertain ownership or foreign contents may leave staging artifacts. It never recursively
+removes a replacement directory, the original, backups, or a completed published export. These checks
+detect observed path/symlink swaps, not every adversarial same-UID race inside portable path-based
+link/unlink syscalls; the destination directory must not be concurrently controlled by an adversary. A directory-durability warning can leave
+a complete usable export available. Committed publication synchronously clears the request deadline,
+reports success only to the still-current owner, and retires its own progress before asynchronous
+descriptor cleanup; a held close cannot hide the new ID/path or become a late timeout. The result
+reports its new ID/path; open it explicitly with
 `/resume`. **No session switch or ordinary follow-up is sent automatically.**
 
 The original session is **not repaired in place**, and its backup is unchanged. A smaller prefix
