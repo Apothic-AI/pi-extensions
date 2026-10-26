@@ -4,7 +4,14 @@ export const CANONICAL_HISTORY_NOTICE =
   "This compaction sends Pi's persisted canonical history, including custom content, system instructions, and tools. It bypasses request-local context filters; content hidden from ordinary model requests may be sent, retained in the checkpoint, and replayed later. Persisted context_edit omissions remain honored. If remote compaction fails, Pi's native summary may use this same canonical history. Allow once? This does not change your settings.";
 
 /** No credentials, history excerpts, or destination URLs belong in this dialog. */
-export async function authorizeCanonicalHistory(ctx: ExtensionContext, signal: AbortSignal): Promise<boolean> {
+export async function authorizeCanonicalHistory(
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+  dialog: { title: string; notice: string } = {
+    title: "Codex compaction · Allow canonical history once?",
+    notice: CANONICAL_HISTORY_NOTICE,
+  },
+): Promise<boolean> {
   if (signal.aborted || ctx.mode !== "tui" || !ctx.hasUI) return false;
   const controller = new AbortController();
   const dialogSignal = AbortSignal.any([signal, controller.signal]);
@@ -18,7 +25,7 @@ export async function authorizeCanonicalHistory(ctx: ExtensionContext, signal: A
     });
     return (
       (await Promise.race([
-        ctx.ui.confirm("Codex compaction · Allow canonical history once?", CANONICAL_HISTORY_NOTICE, {
+        ctx.ui.confirm(dialog.title, dialog.notice, {
           signal: dialogSignal,
           timeout: 300_000,
         }),

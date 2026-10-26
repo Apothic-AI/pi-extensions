@@ -44,7 +44,7 @@ test("root menu makes manual compaction primary and exposes its effective route"
   if (main.kind !== "actions") assert.fail("Expected actions screen");
   assert.deepEqual(
     main.items.map((item) => item.label),
-    ["Compact now", "Settings", "Close"],
+    ["Compact now", "Recovery export (new session)", "Settings", "Close"],
   );
   assert.match(main.lines?.join("\n") ?? "", /openai-codex\/gpt-5\.6/);
   assert.match(main.lines?.join("\n") ?? "", /Codex Remote V2/);
@@ -80,7 +80,7 @@ test("settings screen exposes bounded controls and invalid files remain repairab
   const invalidMain = resolveMenuScreen(invalidMenu, "main", invalid.runtime.get());
   assert.equal(invalidMain.kind, "actions");
   if (invalidMain.kind !== "actions") assert.fail("Expected invalid root actions");
-  assert.equal("to" in invalidMain.items[1] ? invalidMain.items[1].to : undefined, "invalid");
+  assert.equal("to" in invalidMain.items[2] ? invalidMain.items[2].to : undefined, "invalid");
   const detail = resolveMenuScreen(invalidMenu, "invalid", invalid.runtime.get());
   assert.equal(detail.kind, "detail");
   if (detail.kind !== "detail") assert.fail("Expected invalid detail");
@@ -267,6 +267,33 @@ for (const outcome of [
     );
   });
 }
+
+test("recovery menu action closes first and never calls original compact", async () => {
+  const memory = memoryRuntime();
+  let closed = false;
+  let recovery = 0;
+  const { ctx } = createMockContext({
+    mode: "tui",
+    select: async (_title: string, options: string[]) => options.find((option) => option.startsWith("Recovery export")),
+    compact: () => assert.fail("Recovery must not call original compact"),
+  });
+  const commandCtx = ctx as ExtensionCommandContext;
+  const custom = commandCtx.ui.custom;
+  commandCtx.ui.custom = async (...args) => {
+    const result = await custom(...args);
+    closed = true;
+    return result;
+  };
+  await showCodexCompactMenu(memory.runtime, ctx, {
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    recover: async () => {
+      assert.equal(closed, true);
+      recovery++;
+    },
+  });
+  assert.equal(recovery, 1);
+});
 
 test("non-TUI command reports the settings path without compacting", async () => {
   const memory = memoryRuntime();

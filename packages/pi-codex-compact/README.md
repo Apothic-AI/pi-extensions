@@ -13,8 +13,9 @@ that item in later OpenAI Codex Responses requests.
 
 Pi remains responsible for deciding when compaction runs, including automatic thresholds, the
 built-in `/compact` command, overflow retries, retained-message selection, and append-only session
-publication. This package owns only the Remote V2 request, checkpoint persistence, and later payload
-replay.
+publication. This package owns the Remote V2 request, checkpoint persistence, and later payload
+replay. Its separate, explicit recovery-export action can create a new session without compacting or
+mutating the original.
 
 ## Features
 
@@ -91,6 +92,7 @@ or malformed active checkpoint cancels compaction while the hook is enabled. It 
 
 ```text
 Compact now
+Recovery export (new session)
 Settings
 Close
 ```
@@ -105,6 +107,52 @@ manual settings path instead of opening custom UI or compacting.
 
 Pi's built-in `/compact` remains available and follows the same extension hook, including the
 opaque-boundary safety gate on unsupported models.
+
+## Explicit recovery export (restricted)
+
+If full remote compaction cannot fit, **Recovery export (new session)** under `/codex-compact` offers
+an explicit one-shot alternative. It is never an automatic fallback, and selecting **Compact now**
+retains its existing full-compaction behavior. This recovery action requires an idle, persisted TUI
+session with no pending work, a compatible validated prior opaque checkpoint, and unchanged canonical
+prompt/tools/model and source lineage. RPC/headless recovery is not supported.
+
+Pi's public settings getters resolve the active model's `compaction.keepRecentTokens` (including
+model overrides and the host's trusted effective settings). Its public cut helper selects a suffix
+from an in-memory canonical entry view; this is not private native compaction preparation. The split
+must leave one prior marker plus meaningful new prefix content and a nonempty smaller, completely
+unsent suffix. Only `user`, `assistant`, `toolResult`, `custom`, and `bashExecution` messages are
+supported; summaries, ambiguous IDs, missing results, and crossed tool pairs reject the operation.
+No cut is guessed or recursively retried. Existing consent, loadout, frozen-wire, model and ownership
+gates remain in force; recovery does not establish or fabricate loadout evidence.
+
+Every export asks for informed confirmation, even when **Allow canonical history** is enabled.
+The confirmed prefix uses the same canonical system/tool envelope and privacy boundary described
+below: request-local filters are bypassed, while persisted context edits remain honored. It makes
+one forced-SSE prefix request with **zero transport retries**, no ordinary preparation probe, no
+full-first request, and no native fallback. Escape cancels its owned progress operation. New input,
+agent work, navigation, session replacement/reload, or model/source/loadout drift retires the owner;
+late responses cannot publish an export or notify stale UI.
+
+On acceptance, the extension privately stages and validates a fresh current-format native session:
+one resolved system envelope, one ordinary V1 **retain-none** checkpoint, then the exact model-visible
+unsent suffix appended as new entries. No old raw summaries, compactions, abandoned branches,
+control state, or pending queues are copied. Reasoning signatures, media, tool IDs/results, order,
+and model attribution are preserved. Copied historical assistant/tool-result **usage and cost are
+reset to zero**: original accounting remains in the untouched source, old large usage cannot become
+a new context baseline, and global billing is not counted twice. The new checkpoint records only
+the actual recovery request's usage. This is not byte-identical raw-history copying.
+
+The complete file is fsynced, reopened and replay-validated, then atomically published without
+replacing any existing path. Exports over 64 MiB are rejected. Failures clean owned staging files,
+not the original, backups, or a completed published export. A directory-durability warning can leave
+a complete usable export available. The result reports its new ID/path; open it explicitly with
+`/resume`. **No session switch or ordinary follow-up is sent automatically.**
+
+The original session is **not repaired in place**, and its backup is unchanged. A smaller prefix
+can still exceed the backend window or fail for other reasons; old usage and byte counts do not
+prove fit. Even an accepted export does not prove the next ordinary request will fit. This restricted
+experimental capability makes no backend recovery, cross-model compatibility, or migration promise.
+Keep the source and backups; offline fixtures do not establish live server acceptance.
 
 ## Safe failure diagnostics
 
@@ -416,7 +464,10 @@ src/failure.ts        Closed source-free reason codes and validated HTTP status
 src/protocol.ts       Bounded SSE parsing and Remote V2 payload/output validation
 src/checkpoint.ts     Replacement history, fingerprints, persistence, and replay projection
 src/settings.ts       Global settings validation and atomic persistence
-src/settings-menu.ts  Manual compaction and settings TUI
+src/settings-menu.ts  Manual compaction, recovery action, and settings TUI
+src/recovery-command.ts Explicit cancellable idle recovery owner and prefix request
+src/recovery-snapshot.ts Canonical occurrence split, tool-pair checks, accounting reset
+src/recovery-export.ts Fresh native graph, replay validation, crash-safe no-replace publication
 
 test/                 Protocol, checkpoint, lifecycle, remote, settings, and menu coverage
 ```
