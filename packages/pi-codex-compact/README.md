@@ -108,6 +108,27 @@ manual settings path instead of opening custom UI or compacting.
 Pi's built-in `/compact` remains available and follows the same extension hook, including the
 opaque-boundary safety gate on unsupported models.
 
+## Bounded full-history folding
+
+Normal compaction may make sequential remote folds within one hook, with **at most eight
+actual HTTP attempts total**, including transient retries and context-limit backoff. Extra requests
+may add latency and cost. All stages retain the same canonical instructions, tools, model, and
+credentials. Only closed conversation groups are split; the original opaque item and preceding raw
+user backups are absorbed together in the first fold. Unsupported segmented histories fail closed.
+Bounded folding accepts the native Codex JSON/zstd transport shape (`method`, `headers`, `body`,
+`signal`); additional transport options and deferred coercions are rejected before sending.
+
+Intermediate opaque results stay in memory. A checkpoint is returned only after **every original
+input occurrence** has been absorbed; raw user backups and the host's retained-tail semantics remain
+unchanged. Failed folds never publish a prefix checkpoint. Existing opaque history is preserved on
+failure (the non-opaque native-fallback policy above is unchanged).
+
+The initial target is the smaller of 4 MiB and three bytes per available context token, with an
+8 MiB serialized-request hard cap. This is a heuristic, not an exact token count or a guarantee of
+fit. Structured context-window errors can shrink only to earlier closed boundaries, within the same
+eight-attempt budget and overall authentication/request deadline. The host may start another
+operation; this extension does **not** fix core continuation after failed compaction.
+
 ## Explicit recovery export (restricted)
 
 If full remote compaction cannot fit, **Recovery export (new session)** under `/codex-compact` offers

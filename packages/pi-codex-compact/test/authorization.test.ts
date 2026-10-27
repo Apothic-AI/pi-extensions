@@ -9,7 +9,7 @@ import { test, vi } from "vitest";
 import { CANONICAL_HISTORY_NOTICE } from "../src/authorization.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
-import { createMockContext, createMockPi } from "./support.js";
+import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const model: Model<"openai-codex-responses"> = {
   id: "gpt-5.6",
@@ -73,7 +73,7 @@ async function fixture(
           env: { CODEX_SECRET: "ENV_SECRET" },
         };
       },
-      getProvider: () => {
+      getProvider: stableProvider(() => {
         const provider = openaiCodexProvider();
         return {
           ...provider,
@@ -90,7 +90,7 @@ async function fixture(
             });
           }) satisfies typeof provider.stream,
         };
-      },
+      }),
     },
   });
   createCodexCompactExtension({

@@ -2,6 +2,20 @@ import os from "node:os";
 import path from "node:path";
 import { Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
 
+// Real registries retain provider identity between lookups. Factory fixtures
+// must do the same so ownership checks can detect actual replacements.
+export function stableProvider<T>(factory: () => T): () => T {
+  let value: T;
+  let initialized = false;
+  return () => {
+    if (!initialized) {
+      value = factory();
+      initialized = true;
+    }
+    return value;
+  };
+}
+
 type MockHandler = (...args: unknown[]) => unknown;
 
 type MockCommand = {

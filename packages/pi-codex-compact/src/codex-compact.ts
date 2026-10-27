@@ -13,6 +13,7 @@ import {
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { authorizeCanonicalHistory } from "./authorization.js";
+import { requestBoundedCompaction } from "./bounded-compaction.js";
 import {
   buildReplacementHistory,
   CHECKPOINT_KIND,
@@ -39,7 +40,6 @@ import {
 import { PreparationBranchFence } from "./preparation-branch.js";
 import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
 import { createRecoveryCommand } from "./recovery-command.js";
-import { requestRemoteCompaction } from "./remote.js";
 import {
   type CodexCompactSettings,
   type CodexCompactSettingsRuntime,
@@ -329,6 +329,21 @@ async function awaitCompactionAuth(
   }
 }
 
+function modelFingerprint(model: Model<Api> | undefined): string | undefined {
+  // Clone first: a model's toJSON must neither hide routing changes nor escape
+  // the cancellation boundary. SDK data accessors remain supported by cloning.
+  return model === undefined
+    ? undefined
+    : JSON.stringify([
+        model.provider,
+        model.api,
+        model.id,
+        model.baseUrl,
+        structuredClone(model.headers),
+        structuredClone(model),
+      ]);
+}
+
 async function compactRemotely(
   pi: ExtensionAPI,
   event: SessionBeforeCompactEvent,
@@ -353,21 +368,26 @@ async function compactRemotely(
   const signal = AbortSignal.any([event.signal, ownerSignal]);
   const sessionId = ctx.sessionManager.getSessionId();
   const sourceBranch = new PreparationBranchFence(event.branchEntries);
-  const sourceModel = JSON.stringify([model.provider, model.api, model.id, model.baseUrl]);
+  let sourceModel: string | undefined;
+  let issuingModelId: string;
+  try {
+    issuingModelId = model.id;
+    sourceModel = modelFingerprint(model);
+  } catch {
+    const failure = compactionFailure("payload_rejected");
+    if (isOpaqueCompaction(compaction)) return cancelOpaqueCompaction(ctx, failure);
+    notifyFailure(ctx, settings, failure);
+    return undefined;
+  }
   const isOwned = () => sessionStillOwned(ctx, sessionId, signal);
   let witnessedRequest: { canonicalPrompt: string; effectivePrompt: string; transcript?: AgentMessage[] } | undefined;
   const isCurrent = () => {
-    if (
-      !isOwned() ||
-      JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) !== sourceModel
-    ) {
-      return false;
-    }
-    const branch = ctx.sessionManager.getBranch();
-    const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
-    if (!sourceBranch.matches(branch, leafId)) return false;
-    if (!witnessedRequest) return true;
     try {
+      if (!isOwned() || modelFingerprint(ctx.model) !== sourceModel) return false;
+      const branch = ctx.sessionManager.getBranch();
+      const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
+      if (!sourceBranch.matches(branch, leafId)) return false;
+      if (!witnessedRequest) return true;
       // Projection may retain references to mutable checkpoint system messages.
       // Compare rebuilt LIVE canonical text to an immutable string, not just an
       // old transcript or matchesPrompt's ordinary equal-view shortcut.
@@ -385,8 +405,12 @@ async function compactRemotely(
     // Explicit abort and retired session/reload owners must not notify through
     // stale UI. Same-owner branch/model invalidation is a local cancellation.
     if (!isOwned()) return { cancel: true as const };
-    const modelChanged =
-      JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) !== sourceModel;
+    let modelChanged = true;
+    try {
+      modelChanged = modelFingerprint(ctx.model) !== sourceModel;
+    } catch {
+      // Unsupported live model state cannot authorize or escape cancellation.
+    }
     const branch = ctx.sessionManager.getBranch();
     const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
     return cancelPreparation(
@@ -447,7 +471,29 @@ async function compactRemotely(
     phase = "provider_unavailable";
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw compactionError("provider_unavailable");
-    const requestModel = { ...model, baseUrl: auth.baseUrl ?? model.baseUrl };
+    const providerStream = provider.stream;
+    const authResolver = ctx.modelRegistry.getApiKeyAndHeaders;
+    const resolvedAuth = JSON.stringify(auth);
+    const authStatus = () => JSON.stringify(ctx.modelRegistry.getProviderAuthStatus?.(model.provider));
+    const sourceAuthStatus = authStatus();
+    const providerIsCurrent = () =>
+      ctx.modelRegistry.getProvider(model.provider) === provider &&
+      provider.stream === providerStream &&
+      ctx.modelRegistry.getApiKeyAndHeaders === authResolver &&
+      JSON.stringify(auth) === resolvedAuth &&
+      authStatus() === sourceAuthStatus;
+    const requestModel = {
+      ...structuredClone(model),
+      // Public routing fields may be non-enumerable SDK compatibility views.
+      // Preserve them explicitly rather than relying on clone enumeration.
+      provider: model.provider,
+      api: model.api,
+      id: issuingModelId,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+      headers: structuredClone(model.headers),
+      baseUrl: auth.baseUrl ?? model.baseUrl,
+    };
     phase = "checkpoint_projection_failed";
     const current = projectedCurrentMessages(event.branchEntries, model);
     phase = "loadout_mismatch";
@@ -482,11 +528,19 @@ async function compactRemotely(
     const remainingMs = deadline - performance.now();
     if (remainingMs <= 0) throw compactionError("remote_timeout");
     phase = "remote_provider_error";
-    const response = await requestRemoteCompaction({
+    const response = await requestBoundedCompaction({
       provider,
       model: requestModel,
       context,
-      isCurrent,
+      isCurrent: () => {
+        if (!isCurrent()) return false;
+        const currentState =
+          providerIsCurrent() &&
+          sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) &&
+          (!piCodingAgentCompat.buildSessionProjection || sameTools(requestTools, activeTools(pi)));
+        if (!currentState) phase = "state_divergence";
+        return currentState;
+      },
       validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId, prompts),
       apiKey: auth.apiKey,
       headers: auth.headers,
@@ -507,6 +561,7 @@ async function compactRemotely(
     // appendCompaction will snapshot the session's resolved system/tool state;
     // never persist a checkpoint for a request that became stale while in flight.
     if (
+      !providerIsCurrent() ||
       !sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) ||
       (piCodingAgentCompat.buildSessionProjection && !sameTools(requestTools, activeTools(pi)))
     ) {
@@ -517,7 +572,7 @@ async function compactRemotely(
       tokenBudget: settings.replacementTokenBudget,
     });
     const details = createCheckpointDetails({
-      modelId: model.id,
+      modelId: issuingModelId,
       replacementHistory,
       keptMessages: keptMessages(event),
       // Canonical hosts persist recovery omissions before this hook. Retained

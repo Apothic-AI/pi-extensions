@@ -1,3 +1,4 @@
+import * as zlib from "node:zlib";
 import type { Context, Model, Provider, ProviderHeaders, Usage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import {
@@ -35,6 +36,10 @@ export interface RemoteCompactionRequest {
   requestTimeoutMs?: number;
   maxRetries?: number;
   fetch?: typeof globalThis.fetch;
+  /** Internal bounded-fold seam. Presence enables strict serialized-body verification. */
+  selectInput?: (input: JsonObject[], prepared: JsonObject) => JsonObject[];
+  /** Runs at the last no-send boundary, including provider retries. */
+  beforeFetch?: (input: RequestInfo | URL, init?: RequestInit) => void;
 }
 
 export interface RemoteCompactionResponse {
@@ -169,16 +174,100 @@ async function performRemoteCompaction(
   if (operationSignal.aborted) throw compactionAbortError();
   let sentInput: JsonObject[] | undefined;
   let localRejection: CompactionFailure | undefined;
+  let acceptedBody: string | undefined;
   let transportFailure: CompactionFailure | undefined;
   const inspections: Promise<{ ok: true; value: CollectedCompaction } | { ok: false; failure: CompactionFailure }>[] =
     [];
   const baseFetch = request.fetch ?? globalThis.fetch;
+  const deadline = performance.now() + (request.requestTimeoutMs ?? 300_000);
   const inspectedFetch: typeof globalThis.fetch = async (input, init) => {
     if (operationSignal.aborted || !isCurrent()) throw compactionAbortError();
-    const signal = init?.signal ? AbortSignal.any([operationSignal, init.signal]) : operationSignal;
+    let signal = operationSignal;
+    try {
+      if (localRejection) throw compactionError(localRejection.code);
+      if (request.selectInput) {
+        // Snapshot before any final gate. Never read provider-owned accessors,
+        // headers, URL coercions or mutable body storage during dispatch.
+        if (!init || ![Object.prototype, null].includes(Object.getPrototypeOf(init)))
+          throw compactionError("payload_rejected");
+        const descriptors = Object.getOwnPropertyDescriptors(init);
+        const supported = new Set(["method", "headers", "body", "signal"]);
+        if (
+          Reflect.ownKeys(descriptors).some((key) => typeof key !== "string" || !supported.has(key)) ||
+          Object.values(descriptors).some((entry) => !("value" in entry))
+        )
+          throw compactionError("payload_rejected");
+        init = Object.fromEntries(Object.entries(descriptors).map(([key, entry]) => [key, entry.value])) as RequestInit;
+        // Native fetch coerces other dictionary values after this gate. Only
+        // the qualified Codex transport fields and an inert method are allowed.
+        if (init.method !== undefined && typeof init.method !== "string") throw compactionError("payload_rejected");
+        init.headers = new Headers(init.headers);
+        if (typeof input !== "string") {
+          if (!(input instanceof URL)) throw compactionError("payload_rejected");
+          const href = Object.getOwnPropertyDescriptor(URL.prototype, "href")?.get;
+          if (!href) throw compactionError("payload_rejected");
+          input = href.call(input) as string;
+        }
+        if (!acceptedBody || Buffer.byteLength(acceptedBody, "utf8") > 8 * 1024 * 1024) {
+          throw compactionError("payload_rejected");
+        }
+        const encoding = new Headers(init?.headers).get("content-encoding");
+        if (typeof init?.body === "string" && !encoding) {
+          if (init.body !== acceptedBody) throw compactionError("payload_rejected");
+        } else if (
+          init?.body instanceof Uint8Array &&
+          encoding === "zstd" &&
+          typeof zlib.zstdDecompressSync === "function"
+        ) {
+          // Native Codex 1.4 compresses AFTER onPayload. Bound both wire bytes
+          // and decompressed output; compare bytes, not lossy UTF-8 decoding.
+          // Invoke the intrinsic getter, not a spoofable subclass property.
+          const byteLength = Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(Uint8Array.prototype),
+            "byteLength",
+          )?.get;
+          const length: unknown = byteLength?.call(init.body);
+          if (typeof length !== "number" || length > 8 * 1024 * 1024) throw compactionError("payload_rejected");
+          const body = new Uint8Array(length);
+          Uint8Array.prototype.set.call(body, init.body);
+          if (body.byteLength !== length) throw compactionError("payload_rejected");
+          const expected = Buffer.from(acceptedBody, "utf8");
+          if (!zlib.zstdDecompressSync(body, { maxOutputLength: expected.byteLength }).equals(expected)) {
+            throw compactionError("payload_rejected");
+          }
+          init = { ...init, body };
+        } else {
+          throw compactionError("payload_rejected");
+        }
+      }
+      signal = request.selectInput
+        ? AbortSignal.any(init?.signal ? [operationSignal, init.signal] : [operationSignal])
+        : init?.signal
+          ? AbortSignal.any([operationSignal, init.signal])
+          : operationSignal;
+      init = { ...init, signal };
+      // Callbacks receive a disposable view, not dispatch-owned storage.
+      request.beforeFetch?.(
+        input,
+        request.selectInput
+          ? {
+              ...init,
+              headers: new Headers(init.headers),
+              signal: AbortSignal.any([signal]),
+              body: init.body instanceof Uint8Array ? new Uint8Array(init.body) : init.body,
+            }
+          : init,
+      );
+      if (signal.aborted || !isCurrent()) throw compactionAbortError();
+      if (performance.now() >= deadline) throw compactionError("remote_timeout");
+    } catch (error) {
+      localRejection ??= failureFrom(error, "payload_rejected");
+      onFatalFailure(localRejection);
+      throw compactionError(localRejection.code);
+    }
     let response: Response;
     try {
-      response = await baseFetch(input, { ...init, signal });
+      response = await baseFetch(input, init);
     } catch (error) {
       transportFailure = compactionFailure("remote_transport_error");
       // Preserve the provider's existing retry decisions (notably AbortError).
@@ -263,6 +352,7 @@ async function performRemoteCompaction(
       fetch: inspectedFetch,
       onPayload: (payload) => {
         if (operationSignal.aborted || !isCurrent()) throw compactionAbortError();
+        if (localRejection) throw compactionError(localRejection.code);
         // Providers may swallow onPayload exceptions and emit arbitrary text in
         // an error event. Capture the local reason before crossing that seam.
         try {
@@ -276,10 +366,28 @@ async function performRemoteCompaction(
           if (!Array.isArray(prepared.input) || !prepared.input.every(isObject)) {
             throw compactionError("payload_rejected");
           }
-          sentInput = structuredClone(prepared.input.slice(0, -1)) as JsonObject[];
-          return prepared;
-        } catch {
-          localRejection = compactionFailure("payload_rejected");
+          const original = structuredClone(prepared.input.slice(0, -1)) as JsonObject[];
+          let selected = prepared;
+          if (request.selectInput) {
+            if (request.validatePayload && !request.validatePayload(prepared))
+              throw compactionError("loadout_mismatch");
+            const input = request.selectInput(structuredClone(original), structuredClone(prepared));
+            selected = prepareRemoteCompactionPayload({ ...prepared, input });
+            if (request.validatePayload && !request.validatePayload(selected))
+              throw compactionError("loadout_mismatch");
+          }
+          const body = JSON.stringify(selected);
+          if (acceptedBody !== undefined && acceptedBody !== body) throw compactionError("payload_rejected");
+          acceptedBody = body;
+          if (!Array.isArray(selected.input) || !selected.input.every(isObject)) {
+            throw compactionError("payload_rejected");
+          }
+          // This response describes one fold, not the coordinator's complete
+          // coverage. Only the coordinator may return the full original input.
+          sentInput = structuredClone(selected.input.slice(0, -1)) as JsonObject[];
+          return selected;
+        } catch (error) {
+          localRejection = failureFrom(error, "payload_rejected");
           throw compactionError(localRejection.code);
         }
       },
