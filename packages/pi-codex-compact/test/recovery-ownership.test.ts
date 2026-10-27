@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
+import { getCurrentSystemPrompt, type Model } from "@earendil-works/pi-ai";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   type ExtensionCommandContext,
   InteractiveMode,
@@ -10,8 +14,16 @@ import {
   VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
-import { checkpointMarker, createCheckpointDetails } from "../src/checkpoint.js";
+import {
+  checkpointMarker,
+  createCheckpointDetails,
+  fallbackSummary,
+  projectCheckpointContext,
+} from "../src/checkpoint.js";
+import { createCodexCompactExtension } from "../src/codex-compact.js";
+import type { JsonObject } from "../src/protocol.js";
 import { createRecoveryCommand } from "../src/recovery-command.js";
+import { splitRecoveryContext } from "../src/recovery-snapshot.js";
 import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
 import { createMockContext, createMockPi } from "./support.js";
 
@@ -163,6 +175,234 @@ function fixture() {
       rmSync(directory, { recursive: true, force: true });
     },
   };
+}
+
+// Exercise the registered command and the extension's real shared matcher/tracker
+// with an idle, accepted C/E witness. Only injected synthetic transport is allowed.
+async function witnessedPromptFixture(phase: "stable" | "offer" | "auth" | "body" | "staging") {
+  const directory = mkdtempSync(join(tmpdir(), "pi-recovery-prompt-owner-"));
+  const canonical = "Synthetic canonical recovery instructions";
+  const effective = "Synthetic request-local recovery instructions";
+  let livePrompt = effective;
+  const manager = SessionManager.create(directory, directory);
+  manager.appendMessage({ role: "system", content: canonical, timestamp: 1 });
+  manager.appendMessage({ role: "user", content: "Synthetic older task", timestamp: 2 });
+  const kept = { role: "user" as const, content: "Meaningful canonical prefix ".repeat(100), timestamp: 3 };
+  const keptId = manager.appendMessage(kept);
+  const model: Model<"openai-codex-responses"> = {
+    id: "offline-recovery",
+    name: "Offline recovery",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    baseUrl: "https://offline.test",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 100000,
+    maxTokens: 1000,
+  };
+  const prior = createCheckpointDetails({
+    modelId: model.id,
+    replacementHistory: [{ type: "compaction", encrypted_content: "synthetic-prior" }],
+    keptMessages: [kept],
+  });
+  const checkpointId = manager.appendCompaction(fallbackSummary(prior.checkpointId), keptId, 100, prior);
+  manager.appendMessage({ ...kept, timestamp: 4 });
+  manager.appendMessage({ role: "user", content: "Unsent tail", timestamp: 5 });
+  const checkpoint = manager.getBranch().find((entry) => entry.id === checkpointId);
+  assert.ok(checkpoint?.type === "compaction" && checkpoint.systemMessage);
+  const sourceFile = manager.getSessionFile();
+  assert.ok(sourceFile);
+  const sourceBytes = readFileSync(sourceFile);
+  const branchIds = manager.getBranch().map((entry) => entry.id);
+  const files = readdirSync(directory);
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const payloads: JsonObject[] = [];
+  let authCount = 0;
+  const provider = openaiCodexProvider();
+  const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "synthetic" } })).toString("base64")}.x`;
+  const mock = createMockContext({
+    mode: "tui",
+    model,
+    cwd: directory,
+    sessionManager: manager,
+    getSystemPrompt: () => livePrompt,
+    select: async (_title: string, options: string[]) => options.find((option) => option.includes("Recovery export")),
+    modelRegistry: {
+      getProvider: () => provider,
+      getApiKeyAndHeaders: async () => {
+        authCount++;
+        if (phase === "auth") {
+          started.resolve();
+          await release.promise;
+        }
+        return { ok: true, apiKey };
+      },
+    },
+  });
+  const ctx = mock.ctx as ExtensionCommandContext;
+  const widgets = new Map<string, unknown>();
+  Object.assign(ctx.ui, {
+    onTerminalInput: () => () => {},
+    setWidget(key: string, factory: (() => unknown) | undefined) {
+      if (factory) widgets.set(key, factory());
+      else widgets.delete(key);
+    },
+  });
+  const runtime: CodexCompactSettingsRuntime = {
+    get: () => ({
+      kind: "missing",
+      path: join(directory, "synthetic-settings"),
+      document: {},
+      settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory: false },
+    }),
+    reload: async () => runtime.get(),
+    update: async () => assert.fail("No settings writes"),
+    flush: async () => {},
+  };
+  const pi = createMockPi();
+  Object.assign(pi.pi, { getSettings: () => ({ compaction: { keepRecentTokens: 1 } }) });
+  vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("No live HTTP"));
+  vi.spyOn(globalThis, "WebSocket").mockImplementation(() => {
+    throw new Error("No live WebSocket");
+  });
+  createCodexCompactExtension({
+    settingsRuntime: runtime,
+    fetch: async (_url, init) => {
+      const body = init?.body;
+      assert.ok(typeof body === "string" || body instanceof Uint8Array);
+      payloads.push(JSON.parse(typeof body === "string" ? body : zstdDecompressSync(body).toString("utf8")));
+      if (phase === "body") {
+        started.resolve();
+        await release.promise;
+      }
+      const item = { type: "compaction", encrypted_content: "synthetic-new" };
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [item] } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  })(pi.pi);
+  // No live Goal or ordinary model call: these are the actual extension hooks
+  // which prepare/accept the witness from a synthetic ordinary SDK callback.
+  const transcript = manager.buildSessionContext().messages;
+  const projection = projectCheckpointContext(transcript, prior, "full");
+  assert.ok(projection, JSON.stringify(transcript));
+  const split = splitRecoveryContext(
+    projection.filter((message) => message.role !== "system"),
+    prior.checkpointId,
+    1,
+  );
+  assert.equal(split.prefix.length, 2);
+  assert.equal(split.suffix.length, 1);
+  await pi.events.get("context")?.[0]({ messages: transcript }, ctx);
+  await pi.events.get("before_provider_request")?.[0]({ payload: { instructions: effective, tools: [] } }, ctx);
+  if (phase === "staging") {
+    const open = fsPromises.open;
+    vi.spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      vi.spyOn(handle, "sync").mockImplementation(async () => {
+        started.resolve();
+        await release.promise;
+      });
+      return handle;
+    });
+  }
+  const handler = pi.commands.get("codex-compact")?.handler;
+  assert.ok(handler);
+  initTheme("dark");
+  await handler("", ctx);
+  const offer = mock.notifications.at(-1)?.message ?? "";
+  assert.match(offer, /^Recovery OFFER ONLY:/, "real shared matcher must accept the initial C/E witness");
+  const nonce = offer.match(/confirm-recovery ([a-f0-9-]{36})/)?.[1];
+  assert.ok(nonce);
+  return {
+    canonical,
+    effective,
+    started,
+    release,
+    payloads,
+    notifications: mock.notifications,
+    widgets,
+    authCount: () => authCount,
+    confirm: () => handler(`confirm-recovery ${nonce}`, ctx),
+    clearEffective: () => {
+      livePrompt = canonical;
+    },
+    changeCanonical: () => {
+      assert.ok(checkpoint.systemMessage);
+      checkpoint.systemMessage.content = effective;
+      assert.equal(getCurrentSystemPrompt(manager.buildSessionContext().messages), effective);
+      assert.deepEqual(
+        manager.getBranch().map((entry) => entry.id),
+        branchIds,
+        "same IDs and in-place head edit",
+      );
+    },
+    assertSourceUnchanged: () => assert.deepEqual(readFileSync(sourceFile), sourceBytes),
+    assertUnchanged: () => {
+      assert.deepEqual(readFileSync(sourceFile), sourceBytes, "original persisted source is read-only");
+      assert.deepEqual(readdirSync(directory), files, "no export or staging artifact");
+    },
+    exports: () => readdirSync(directory).filter((file) => !files.includes(file) && file.endsWith(".jsonl")),
+    cleanup: async () => {
+      release.resolve();
+      await pi.events.get("session_shutdown")?.[0]({ reason: "exit" }, ctx);
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("idle recovery stable witnessed C/E exports once with canonical wire instructions", async () => {
+  const f = await witnessedPromptFixture("stable");
+  try {
+    assert.equal(f.authCount(), 0, "offer is read-only");
+    assert.equal(f.payloads.length, 0);
+    await f.confirm();
+    assert.equal(f.authCount(), 1);
+    assert.equal(f.payloads.length, 1);
+    assert.equal(f.payloads[0].instructions, f.canonical);
+    assert.notEqual(f.payloads[0].instructions, f.effective);
+    assert.equal(f.exports().length, 1);
+    assert.match(f.notifications.at(-1)?.message ?? "", /Recovery exported to NEW session/);
+    assert.equal(f.widgets.size, 0);
+    await f.confirm();
+    assert.equal(f.authCount(), 1, "nonce remains one-use");
+    assert.equal(f.payloads.length, 1);
+    assert.equal(f.exports().length, 1);
+    f.assertSourceUnchanged();
+  } finally {
+    await f.cleanup();
+  }
+});
+
+for (const phase of ["offer", "auth", "body", "staging"] as const) {
+  for (const drift of ["effective-clear", "canonical-in-place"] as const) {
+    test(`idle recovery witnessed C/E ${drift} during ${phase} retires the offer without publication`, async () => {
+      const f = await witnessedPromptFixture(phase);
+      try {
+        const notices = f.notifications.length;
+        const mutate = drift === "effective-clear" ? f.clearEffective : f.changeCanonical;
+        if (phase === "offer") mutate();
+        const command = f.confirm();
+        if (phase !== "offer") {
+          await f.started.promise;
+          mutate();
+          f.release.resolve();
+        }
+        await command;
+        f.assertUnchanged();
+        assert.equal(f.authCount(), phase === "offer" ? 0 : 1);
+        assert.equal(f.payloads.length, phase === "body" || phase === "staging" ? 1 : 0);
+        assert.equal(f.widgets.size, 0);
+        if (phase === "offer") assert.match(f.notifications.at(-1)?.message ?? "", /no request was sent/);
+        else assert.equal(f.notifications.length, notices, "no stale UI takeover or success notice");
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
 }
 
 test("cold preflight loadout mismatch gives fixed warning, zero auth/transport/export", async () => {
