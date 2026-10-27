@@ -211,7 +211,7 @@ async function fakeLoader(factories: ExtensionFactory[], directory: string) {
   return { loader, actions };
 }
 
-type Control = "goal" | "ordinary" | "first-force" | "unwitnessed" | "malformed";
+type Control = "goal" | "goal-fold" | "ordinary" | "first-force" | "unwitnessed" | "malformed";
 type Drift =
   | "auth-force"
   | "auth-base"
@@ -221,16 +221,23 @@ type Drift =
   | "body-canonical"
   | "consent-canonical-to-effective"
   | "auth-canonical-to-effective"
-  | "body-canonical-to-effective";
+  | "body-canonical-to-effective"
+  | "fold-branch"
+  | "fold-model"
+  | "fold-provider"
+  | "fold-prompt";
 async function exercise(control: Control, drift?: Drift) {
   const directory = mkdtempSync(join(sandbox, "fixture-"));
-  const realGoal = control === "goal";
+  const realGoal = control === "goal" || control === "goal-fold";
+  const boundedFold = control === "goal-fold";
+  const remoteCheckpointCounts: number[] = [];
   const source = SessionManager.inMemory(directory);
   let target = false;
   let toolNext = false;
   let completeNext = false;
   let compacting = false;
   let transportRole = "ordinary";
+  let targetRemoteStreams = 0;
   let mutateForce = () => {};
   const mutate = () => {
     if (drift?.endsWith("force") || drift?.endsWith("base")) mutateForce();
@@ -281,6 +288,8 @@ async function exercise(control: Control, drift?: Drift) {
     assert.ok(typeof body === "string" || body instanceof Uint8Array);
     const packet = JSON.parse(typeof body === "string" ? body : zstdDecompressSync(body).toString("utf8")) as Packet;
     const remote = packet.input.some((item) => item.type === "compaction_trigger");
+    if (target && remote)
+      remoteCheckpointCounts.push(source.getBranch().filter((entry) => entry.type === "compaction").length);
     const kind = remote ? "remote" : transportRole;
     requests.push({ target, kind, packet });
     assert.ok(requests.length < 30, "bounded synthetic execution");
@@ -332,6 +341,29 @@ async function exercise(control: Control, drift?: Drift) {
     },
     stream: (m, context, options) => {
       transportRole = "remote";
+      if (target && ++targetRemoteStreams === 2 && drift?.startsWith("fold")) {
+        if (drift === "fold-branch")
+          source.appendMessage({ role: "user", content: "Changed branch", timestamp: Date.now() });
+        if (drift === "fold-model") {
+          assert.ok(session.model);
+          session.model.headers = { ...session.model.headers, "X-Profile": "changed" };
+        }
+        if (drift === "fold-provider") {
+          const registered = runtime.getProvider(model.provider);
+          assert.ok(registered);
+          registered.stream = () => {
+            throw new Error("Retired provider must not run");
+          };
+        }
+        if (drift === "fold-prompt") {
+          const checkpoint = source
+            .getBranch()
+            .filter((entry) => entry.type === "compaction")
+            .at(-1);
+          assert.ok(checkpoint?.systemMessage);
+          checkpoint.systemMessage.content = "Changed canonical prompt";
+        }
+      }
       return actual.stream(m, context, {
         ...options,
         transport: "sse",
@@ -445,7 +477,12 @@ async function exercise(control: Control, drift?: Drift) {
         description: "Return text without I/O",
         parameters: Type.Object({}),
         execute: async () => ({
-          content: [{ type: "text", text: `UNIQUE_SYNTHETIC_TOOL_TAIL ${"tail result ".repeat(150)}` }],
+          content: [
+            {
+              type: "text",
+              text: `UNIQUE_SYNTHETIC_TOOL_TAIL ${"tail result ".repeat(target && boundedFold ? 23_000 : 150)}`,
+            },
+          ],
           details: {},
         }),
       },
@@ -486,8 +523,8 @@ async function exercise(control: Control, drift?: Drift) {
   });
   const checkpoints = () => source.getBranch().filter((entry) => entry.type === "compaction");
   const checkpoint = () => parseCheckpointDetails(checkpoints().at(-1)?.details);
-  const fill = async () => {
-    await session.prompt(`MEANINGFUL_SYNTHETIC_PREFIX ${"synthetic older text ".repeat(1200)}`);
+  const fill = async (large = false) => {
+    await session.prompt(`MEANINGFUL_SYNTHETIC_PREFIX ${"synthetic older text ".repeat(large ? 4000 : 1200)}`);
     await session.prompt(`Meaningful recent user tail ${"synthetic tail ".repeat(300)}`);
   };
   const trigger = async () => {
@@ -503,7 +540,7 @@ async function exercise(control: Control, drift?: Drift) {
       assert.ok(checkpoint(), "bootstrap itself uses automatic remote compaction");
       settings.applyOverrides({ compaction: { enabled: false } });
     }
-    await fill();
+    await fill(boundedFold);
     if (realGoal) {
       const now = Date.now();
       source.appendCustomEntry("goal-state", {
@@ -552,15 +589,22 @@ async function exercise(control: Control, drift?: Drift) {
       "never native fallback over opaque history",
     );
     if (drift || control === "unwitnessed" || control === "malformed") {
-      assert.equal(remote.length, drift?.startsWith("body") ? 1 : 0);
+      assert.equal(remote.length, drift?.startsWith("body") || drift?.startsWith("fold") ? 1 : 0);
+      if (drift?.startsWith("fold"))
+        assert.equal(targetRemoteStreams, 2, "second fold observes drift before its transport");
       assert.equal(checkpoints().length, beforeCount, "no stale compaction publication");
       assert.deepEqual(checkpoint(), before);
       assert.deepEqual(outcomes, [{ hasResult: false, aborted: true }]);
-      if (!drift?.endsWith("canonical")) {
+      if (!drift?.endsWith("canonical") && !drift?.startsWith("fold")) {
         assert.ok(notifications.some((message) => message.endsWith("[loadout_mismatch]")));
       }
     } else {
-      assert.equal(remote.length, 1);
+      assert.equal(remote.length, boundedFold ? 2 : 1);
+      assert.deepEqual(
+        remoteCheckpointCounts,
+        remote.map(() => beforeCount),
+        "no intermediate checkpoint publication",
+      );
       assert.equal(checkpoints().length, beforeCount + 1);
       const after = checkpoint();
       assert.ok(after);
@@ -569,7 +613,11 @@ async function exercise(control: Control, drift?: Drift) {
       assert.ok(projectCheckpointContext(source.buildSessionContext().messages, after, "full"));
       assert.deepEqual(outcomes, [{ hasResult: true, aborted: false }]);
       const prep = preparations[0];
-      assert.equal(remote[0].packet.instructions, prep.canonical);
+      for (const request of remote) {
+        assert.equal(request.packet.instructions, prep.canonical);
+        assert.deepEqual(request.packet.tools, remote[0].packet.tools);
+      }
+      const remoteInput = remote.flatMap((request) => request.packet.input);
       assert.ok(JSON.stringify(remote[0].packet.input).includes("MEANINGFUL_SYNTHETIC_PREFIX"));
       assert.equal(remote[0].packet.input.filter((item) => item.type === "compaction").length, before ? 1 : 0);
       const retainedResult = prep.retained.find((message) => message.role === "toolResult");
@@ -579,11 +627,11 @@ async function exercise(control: Control, drift?: Drift) {
         .map((block) => block.text)
         .join("\n");
       assert.deepEqual(
-        remote[0].packet.input.filter((item) => item.type === "function_call_output").map((item) => item.output),
+        remoteInput.filter((item) => item.type === "function_call_output").map((item) => item.output),
         [exactResult],
       );
       assert.equal(
-        JSON.stringify(remote[0].packet.input).split("UNIQUE_SYNTHETIC_TOOL_TAIL").length - 1,
+        JSON.stringify(remoteInput).split("UNIQUE_SYNTHETIC_TOOL_TAIL").length - 1,
         1,
         "the exact retained tool result is covered once by full V1 compaction",
       );
@@ -593,6 +641,17 @@ async function exercise(control: Control, drift?: Drift) {
         "V1 covers the retained tail; do not replay it again beside its new opaque item",
       );
       assert.equal(ordinary[1].packet.input.filter((item) => item.type === "compaction").length, 1);
+      if (boundedFold) {
+        const finalOpaque = after.replacementHistory.find((item) => item.type === "compaction");
+        assert.deepEqual(
+          ordinary[1].packet.input.find((item) => item.type === "compaction"),
+          finalOpaque,
+        );
+        assert.notDeepEqual(
+          remote[1].packet.input.find((item) => item.type === "compaction"),
+          finalOpaque,
+        );
+      }
       if (control !== "ordinary") {
         assert.notEqual(prep.canonical, prep.effective);
         assert.ok(ordinary.every((request) => request.packet.instructions === prep.effective));
@@ -621,8 +680,11 @@ async function exercise(control: Control, drift?: Drift) {
   }
 }
 
-for (const control of ["goal", "ordinary", "first-force", "unwitnessed", "malformed"] as const) {
+for (const control of ["goal", "goal-fold", "ordinary", "first-force", "unwitnessed", "malformed"] as const) {
   test(`automatic compaction composition: ${control}`, () => exercise(control), 20_000);
+}
+for (const drift of ["fold-branch", "fold-model", "fold-provider", "fold-prompt"] as const) {
+  test(`automatic multi-fold cancels between stages: ${drift}`, () => exercise("goal-fold", drift), 20_000);
 }
 for (const drift of [
   "auth-force",

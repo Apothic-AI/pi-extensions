@@ -36,7 +36,7 @@ import {
   type CodexCompactSettingsState,
   DEFAULT_CODEX_COMPACT_SETTINGS,
 } from "../src/settings.js";
-import { createMockContext, createMockPi } from "./support.js";
+import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const model = {
   id: "gpt-5.6",
@@ -113,7 +113,10 @@ function fakeProvider(
           assert.deepEqual((payload as { input: unknown[] }).input.at(-1), {
             type: "compaction_trigger",
           });
-          const response = await options?.fetch?.("https://example.test", { method: "POST" });
+          const response = await options?.fetch?.("https://example.test", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
           await response?.text();
           const message = {
             role: "assistant" as const,
@@ -252,10 +255,11 @@ test("effective checkpoint selection recovers remote -> native -> remote and fai
       sessionManager: session,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-test-key" }),
-        getProvider: () =>
+        getProvider: stableProvider(() =>
           fakeProvider(undefined, (payload) => {
             sentPayload = payload;
           }),
+        ),
       },
     });
     if (native) {
@@ -335,7 +339,7 @@ for (const [label, summary, opaque] of [
             if (fails) throw new Error("secret-auth-canary");
             return { ok: true, apiKey: "fake-test-key" };
           },
-          getProvider: () => fakeProvider(),
+          getProvider: stableProvider(() => fakeProvider()),
         },
       });
       const result = await mock.events.get("session_before_compact")?.[0](
@@ -399,7 +403,7 @@ test("real Codex HTTP errors cannot echo credentials into fallback warnings or c
         headers: { "X-Provider-Token": providerToken },
         env: { CODEX_SECRET: envSecret },
       }),
-      getProvider: () => openaiCodexProvider(),
+      getProvider: stableProvider(openaiCodexProvider),
     },
   });
   const handler = mock.events.get("session_before_compact")?.[0];
@@ -460,7 +464,7 @@ test("a real Codex stalled body reaches the extension deadline and uses native f
     sessionManager: session,
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
-      getProvider: () => openaiCodexProvider(),
+      getProvider: stableProvider(openaiCodexProvider),
     },
   });
   const started = Date.now();
@@ -521,11 +525,12 @@ for (const scenario of ["delayed success", "auth deadline", "cancel during auth"
               persisted = true;
               return value;
             }),
-          getProvider: () =>
+          getProvider: stableProvider(() =>
             fakeProvider((options) => {
               requestBudget = options.timeoutMs;
               requestSignal = options.signal;
             }),
+          ),
         },
       });
       let settled = false;
@@ -671,7 +676,7 @@ for (const [scenario, name] of [
       sessionManager: manager,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-test-key" }),
-        getProvider: () => fakeProvider(),
+        getProvider: stableProvider(() => fakeProvider()),
       },
     });
     const input = event();
@@ -741,10 +746,11 @@ test("registers the settings command and returns a versioned Remote V2 compactio
         apiKey: "secret-oauth",
         headers: { Authorization: null, "X-Provider-Token": "test" },
       }),
-      getProvider: () =>
+      getProvider: stableProvider(() =>
         fakeProvider((options) => {
           forwardedHeaders = options.headers;
         }),
+      ),
     },
   });
   const result = (await handler?.(event(), ctx)) as {
@@ -835,7 +841,7 @@ test("canonical overflow hooks keep full retained lineage, and model guards stil
       sessionManager: session,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake" }),
-        getProvider: () => fakeProvider(),
+        getProvider: stableProvider(() => fakeProvider()),
       },
     });
     const result = (await mock.events.get("session_before_compact")?.[0](
@@ -1027,7 +1033,7 @@ for (const edit of ["omit", "replace"] as const) {
         sessionManager: session,
         modelRegistry: {
           getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake" }),
-          getProvider: () => fakeProvider(),
+          getProvider: stableProvider(() => fakeProvider()),
         },
       });
       const result = (await mock.events.get("session_before_compact")?.[0](
@@ -1426,7 +1432,7 @@ for (const change of ["prompt", "tools", "context edit"] as const) {
       sessionManager: session,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
-        getProvider: () => openaiCodexProvider(),
+        getProvider: stableProvider(openaiCodexProvider),
       },
     });
     const inFlight = mock.events.get("session_before_compact")?.[0](
@@ -1618,6 +1624,71 @@ for (const selected of [
   }
 }
 
+for (const mode of ["throwing", "masking", "getter", "nonenumerable-id"] as const) {
+  test(`model serialization ${mode} cannot bypass opaque cancellation`, async () => {
+    const selectedModel = { ...model, contextWindow: 1000, maxTokens: 100 };
+    if (mode === "nonenumerable-id") {
+      Object.defineProperty(selectedModel, "id", { value: model.id, writable: true, enumerable: false });
+    }
+    if (mode === "getter") {
+      Object.defineProperty(selectedModel, "headers", {
+        enumerable: true,
+        get: () => {
+          throw new Error("SECRET model getter");
+        },
+      });
+    } else {
+      Object.defineProperty(selectedModel, "toJSON", {
+        value: () => {
+          if (mode === "throwing") throw new Error("SECRET model serialization");
+          return { masked: true };
+        },
+      });
+    }
+    const session = SessionManager.inMemory();
+    const oldId = session.appendMessage({ role: "user", content: "Older task", timestamp: 1 });
+    const details = createCheckpointDetails({
+      modelId: model.id,
+      replacementHistory: [{ type: "compaction", encrypted_content: "old-opaque" }],
+      keptMessages: [],
+    });
+    session.appendCompaction(fallbackSummary(details.checkpointId), oldId, 100, details);
+    let keptId = oldId;
+    for (let i = 0; i < 6; i++) {
+      keptId = session.appendMessage({ role: "user", content: `${i}${"x".repeat(1000)}`, timestamp: i + 2 });
+    }
+    const before = session.getEntries();
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => {
+      selectedModel.id = "different-issuing-model";
+      return sseResponse();
+    });
+    const mock = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch })(mock.pi);
+    const { ctx, notifications } = createMockContext({
+      model: selectedModel,
+      getSystemPrompt: () => "",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "synthetic-key" }),
+        getProvider: stableProvider(() => fakeProvider()),
+      },
+    });
+    const result = await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    );
+    assert.deepEqual(result, { cancel: true });
+    assert.ok(fetch.mock.calls.length <= 1, "model drift prevents later folds");
+    if (mode === "getter") assert.equal(fetch.mock.calls.length, 0);
+    assert.equal(JSON.stringify(notifications).includes("SECRET"), false);
+    assert.deepEqual(session.getEntries(), before);
+  });
+}
+
 test("disabled, unsupported, auth-failed, and aborted compaction paths remain safe", async () => {
   const run = async (options: {
     settings?: CodexCompactSettingsRuntime;
@@ -1637,7 +1708,7 @@ test("disabled, unsupported, auth-failed, and aborted compaction paths remain sa
       sessionManager: { getSessionId: () => "session", getBranch: () => branch() },
       modelRegistry: {
         getApiKeyAndHeaders: async () => options.auth ?? { ok: false, error: "missing auth" },
-        getProvider: () => fakeProvider(),
+        getProvider: stableProvider(() => fakeProvider()),
       },
       hasUI: true,
     });

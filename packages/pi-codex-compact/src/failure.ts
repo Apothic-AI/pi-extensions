@@ -14,6 +14,8 @@ const FAILURE_CODES = [
   "remote_transport_error",
   "remote_provider_error",
   "remote_context_window_exceeded",
+  "segmentation_unsupported",
+  "remote_attempt_budget_exhausted",
   "payload_rejected",
   "remote_response_invalid",
   "local_compaction_failed",
@@ -71,6 +73,14 @@ export function failureFrom(error: unknown, fallback: CompactionFailureCode): Co
   return (typeof error === "object" && error !== null && failures.get(error)) || compactionFailure(fallback);
 }
 
+const cancellations = new WeakSet<object>();
+
+export function isCompactionAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && cancellations.has(error);
+}
+
 export function compactionAbortError(): DOMException {
-  return new DOMException("Compaction aborted", "AbortError");
+  const error = new DOMException("Compaction aborted", "AbortError");
+  cancellations.add(error);
+  return error;
 }

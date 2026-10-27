@@ -113,7 +113,7 @@ function runComposition(
     const output = `${child.stdout ?? ""}\n${child.stderr ?? ""}`;
     assert.equal(child.error, undefined, output);
     assert.equal(child.status, 0, output);
-    assert.match(output, /14 passed/, output);
+    assert.match(output, /19 passed/, output);
     console.log(`Offline host peers: ${versions.join(", ")}\n${output}`);
   });
 }

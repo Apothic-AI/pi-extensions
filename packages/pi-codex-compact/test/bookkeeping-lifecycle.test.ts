@@ -6,7 +6,7 @@ import { test, vi } from "vitest";
 import { createCheckpointDetails, fallbackSummary } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
-import { createMockContext, createMockPi } from "./support.js";
+import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const model: Model<"openai-codex-responses"> = {
   id: "offline-model",
@@ -141,7 +141,7 @@ for (const [phase, change] of scenarios) {
       hasUI: true,
       sessionManager: manager,
       getSystemPrompt: () => "Instructions",
-      modelRegistry: { getApiKeyAndHeaders: auth, getProvider: () => openaiCodexProvider() },
+      modelRegistry: { getApiKeyAndHeaders: auth, getProvider: stableProvider(openaiCodexProvider) },
     });
     const ctx = mockCtx as ExtensionContext;
     createCodexCompactExtension({

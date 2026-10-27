@@ -617,7 +617,8 @@ test("actual SDK full oversized → explicit prefix accepted → fresh reopen/fo
     const creds = await f.credentials.list();
     const requests = f.requests.length;
     await assert.rejects(f.session.compact(), /cancel/i);
-    assert.equal(f.requests.length, requests + 1, JSON.stringify(f.notifications));
+    const foldAttempts = f.requests.length - requests;
+    assert.ok(foldAttempts > 1 && foldAttempts <= 8, JSON.stringify(f.notifications));
     assert.match(JSON.stringify(f.notifications), /remote_context_window_exceeded/);
     assert.equal(hash(sourceFile), sourceHash);
     const projected = canonical(f.source);
@@ -635,7 +636,11 @@ test("actual SDK full oversized → explicit prefix accepted → fresh reopen/fo
     await f.session.prompt("/codex-compact");
     const recovery = f.requests.at(-1)?.payload;
     assert.ok(recovery);
-    assert.equal(f.requests.length, requests + 2, "one prefix request only; no automatic ordinary follow-up");
+    assert.equal(
+      f.requests.length,
+      requests + foldAttempts + 1,
+      "one prefix request only; no automatic ordinary follow-up",
+    );
     assert.deepEqual(f.streamOptions.at(-1), { maxRetries: 0, transport: "sse" });
     assert.doesNotMatch(JSON.stringify(recovery), /TAIL_.*CANARY/);
     assert.match(JSON.stringify(recovery), /Meaningful new prefix/);

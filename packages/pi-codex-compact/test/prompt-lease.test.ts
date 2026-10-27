@@ -6,7 +6,7 @@ import { test } from "vitest";
 import { createCheckpointDetails, fallbackSummary } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
-import { createMockContext, createMockPi } from "./support.js";
+import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const canonical = "Synthetic canonical instructions";
 const effective = "Synthetic request-local instructions";
@@ -71,7 +71,7 @@ for (const seam of ["stable", "consent", "auth", "body"] as const) {
         return true;
       },
       modelRegistry: {
-        getProvider: () => openaiCodexProvider(),
+        getProvider: stableProvider(openaiCodexProvider),
         getApiKeyAndHeaders: async () => {
           authCalls++;
           if (seam === "auth") await heldMutation();
