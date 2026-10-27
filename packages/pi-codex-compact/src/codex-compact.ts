@@ -170,7 +170,10 @@ function transcriptMatchesLiveState(
   const { getCurrentSystemPrompt, getCurrentTools } = piAiCompat;
   if (!getCurrentSystemPrompt || !getCurrentTools) return false;
   return (
-    getCurrentSystemPrompt(messages) === ctx.getSystemPrompt() &&
+    toolState.matchesPrompt(ctx.sessionManager, ctx.sessionManager.getSessionId(), {
+      canonical: getCurrentSystemPrompt(messages),
+      effective: ctx.getSystemPrompt(),
+    }) &&
     toolState.matches(
       ctx.sessionManager,
       ctx.sessionManager.getSessionId(),
@@ -267,11 +270,15 @@ function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailur
   return { cancel: true };
 }
 
-function cancelPreparation(ctx: ExtensionContext, code: CompactionCancellationCode, opaque: boolean): { cancel: true } {
+function cancelPreparation(
+  ctx: ExtensionContext,
+  code: CompactionCancellationCode | CompactionFailure,
+  opaque: boolean,
+): { cancel: true } {
   try {
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `${opaque ? "Compaction cancelled to preserve the existing opaque checkpoint." : "Compaction cancelled."} ${formatCompactionCancellation(code)}`,
+        `${opaque ? "Compaction cancelled to preserve the existing opaque checkpoint." : "Compaction cancelled."} ${typeof code === "string" ? formatCompactionCancellation(code) : formatCompactionFailure(code)}`,
         "warning",
       );
     }
@@ -348,6 +355,7 @@ async function compactRemotely(
   const sourceBranch = new PreparationBranchFence(event.branchEntries);
   const sourceModel = JSON.stringify([model.provider, model.api, model.id, model.baseUrl]);
   const isOwned = () => sessionStillOwned(ctx, sessionId, signal);
+  let witnessedRequest: { canonicalPrompt: string; effectivePrompt: string; transcript?: AgentMessage[] } | undefined;
   const isCurrent = () => {
     if (
       !isOwned() ||
@@ -357,7 +365,21 @@ async function compactRemotely(
     }
     const branch = ctx.sessionManager.getBranch();
     const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
-    return sourceBranch.matches(branch, leafId);
+    if (!sourceBranch.matches(branch, leafId)) return false;
+    if (!witnessedRequest) return true;
+    try {
+      // Projection may retain references to mutable checkpoint system messages.
+      // Compare rebuilt LIVE canonical text to an immutable string, not just an
+      // old transcript or matchesPrompt's ordinary equal-view shortcut.
+      const latest = buildSessionContext(branch, leafId).messages;
+      return (
+        piAiCompat.getCurrentSystemPrompt?.(latest) === witnessedRequest.canonicalPrompt &&
+        ctx.getSystemPrompt() === witnessedRequest.effectivePrompt &&
+        (!witnessedRequest.transcript || transcriptMatchesLiveState(witnessedRequest.transcript, pi, ctx, toolState))
+      );
+    } catch {
+      return false;
+    }
   };
   const cancelInvalidatedPreparation = () => {
     // Explicit abort and retired session/reload owners must not notify through
@@ -365,12 +387,34 @@ async function compactRemotely(
     if (!isOwned()) return { cancel: true as const };
     const modelChanged =
       JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) !== sourceModel;
+    const branch = ctx.sessionManager.getBranch();
+    const leafId = ctx.sessionManager.getLeafId ? ctx.sessionManager.getLeafId() : (branch.at(-1)?.id ?? null);
     return cancelPreparation(
       ctx,
-      modelChanged ? "preparation_model_changed" : "preparation_branch_changed",
+      modelChanged
+        ? "preparation_model_changed"
+        : witnessedRequest && sourceBranch.matches(branch, leafId)
+          ? compactionFailure("loadout_mismatch")
+          : "preparation_branch_changed",
       isOpaqueCompaction(compaction),
     );
   };
+  try {
+    // Pin BOTH divergent views before any async consent/auth seam can turn C/E
+    // into E/E. Equal-prompt and legacy operations keep their existing lifecycle.
+    if (piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentSystemPrompt) {
+      const transcript = buildSessionContext(event.branchEntries, event.branchEntries.at(-1)?.id ?? null).messages;
+      const canonicalPrompt = piAiCompat.getCurrentSystemPrompt(transcript);
+      const effectivePrompt = ctx.getSystemPrompt();
+      if (canonicalPrompt !== effectivePrompt) witnessedRequest = { canonicalPrompt, effectivePrompt };
+    }
+  } catch (error) {
+    if (!isOwned()) return { cancel: true };
+    const failure = failureFrom(error, "checkpoint_projection_failed");
+    if (isOpaqueCompaction(compaction)) return cancelOpaqueCompaction(ctx, failure);
+    notifyFailure(ctx, settings, failure);
+    return undefined;
+  }
   if (!isCurrent()) return cancelInvalidatedPreparation();
   // Native compaction also bypasses request-local filters. Lack of consent must
   // cancel, not fall through to a native summary of the same canonical history.
@@ -391,8 +435,12 @@ async function compactRemotely(
   if (ctx.mode === "tui" && ctx.hasUI) setCompactionStatus(ctx, "Codex remote compaction…");
   let phase: CompactionFailureCode = "authentication_failed";
   try {
+    const effectiveBeforeAuth = piCodingAgentCompat.buildSessionProjection ? ctx.getSystemPrompt() : undefined;
     const auth = await awaitCompactionAuth(ctx, model, signal, deadline);
     if (!isCurrent()) return cancelInvalidatedPreparation();
+    if (effectiveBeforeAuth !== undefined && ctx.getSystemPrompt() !== effectiveBeforeAuth) {
+      throw compactionError("loadout_mismatch");
+    }
     if (!auth.ok || !auth.apiKey) {
       throw compactionError("credentials_unavailable");
     }
@@ -406,10 +454,28 @@ async function compactRemotely(
     if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState)) {
       throw compactionError("loadout_mismatch");
     }
+    const prompts =
+      piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentSystemPrompt
+        ? { canonical: piAiCompat.getCurrentSystemPrompt(current.transcript), effective: ctx.getSystemPrompt() }
+        : undefined;
+    if (
+      witnessedRequest &&
+      (prompts?.canonical !== witnessedRequest.canonicalPrompt ||
+        prompts?.effective !== witnessedRequest.effectivePrompt)
+    ) {
+      throw compactionError("loadout_mismatch");
+    }
+    if (prompts && prompts.canonical !== prompts.effective) {
+      witnessedRequest = {
+        canonicalPrompt: prompts.canonical,
+        effectivePrompt: prompts.effective,
+        transcript: current.transcript,
+      };
+    }
     phase = "payload_rejected";
     const requestTools = structuredClone(activeTools(pi));
     const context: Context = {
-      systemPrompt: ctx.getSystemPrompt(),
+      systemPrompt: prompts?.canonical ?? ctx.getSystemPrompt(),
       messages: convertToLlm(current.messages),
       tools: requestTools,
     };
@@ -421,7 +487,7 @@ async function compactRemotely(
       model: requestModel,
       context,
       isCurrent,
-      validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId),
+      validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId, prompts),
       apiKey: auth.apiKey,
       headers: auth.headers,
       env: auth.env,
@@ -503,7 +569,15 @@ export function createCodexCompactExtension(
       matches: (transcript, ctx) => transcriptMatchesLiveState(transcript, pi, ctx, toolState),
       tools: () => activeTools(pi),
       authenticate: awaitCompactionAuth,
-      payloadValidator: (ctx) => toolState.payloadValidator(ctx.sessionManager, ctx.sessionManager.getSessionId()),
+      payloadValidator: (ctx) => {
+        const branch = ctx.sessionManager.getBranch();
+        const transcript = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+        const prompts =
+          piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentSystemPrompt
+            ? { canonical: piAiCompat.getCurrentSystemPrompt(transcript), effective: ctx.getSystemPrompt() }
+            : undefined;
+        return toolState.payloadValidator(ctx.sessionManager, ctx.sessionManager.getSessionId(), prompts);
+      },
       fetch: options.fetch,
     });
     // Idle recovery has its own controller; never abort unrelated agent work.
@@ -622,7 +696,11 @@ export function createCodexCompactExtension(
       if (!active || !settingsRuntime.get().settings.enabled) return undefined;
       // Agent-core invokes context preparation for a new request. Cache warming
       // reuses the prepared context and only invokes provider callbacks.
-      if (piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentTools) {
+      if (
+        piCodingAgentCompat.buildSessionProjection &&
+        piAiCompat.getCurrentTools &&
+        piAiCompat.getCurrentSystemPrompt
+      ) {
         // The public context event hides system messages. Read the canonical
         // branch, whose prepared declarations were persisted before this hook.
         const branch = ctx.sessionManager.getBranch();
@@ -632,6 +710,7 @@ export function createCodexCompactExtension(
           ctx.sessionManager.getSessionId(),
           comparableTools(piAiCompat.getCurrentTools(transcript)),
           activeTools(pi),
+          { canonical: piAiCompat.getCurrentSystemPrompt(transcript), effective: ctx.getSystemPrompt() },
         );
       }
       const checkpoint = activeCheckpoint(ctx);
@@ -658,17 +737,14 @@ export function createCodexCompactExtension(
       ) {
         const branch = ctx.sessionManager.getBranch();
         const transcript = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
-        if (piAiCompat.getCurrentSystemPrompt(transcript) === ctx.getSystemPrompt()) {
-          toolState.observe(
-            ctx.sessionManager,
-            ctx.sessionManager.getSessionId(),
-            comparableTools(piAiCompat.getCurrentTools(transcript)),
-            activeTools(pi),
-            event.payload,
-          );
-        } else {
-          toolState.reset(ctx.sessionManager);
-        }
+        toolState.observe(
+          ctx.sessionManager,
+          ctx.sessionManager.getSessionId(),
+          comparableTools(piAiCompat.getCurrentTools(transcript)),
+          activeTools(pi),
+          event.payload,
+          { canonical: piAiCompat.getCurrentSystemPrompt(transcript), effective: ctx.getSystemPrompt() },
+        );
       }
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;

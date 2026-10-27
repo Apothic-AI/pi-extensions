@@ -3,7 +3,7 @@ import { lstatSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Model, Tool } from "@earendil-works/pi-ai";
+import { getSystemMessageText, type Model, type Tool } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   type ExtensionAPI,
@@ -227,8 +227,16 @@ export function createRecoveryCommand(
         if (head?.role !== "system" || current.messages.filter((message) => message.role === "system").length !== 1) {
           throw compactionError("checkpoint_projection_failed");
         }
+        // Lease both offer-time views. The cloned branch/head pins canonical
+        // content; the shared matcher's equal-view shortcut must not authorize
+        // C/E becoming C/C while confirmation, auth, body or publication waits.
+        const canonicalPrompt = getSystemMessageText(head);
+        const effectivePrompt = ctx.getSystemPrompt();
         // Cold-load eligibility failure is actionable, not a stale takeover.
         if (!dependencies.matches(current.transcript, ctx)) throw compactionError("loadout_mismatch");
+        // Freeze the validator against this offered branch and prompt pair,
+        // never recompute it after auth from a newly equal current view.
+        const validatePayload = dependencies.payloadValidator(ctx);
         const split = splitRecoveryContext(current.messages.slice(1), prior.checkpointId, keepRecentTokens);
         const tools = structuredClone(dependencies.tools());
         let retired = false;
@@ -264,6 +272,7 @@ export function createRecoveryCommand(
               ctx.isProjectTrusted() !== trusted ||
               JSON.stringify(pi.getSettings()) !== settingsKey ||
               JSON.stringify(runtime.get().settings) !== JSON.stringify(settings) ||
+              ctx.getSystemPrompt() !== effectivePrompt ||
               !dependencies.matches(current.transcript, ctx) ||
               !sameTools(tools, dependencies.tools());
           } catch {
@@ -304,6 +313,7 @@ export function createRecoveryCommand(
                 confirmationCtx.sessionManager === manager &&
                 confirmationCtx.modelRegistry === registry &&
                 isDeepStrictEqual(confirmationCtx.model, sourceModel) &&
+                confirmationCtx.getSystemPrompt() === effectivePrompt &&
                 isCurrent()
               );
             } catch {
@@ -385,7 +395,7 @@ export function createRecoveryCommand(
                       provider,
                       model: { ...model, baseUrl: auth.baseUrl ?? model.baseUrl },
                       context: {
-                        systemPrompt: ctx.getSystemPrompt(),
+                        systemPrompt: canonicalPrompt,
                         messages: convertToLlm([head, ...split.prefix]),
                         tools,
                       },
@@ -394,7 +404,7 @@ export function createRecoveryCommand(
                       env: auth.env,
                       signal,
                       isCurrent,
-                      validatePayload: dependencies.payloadValidator(ctx),
+                      validatePayload,
                       priorCheckpoint: {
                         marker: checkpointMarker(prior.checkpointId),
                         replacementHistory: prior.replacementHistory,

@@ -306,6 +306,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     waitForIdle: overrides.waitForIdle ?? (async () => undefined),
     reload: overrides.reload ?? (async () => undefined),
     getContextUsage: overrides.getContextUsage ?? (() => undefined),
+    getSystemPrompt: overrides.getSystemPrompt ?? (() => ""),
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
       getSessionName: () => undefined,

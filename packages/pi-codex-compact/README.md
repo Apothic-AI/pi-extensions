@@ -217,7 +217,7 @@ failure cannot turn opaque cancellation into native fallback.
 | `credentials_unavailable` / `provider_unavailable` | No usable credential / no available provider implementation. |
 | `checkpoint_malformed` / `checkpoint_incompatible` | The early opaque-boundary gate rejected checkpoint details / active provider, API, or exact model ID. |
 | `checkpoint_projection_failed` | Canonical checkpoint projection failed its anchor or lineage checks, or could not be built. |
-| `loadout_mismatch` | Persisted prompt/tools or the observed wire-tool snapshot could not be reproduced; this includes a locally rejected validator even if the provider swallows its exception. |
+| `loadout_mismatch` | Canonical/effective prompt views, their required ordinary-request witness, tools, or the frozen wire snapshot could not be reproduced; this includes a locally rejected validator even if the provider swallows its exception. |
 | `payload_rejected` | Local provider-context or Remote V2 payload preparation was rejected. |
 | `remote_http_error; HTTP NNN` | The intercepted transport returned a non-success HTTP response. Only an integer `Response.status` from 100–599 is included, when valid. |
 | `remote_timeout` | The extension-owned remote deadline expired, including response-body inspection. |
@@ -346,9 +346,10 @@ This extension does **not** read `~/.codex/config.toml`.
 - A working OpenAI Codex OAuth login and Remote V2 entitlement.
 
 The repository's automated SDK regression baseline is **Pi 1.0.4**, matching the package's development
-dependencies. **Pi 1.3.0 is a separate qualification lane**: an isolated loader check on that host does
-not establish whole-host compatibility or repair an unknown live backend failure. Offline regression
-results do not claim either. Live backend diagnosis requires a separately authorized retry.
+dependencies. Offline prompt-witness and automatic Goal/Compact composition regressions also run on
+**Pi 1.4.0**, with all four Pi peers from that same host and synthetic credentials/SSE transports.
+These checks do not establish whole-host compatibility, live backend acceptance, or recovery of an
+already oversized conversation. Live backend diagnosis requires a separately authorized retry.
 
 OpenAI API-key, Azure, GitHub Copilot, and arbitrary Responses-compatible providers are not
 supported. The built-in Codex provider's credential-resolved destination is honored together with
@@ -399,7 +400,8 @@ additive system entries in a different wire layout. First compaction and legacy 
 existing path; preflight and post-response guards still check the unmodified canonical transcript.
 No request-local filter output is reused. Flattening, regrouping, or reordering declarations is not equivalent proof,
 even with the same effective tool set. Ordinary input text, messages, and checkpoint content are not
-retained or compared by this tracker. Cached provider callbacks cannot approve unsent registry edits,
+retained or compared by this tracker. System-prompt views are separate ephemeral evidence, described
+below. Cached provider callbacks cannot approve unsent registry edits,
 and hidden declarations cause Pi-native fallback (or cancellation with an active opaque boundary)
 rather than restoring hidden tools remotely. Evidence is
 in-memory only and resets on startup, reload, or tree navigation. A fresh, unchanged normal request
@@ -407,6 +409,34 @@ can establish it again; prompt, tool, and schema changes remain guarded. For a l
 user-authorized short ordinary request on the checkpoint's issuing compatible model, then manual
 compaction without an intervening reload, can establish and reuse that evidence. This does not
 bypass consent or equality checks and is not a fix for an unknown backend failure.
+
+### Witnessed request-local system prompts
+
+On structured-transcript hosts, a run-local forced prompt (for example active Goal guidance) may
+legitimately differ from the persisted canonical prompt. Remote V2 admits this pair only after fresh
+native `context` preparation captures **both** strings and the public ordinary
+`before_provider_request` callback reproduces the same pair and accepted tool declarations. The
+payload must have its own ordinary data `instructions` string **exactly** equal to the effective
+prompt; accessors, proxies, serialization overrides, missing/non-string instructions and unsupported
+wire shapes cannot prove it. No prefix recognition, whitespace normalization, serializer preview,
+extra model request, or remote-compaction callback establishes this evidence. Empty canonical text
+with a divergent forced prompt is unsupported: provider fallback instructions are not guessed.
+
+Full compaction still sends the resolved **canonical** system envelope, not ephemeral forced text.
+Its frozen validator checks canonical `instructions` for an operation admitted by this witness,
+beside the unchanged exact top-level tools and ordered additive groups. Ordinary requests keep their
+effective guidance. Both current prompt strings must still match the same owner/session witness;
+canonical-only or effective-only drift, missing preparation/observation, reload or tree navigation
+rejects the divergent operation. Equal canonical/effective prompts retain the existing cold/unforced
+path and do not inherit an obsolete forced prompt's instruction constraint. Prompt views live only
+in weakly keyed memory, never checkpoint details, settings or diagnostics.
+
+This is **callback-level evidence**, not a guaranteed final packet after arbitrary later trusted
+payload hooks. It is not a hard network fence or a way to halt Pi's ordinary continuation after
+cancelled compaction. Such continuation, host usage estimation and backend context-window limits
+remain outside this fix; in particular it does not repair an already stranded/oversized conversation
+or turn `remote_context_window_exceeded` into successful recovery. Explicit nonce-authorized recovery
+export remains a separate unchanged action, not an automatic fallback.
 
 ## Privacy, storage, and limits
 
@@ -471,15 +501,16 @@ ceilings are intentionally not configurable.
   exposes only the portability fallback marker and Pi-retained recent messages.
 - The package does not reproduce Codex core's context-window UUID/number lineage, previous-model
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
-- A live prompt or tool change that has not been written into Pi's transcript causes native
-  fallback only without an active opaque boundary; otherwise compaction cancels. An opaque
-  checkpoint must match the system state Pi will persist.
+- An unproven live prompt or tool change causes native fallback only without an active opaque
+  boundary; otherwise compaction cancels. A witnessed run-local prompt can differ as described above,
+  but the opaque checkpoint still uses the canonical system state Pi will persist.
 - Pi exposes no public effective-loadout snapshot. Observed, unchanged description-only rewrites
   (including codemode `mode: "on"`) can use Remote V2, but unproven transformations, hidden declarations
   (including codemode `mode: "only"`), membership/schema mismatches, unsupported tool-update shapes,
   or different serialized declaration surfaces use native compaction only without an active opaque
   boundary; otherwise they cancel. Observation
-  does not weaken prompt/tool equality or stale-state checks.
+  does not bypass tool/schema equality or stale-state checks; divergent prompts require the separate
+  exact two-view witness above.
 - Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in

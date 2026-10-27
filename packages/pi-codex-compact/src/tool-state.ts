@@ -15,7 +15,19 @@ export function sameTools(previous: Tool[], current: Tool[]): boolean {
   return !!changes && changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
 }
 
-type PreparedTools = { sessionId: string; recorded: Tool[]; registry: Tool[] };
+export type SystemPromptViews = { canonical: string; effective: string };
+type PreparedTools = { sessionId: string; recorded: Tool[]; registry: Tool[]; prompts?: SystemPromptViews };
+
+function samePrompts(left: SystemPromptViews | undefined, right: SystemPromptViews | undefined): boolean {
+  return left?.canonical === right?.canonical && left?.effective === right?.effective;
+}
+
+function instructionsMatch(payload: unknown, prompt: string): boolean {
+  if (!record(payload)) return false;
+  rejectJsonOverride(payload);
+  const instructions = field(payload, "instructions");
+  return typeof instructions === "string" && instructions === prompt;
+}
 type WireDeclarations = {
   tools: unknown[];
   additionalTools: Array<{ type: "additional_tools"; role: "developer"; tools: unknown[] }>;
@@ -170,15 +182,40 @@ export class ToolStateTracker {
     this.observed.delete(owner);
   }
 
-  prepare(owner: object, sessionId: string, recorded: Tool[], registry: Tool[]): void {
-    this.prepared.set(owner, structuredClone({ sessionId, recorded, registry }));
+  prepare(owner: object, sessionId: string, recorded: Tool[], registry: Tool[], prompts?: SystemPromptViews): void {
+    const observed = this.observed.get(owner);
+    // A pending request is not a cold owner. Keep accepted exact wire knowledge
+    // (or a known rejection) tied to its ORIGINAL public tools, but retire the
+    // divergent prompt authorization until a new ordinary callback witnesses it.
+    if (observed) this.observed.set(owner, { ...observed, prompts: undefined });
+    this.prepared.set(owner, structuredClone({ sessionId, recorded, registry, prompts }));
   }
 
-  observe(owner: object, sessionId: string, recorded: Tool[], registry: Tool[], payload: unknown): void {
+  observe(
+    owner: object,
+    sessionId: string,
+    recorded: Tool[],
+    registry: Tool[],
+    payload: unknown,
+    prompts?: SystemPromptViews,
+  ): void {
     const prepared = this.prepared.get(owner);
-    if (!prepared || prepared.sessionId !== sessionId) return;
+    if (!prepared || prepared.sessionId !== sessionId) {
+      const observed = this.observed.get(owner);
+      if (observed?.sessionId === sessionId) {
+        this.observed.set(owner, { ...observed, accepted: false, wire: undefined, prompts: undefined });
+      }
+      return;
+    }
+    // Even early mismatches retire an earlier accepted observation.
+    this.observed.set(owner, { ...prepared, accepted: false });
     try {
-      if (!sameTools(prepared.recorded, recorded) || !sameTools(prepared.registry, registry)) return;
+      if (
+        !sameTools(prepared.recorded, recorded) ||
+        !sameTools(prepared.registry, registry) ||
+        !samePrompts(prepared.prompts, prompts)
+      )
+        return;
       // Flatten ONLY for eligibility. Remote serialization must reproduce the
       // original body tools and ordered additive groups, including all metadata.
       const withoutDescriptions = (tools: Tool[]) => tools.map((tool) => ({ ...tool, description: "" }));
@@ -186,6 +223,9 @@ export class ToolStateTracker {
       const effective = wire && [...wire.tools, ...wire.additionalTools.flatMap((group) => group.tools)];
       const accepted =
         !!effective &&
+        (!prompts ||
+          prompts.canonical === prompts.effective ||
+          (prompts.canonical.length > 0 && instructionsMatch(payload, prompts.effective))) &&
         matchesDeclarations(recorded, effective) &&
         sameTools(withoutDescriptions(recorded), withoutDescriptions(registry));
       this.observed.set(owner, { ...prepared, accepted, wire: accepted ? wire : undefined });
@@ -202,15 +242,38 @@ export class ToolStateTracker {
     return observed.accepted && sameTools(observed.recorded, recorded) && sameTools(observed.registry, registry);
   }
 
-  payloadValidator(owner: object, sessionId: string): ((payload: unknown) => boolean) | undefined {
+  matchesPrompt(owner: object, sessionId: string, prompts: SystemPromptViews): boolean {
+    if (prompts.canonical === prompts.effective) return true;
     const observed = this.observed.get(owner);
-    if (!observed || observed.sessionId !== sessionId || !observed.accepted || !observed.wire) return undefined;
+    return (
+      prompts.canonical.length > 0 &&
+      !!observed?.accepted &&
+      observed.sessionId === sessionId &&
+      samePrompts(observed.prompts, prompts)
+    );
+  }
+
+  payloadValidator(
+    owner: object,
+    sessionId: string,
+    prompts?: SystemPromptViews,
+  ): ((payload: unknown) => boolean) | undefined {
+    const divergent = !!prompts && prompts.canonical !== prompts.effective;
+    if (divergent && !this.matchesPrompt(owner, sessionId, prompts)) return () => false;
+    const observed = this.observed.get(owner);
+    if (!observed || observed.sessionId !== sessionId || !observed.accepted || !observed.wire) {
+      return divergent ? () => false : undefined;
+    }
     const expected = observed.wire;
+    const canonical = divergent ? prompts.canonical : undefined;
     // Preserve provider-specific schema normalization and sampling metadata
     // without reimplementing its serializer. Freeze evidence for this request.
     return (payload) => {
       try {
-        return isDeepStrictEqual(expected, wireDeclarations(payload));
+        return (
+          (canonical === undefined || instructionsMatch(payload, canonical)) &&
+          isDeepStrictEqual(expected, wireDeclarations(payload))
+        );
       } catch {
         return false;
       }
